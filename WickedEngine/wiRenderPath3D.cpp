@@ -64,6 +64,7 @@ namespace wi
 		msaoResources = {};
 		rtaoResources = {};
 		rtdiffuseResources = {};
+		ddgiOutputResources = {};
 		rtreflectionResources = {};
 		ssrResources = {};
 		rtshadowResources = {};
@@ -288,6 +289,7 @@ namespace wi
 		}
 		wi::renderer::CreateTiledLightResources(tiledLightResources, internalResolution);
 		wi::renderer::CreateScreenSpaceShadowResources(screenspaceshadowResources, internalResolution);
+		wi::renderer::CreateDDGIOutputResources(ddgiOutputResources, internalResolution);
 
 		// These can trigger resource creations if needed:
 		setAO(ao);
@@ -625,6 +627,7 @@ namespace wi
 			getRaytracedDiffuseEnabled() ||
 			wi::renderer::GetScreenSpaceShadowsEnabled() ||
 			wi::renderer::GetRaytracedShadowsEnabled() ||
+			wi::renderer::GetDDGIEnabled() ||
 			wi::renderer::GetVXGIEnabled()
 			)
 		{
@@ -1037,12 +1040,22 @@ namespace wi
 				getRaytracedDiffuseEnabled() ||
 				wi::renderer::GetScreenSpaceShadowsEnabled() ||
 				wi::renderer::GetRaytracedShadowsEnabled() ||
+				wi::renderer::GetDDGIEnabled() ||
 				wi::renderer::GetVXGIEnabled()
 				)
 			{
 				// These post effects require surface normals and/or roughness
 				wi::renderer::Visibility_Surface(
 					visibilityResources,
+					cmd
+				);
+			}
+
+			if (wi::renderer::GetDDGIEnabled())
+			{
+				wi::renderer::DDGI_ResolveRemoteIndirectDiffuseFormal(
+					ddgiOutputResources,
+					*scene,
 					cmd
 				);
 			}
@@ -1763,13 +1776,29 @@ namespace wi
 		fx.quality = wi::image::QUALITY_LINEAR;
 		fx.enableFullScreen();
 
-		wi::image::Draw(&GetRenderResult3D(), fx, cmd);
+		const bool ddgi_output_debug_preview_enabled = getDDGIOutputDebugPreview() != DDGIOutputDebugPreview::Disabled;
+		const Texture* ddgi_output_debug_preview = nullptr;
+		switch (getDDGIOutputDebugPreview())
+		{
+		case DDGIOutputDebugPreview::RemoteIndirectDiffuseFormal:
+			if (wi::renderer::GetDDGIEnabled() && scene != nullptr && scene->ddgi.probe_buffer.IsValid() && ddgiOutputResources.remoteIndirectDiffuseFormal.IsValid())
+			{
+				ddgi_output_debug_preview = &ddgiOutputResources.remoteIndirectDiffuseFormal;
+			}
+			break;
+		case DDGIOutputDebugPreview::Disabled:
+		default:
+			break;
+		}
 
-		if (
+		wi::image::Draw(ddgi_output_debug_preview != nullptr ? ddgi_output_debug_preview : &GetRenderResult3D(), fx, cmd);
+
+		if (!ddgi_output_debug_preview_enabled &&
+			(
 			wi::renderer::GetDebugLightCulling() ||
 			wi::renderer::GetVariableRateShadingClassificationDebug() ||
 			wi::renderer::GetSurfelGIDebugEnabled()
-			)
+			))
 		{
 			fx.enableFullScreen();
 			fx.blendFlag = BLENDMODE_PREMULTIPLIED;
@@ -2906,6 +2935,10 @@ namespace wi
 		{
 			rtreflectionResources = {};
 		}
+	}
+	void RenderPath3D::setDDGIOutputDebugPreview(DDGIOutputDebugPreview value)
+	{
+		ddgiOutputDebugPreview = value;
 	}
 	void RenderPath3D::setRaytracedDiffuseEnabled(bool value)
 	{

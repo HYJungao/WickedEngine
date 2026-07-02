@@ -422,6 +422,7 @@
 		1ED577112F0115B40032621C /* ddgi_rayallocationCS.hlsl */ = {isa = PBXFileReference; lastKnownFileType = text; path = ddgi_rayallocationCS.hlsl; sourceTree = "<group>"; };
 		1ED577122F0115B40032621C /* ddgi_raytraceCS.hlsl */ = {isa = PBXFileReference; lastKnownFileType = text; path = ddgi_raytraceCS.hlsl; sourceTree = "<group>"; };
 		1ED577132F0115B40032621C /* ddgi_raytraceCS_rtapi.hlsl */ = {isa = PBXFileReference; lastKnownFileType = text; path = ddgi_raytraceCS_rtapi.hlsl; sourceTree = "<group>"; };
+		7FDD00012F0115B40032621C /* ddgi_remoteindirectdiffuseformalCS.hlsl */ = {isa = PBXFileReference; lastKnownFileType = text; path = ddgi_remoteindirectdiffuseformalCS.hlsl; sourceTree = "<group>"; };
 		1ED577142F0115B40032621C /* ddgi_updateCS.hlsl */ = {isa = PBXFileReference; lastKnownFileType = text; path = ddgi_updateCS.hlsl; sourceTree = "<group>"; };
 		1ED577152F0115B40032621C /* ddgi_updateCS_depth.hlsl */ = {isa = PBXFileReference; lastKnownFileType = text; path = ddgi_updateCS_depth.hlsl; sourceTree = "<group>"; };
 		1ED577162F0115B40032621C /* depth_pyramidCS.hlsl */ = {isa = PBXFileReference; lastKnownFileType = text; path = depth_pyramidCS.hlsl; sourceTree = "<group>"; };
@@ -1352,6 +1353,7 @@
 				1ED577112F0115B40032621C /* ddgi_rayallocationCS.hlsl */,
 				1ED577122F0115B40032621C /* ddgi_raytraceCS.hlsl */,
 				1ED577132F0115B40032621C /* ddgi_raytraceCS_rtapi.hlsl */,
+				7FDD00012F0115B40032621C /* ddgi_remoteindirectdiffuseformalCS.hlsl */,
 				1ED577142F0115B40032621C /* ddgi_updateCS.hlsl */,
 				1ED577152F0115B40032621C /* ddgi_updateCS_depth.hlsl */,
 				1ED577162F0115B40032621C /* depth_pyramidCS.hlsl */,

@@ -29,6 +29,11 @@ namespace wi
 			Performance,
 			Ultra_Performance,
 		};
+		enum class DDGIOutputDebugPreview
+		{
+			Disabled,
+			RemoteIndirectDiffuseFormal,
+		};
 	private:
 		float exposure = 1.0f;
 		float brightness = 0.0f;
@@ -64,6 +69,7 @@ namespace wi
 		wi::renderer::PostProcessQuality ssrQuality = wi::renderer::PostProcessQuality::Medium;
 		uint32_t planarReflectionMSAASampleCount = 4;
 		float planarReflectionResolutionScale = 0.25f;
+		DDGIOutputDebugPreview ddgiOutputDebugPreview = DDGIOutputDebugPreview::Disabled;
 
 		AO ao = AO_DISABLED;
 		bool fxaaEnabled = false;
@@ -143,6 +149,7 @@ namespace wi
 		wi::renderer::MSAOResources msaoResources;
 		wi::renderer::RTAOResources rtaoResources;
 		wi::renderer::RTDiffuseResources rtdiffuseResources;
+		wi::renderer::DDGIOutputResources ddgiOutputResources;
 		wi::renderer::RTReflectionResources rtreflectionResources;
 		wi::renderer::SSRResources ssrResources;
 		wi::renderer::SSGIResources ssgiResources;
@@ -160,6 +167,7 @@ namespace wi
 		wi::renderer::FSR2Resources fsr2Resources;
 		wi::renderer::VXGIResources vxgiResources;
 		wi::renderer::MeshBlendResources meshblendResources;
+		const wi::graphics::Texture& GetDDGIRemoteIndirectDiffuseFormal() const { return ddgiOutputResources.remoteIndirectDiffuseFormal; }
 
 		wi::graphics::CommandList video_cmd;
 
@@ -267,6 +275,7 @@ namespace wi
 		constexpr wi::renderer::PostProcessQuality getSSRQuality() const { return ssrQuality; }
 		constexpr uint32_t getPlanarReflectionMSAASampleCount() const { return planarReflectionMSAASampleCount; }
 		constexpr float getPlanarReflectionResolutionScale() const { return planarReflectionResolutionScale; }
+		constexpr DDGIOutputDebugPreview getDDGIOutputDebugPreview() const { return ddgiOutputDebugPreview; }
 
 		constexpr bool getAOEnabled() const { return ao != AO_DISABLED; }
 		constexpr AO getAO() const { return ao; }
@@ -330,6 +339,7 @@ namespace wi
 		constexpr void setRaytracedDiffuseQuality(wi::renderer::PostProcessQuality value) { raytracedDiffuseQuality = value; }
 		constexpr void setRaytracedReflectionsQuality(wi::renderer::PostProcessQuality value) { raytracedReflectionsQuality = value; }
 		constexpr void setSSRQuality(wi::renderer::PostProcessQuality value) { ssrQuality = value; }
+		void setDDGIOutputDebugPreview(DDGIOutputDebugPreview value);
 
 		void setAO(AO value);
 		void setSSREnabled(bool value);

@@ -803,6 +803,9 @@
     <FxCompile Include="$(MSBuildThisFileDirectory)ddgi_updateCS_depth.hlsl">
       <Filter>CS</Filter>
     </FxCompile>
+    <FxCompile Include="$(MSBuildThisFileDirectory)ddgi_remoteindirectdiffuseformalCS.hlsl">
+      <Filter>CS</Filter>
+    </FxCompile>
     <FxCompile Include="$(MSBuildThisFileDirectory)surfel_integrateCS.hlsl">
       <Filter>CS</Filter>
     </FxCompile>

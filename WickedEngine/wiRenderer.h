@@ -533,6 +533,18 @@ namespace wi::renderer
 		const wi::scene::Scene& scene,
 		wi::graphics::CommandList cmd
 	);
+	struct DDGIOutputResources
+	{
+		wi::graphics::Texture remoteIndirectDiffuseFormal;
+
+		bool IsValid() const { return remoteIndirectDiffuseFormal.IsValid(); }
+	};
+	void CreateDDGIOutputResources(DDGIOutputResources& res, XMUINT2 resolution);
+	void DDGI_ResolveRemoteIndirectDiffuseFormal(
+		const DDGIOutputResources& res,
+		const wi::scene::Scene& scene,
+		wi::graphics::CommandList cmd
+	);
 
 	// VXGI: Voxel-based Global Illumination (voxel cone tracing-based)
 	struct VXGIResources
@@ -1439,4 +1451,3 @@ namespace wi::renderer
 	void FlushBarriers(wi::graphics::CommandList cmd);
 
 };
-

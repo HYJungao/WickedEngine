@@ -1161,6 +1161,7 @@ void LoadShaders()
 	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::CS, shaders[CSTYPE_DDGI_INDIRECTPREPARE], "ddgi_indirectprepareCS.cso"); });
 	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::CS, shaders[CSTYPE_DDGI_UPDATE], "ddgi_updateCS.cso"); });
 	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::CS, shaders[CSTYPE_DDGI_UPDATE_DEPTH], "ddgi_updateCS_depth.cso"); });
+	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::CS, shaders[CSTYPE_DDGI_REMOTE_INDIRECT_DIFFUSE_FORMAL], "ddgi_remoteindirectdiffuseformalCS.cso"); });
 	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::CS, shaders[CSTYPE_TERRAIN_VIRTUALTEXTURE_UPDATE_BASECOLORMAP], "terrainVirtualTextureUpdateCS.cso"); });
 	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::CS, shaders[CSTYPE_TERRAIN_VIRTUALTEXTURE_UPDATE_NORMALMAP], "terrainVirtualTextureUpdateCS_normalmap.cso"); });
 	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::CS, shaders[CSTYPE_TERRAIN_VIRTUALTEXTURE_UPDATE_SURFACEMAP], "terrainVirtualTextureUpdateCS_surfacemap.cso"); });
@@ -12802,6 +12803,62 @@ void DDGI(
 		};
 		device->Barrier(barriers, arraysize(barriers), cmd);
 	}
+
+	wi::profiler::EndRange(prof_range);
+	device->EventEnd(cmd);
+}
+
+void CreateDDGIOutputResources(DDGIOutputResources& res, XMUINT2 resolution)
+{
+	TextureDesc desc;
+	desc.type = TextureDesc::Type::TEXTURE_2D;
+	desc.width = resolution.x;
+	desc.height = resolution.y;
+	desc.bind_flags = BindFlag::SHADER_RESOURCE | BindFlag::UNORDERED_ACCESS;
+	desc.format = Format::R16G16B16A16_FLOAT;
+	desc.layout = ResourceState::SHADER_RESOURCE;
+	device->CreateTexture(&desc, nullptr, &res.remoteIndirectDiffuseFormal);
+	device->SetName(&res.remoteIndirectDiffuseFormal, "ddgi.remoteIndirectDiffuseFormal");
+}
+
+void DDGI_ResolveRemoteIndirectDiffuseFormal(
+	const DDGIOutputResources& res,
+	const Scene& scene,
+	CommandList cmd
+)
+{
+	if (!res.IsValid())
+		return;
+
+	device->EventBegin("DDGI_ResolveRemoteIndirectDiffuseFormal", cmd);
+	auto prof_range = wi::profiler::BeginRangeGPU("DDGI RemoteIndirectDiffuseFormal", cmd);
+
+	device->Barrier(GPUBarrier::Image(&res.remoteIndirectDiffuseFormal, res.remoteIndirectDiffuseFormal.desc.layout, ResourceState::UNORDERED_ACCESS), cmd);
+	device->ClearUAV(&res.remoteIndirectDiffuseFormal, 0, cmd);
+	device->Barrier(GPUBarrier::Memory(&res.remoteIndirectDiffuseFormal), cmd);
+
+	if (scene.ddgi.probe_buffer.IsValid())
+	{
+		BindCommonResources(cmd);
+
+		PostProcess postprocess;
+		postprocess.resolution.x = res.remoteIndirectDiffuseFormal.desc.width;
+		postprocess.resolution.y = res.remoteIndirectDiffuseFormal.desc.height;
+		postprocess.resolution_rcp.x = 1.0f / postprocess.resolution.x;
+		postprocess.resolution_rcp.y = 1.0f / postprocess.resolution.y;
+
+		device->BindComputeShader(&shaders[CSTYPE_DDGI_REMOTE_INDIRECT_DIFFUSE_FORMAL], cmd);
+		device->PushConstants(&postprocess, sizeof(postprocess), cmd);
+		device->BindUAV(&res.remoteIndirectDiffuseFormal, 0, cmd);
+		device->Dispatch(
+			(res.remoteIndirectDiffuseFormal.desc.width + POSTPROCESS_BLOCKSIZE - 1) / POSTPROCESS_BLOCKSIZE,
+			(res.remoteIndirectDiffuseFormal.desc.height + POSTPROCESS_BLOCKSIZE - 1) / POSTPROCESS_BLOCKSIZE,
+			1,
+			cmd
+		);
+	}
+
+	device->Barrier(GPUBarrier::Image(&res.remoteIndirectDiffuseFormal, ResourceState::UNORDERED_ACCESS, res.remoteIndirectDiffuseFormal.desc.layout), cmd);
 
 	wi::profiler::EndRange(prof_range);
 	device->EventEnd(cmd);

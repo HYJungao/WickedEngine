@@ -239,6 +239,17 @@ void GraphicsWindow::Create(EditorComponent* _editor)
 	ddgiDebugCheckBox.SetCheck(wi::renderer::GetDDGIDebugEnabled());
 	AddWidget(&ddgiDebugCheckBox);
 
+	ddgiOutputDebugComboBox.Create("DDGI Output: ");
+	ddgiOutputDebugComboBox.SetTooltip("Preview the DDGI RemoteIndirectDiffuseFormal buffer fullscreen. This buffer is material-decoupled and intended for final shading as (BaseColor / PI) * buffer * AO.");
+	ddgiOutputDebugComboBox.SetSize(XMFLOAT2(wid, itemheight));
+	ddgiOutputDebugComboBox.SetPos(XMFLOAT2(x, y += step));
+	ddgiOutputDebugComboBox.AddItem("Off", (uint64_t)wi::RenderPath3D::DDGIOutputDebugPreview::Disabled);
+	ddgiOutputDebugComboBox.AddItem("Remote Indirect", (uint64_t)wi::RenderPath3D::DDGIOutputDebugPreview::RemoteIndirectDiffuseFormal);
+	ddgiOutputDebugComboBox.OnSelect([=](wi::gui::EventArgs args) {
+		editor->renderPath->setDDGIOutputDebugPreview((wi::RenderPath3D::DDGIOutputDebugPreview)args.userdata);
+	});
+	AddWidget(&ddgiOutputDebugComboBox);
+
 	ddgiRayCountSlider.Create(0, DDGI_MAX_RAYCOUNT, 64, DDGI_MAX_RAYCOUNT, "DDGI RayCount: ");
 	ddgiRayCountSlider.SetTooltip("Adjust the ray count per DDGI probe.");
 	ddgiRayCountSlider.SetSize(XMFLOAT2(wid, itemheight));
@@ -1818,6 +1829,7 @@ void GraphicsWindow::UpdateData()
 	raytracedReflectionsRangeSlider.SetValue(editor->renderPath->getRaytracedReflectionsRange());
 	raytracedReflectionsQualitySlider.SetValue((int)editor->renderPath->getRaytracedReflectionsQuality());
 	raytracedDiffuseCheckBox.SetCheck(editor->renderPath->getRaytracedDiffuseEnabled());
+	ddgiOutputDebugComboBox.SetSelectedByUserdataWithoutCallback((uint64_t)editor->renderPath->getDDGIOutputDebugPreview());
 	ssgiCheckBox.SetCheck(editor->renderPath->getSSGIEnabled());
 	raytracedDiffuseRangeSlider.SetValue(editor->renderPath->getRaytracedDiffuseRange());
 	raytracedDiffuseQualitySlider.SetValue((int)editor->renderPath->getRaytracedDiffuseQuality());
@@ -1989,6 +2001,7 @@ void GraphicsWindow::ResizeLayout()
 		surfelGIDebugComboBox.SetVisible(false);
 		surfelGICheckBox.SetVisible(false);
 		ddgiDebugCheckBox.SetVisible(false);
+		ddgiOutputDebugComboBox.SetVisible(false);
 		ddgiCheckBox.SetVisible(false);
 		ddgiZ.SetVisible(false);
 		ddgiY.SetVisible(false);
@@ -2013,6 +2026,7 @@ void GraphicsWindow::ResizeLayout()
 		surfelGIDebugComboBox.SetVisible(true);
 		surfelGICheckBox.SetVisible(true);
 		ddgiDebugCheckBox.SetVisible(true);
+		ddgiOutputDebugComboBox.SetVisible(true);
 		ddgiCheckBox.SetVisible(true);
 		ddgiZ.SetVisible(true);
 		ddgiY.SetVisible(true);
@@ -2040,6 +2054,7 @@ void GraphicsWindow::ResizeLayout()
 		layout.jump();
 
 		layout.add_right(ddgiCheckBox, ddgiDebugCheckBox);
+		layout.add(ddgiOutputDebugComboBox);
 		layout.add_right(ddgiX, ddgiY, ddgiZ);
 		layout.add(ddgiRayCountSlider);
 		layout.add(ddgiBlendSpeedSlider);

@@ -27,6 +27,7 @@ public:
 	wi::gui::ComboBox surfelGIDebugComboBox;
 	wi::gui::CheckBox ddgiCheckBox;
 	wi::gui::CheckBox ddgiDebugCheckBox;
+	wi::gui::ComboBox ddgiOutputDebugComboBox;
 	wi::gui::TextInputField ddgiX;
 	wi::gui::TextInputField ddgiY;
 	wi::gui::TextInputField ddgiZ;
@@ -131,4 +132,3 @@ public:
 
 	void ApplySamplerSettings();
 };
-
