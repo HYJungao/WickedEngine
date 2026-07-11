@@ -1,0 +1,13 @@
+{
+  "name": "newpipeline-webrtc-signaling",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Minimal ws signaling server for NewPipeline WebRTC datachannel sessions",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

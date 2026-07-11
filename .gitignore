@@ -11,6 +11,7 @@
 [Dd]ebug/
 [Dd]ebugPublic/
 [Rr]elease/
+
 x64/
 [Bb]uild/
 cmake-build-*/
@@ -237,3 +238,10 @@ log.txt
 wicked-editor-crash-log.txt
 pso_cache_vulkan
 .DS_Store
+# NewPipeline_Wicked owns its bundled WebRTC SDK, including directories whose
+# upstream names intentionally match the generic Debug/Release/Build ignores.
+!Samples/NewPipeline_Wicked/WebRTC/
+!Samples/NewPipeline_Wicked/WebRTC/**
+Samples/NewPipeline_Wicked/WebRTC/**/.DS_Store
+Samples/NewPipeline_Wicked/WebRTC/7827/debug/libwebrtc.a
+Samples/NewPipeline_Wicked/WebRTC/7827/release/libwebrtc.a

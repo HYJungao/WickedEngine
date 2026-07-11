@@ -1,0 +1,620 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		4A0000010000000000000001 /* main_macos_client.mm in Sources */ = {isa = PBXBuildFile; fileRef = 4A0000010000000000000101 /* main_macos_client.mm */; };
+		4A0000010000000000000002 /* NewPipelineClientApp.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 4A0000010000000000000103 /* NewPipelineClientApp.cpp */; };
+		4A0000010000000000000003 /* NewPipelineClientRenderPath.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 4A0000010000000000000105 /* NewPipelineClientRenderPath.cpp */; };
+		4A0000010000000000000004 /* NewPipelineRuntime.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 4A0000010000000000000109 /* NewPipelineRuntime.cpp */; };
+		4A0000010000000000000005 /* NewPipelineProtocol.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 4A000001000000000000010B /* NewPipelineProtocol.cpp */; };
+		4A0000010000000000000006 /* NewPipelineTransport.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 4A000001000000000000010D /* NewPipelineTransport.cpp */; };
+		4A000001000000000000000B /* NewPipelineScene.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 4A0000010000000000000111 /* NewPipelineScene.cpp */; };
+		4A0000010000000000000007 /* AppKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 4A0000010000000000000201 /* AppKit.framework */; };
+		4A0000010000000000000008 /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 4A0000010000000000000202 /* Metal.framework */; };
+		4A0000010000000000000009 /* GameController.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 4A0000010000000000000203 /* GameController.framework */; };
+		4A000001000000000000000A /* libWickedEngine_MacOS.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4A0000010000000000000302 /* libWickedEngine_MacOS.a */; };
+		4A0000010000000000000011 /* main_macos_server.mm in Sources */ = {isa = PBXBuildFile; fileRef = 4A0000010000000000000102 /* main_macos_server.mm */; };
+		4A0000010000000000000012 /* NewPipelineServerApp.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 4A0000010000000000000107 /* NewPipelineServerApp.cpp */; };
+		4A0000010000000000000013 /* NewPipelineServerRenderPath.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 4A000001000000000000010F /* NewPipelineServerRenderPath.cpp */; };
+		4A0000010000000000000014 /* NewPipelineRuntime.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 4A0000010000000000000109 /* NewPipelineRuntime.cpp */; };
+		4A0000010000000000000015 /* NewPipelineProtocol.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 4A000001000000000000010B /* NewPipelineProtocol.cpp */; };
+		4A0000010000000000000016 /* NewPipelineTransport.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 4A000001000000000000010D /* NewPipelineTransport.cpp */; };
+		4A000001000000000000001B /* NewPipelineScene.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 4A0000010000000000000111 /* NewPipelineScene.cpp */; };
+		4A0000010000000000000021 /* NewPipelineWebRTCBridge.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 4A0000010000000000000113 /* NewPipelineWebRTCBridge.cpp */; settings = {COMPILER_FLAGS = "-fno-rtti -DNDEBUG -DWEBRTC_POSIX=1 -DWEBRTC_MAC=1 -URTC_DISABLE_CHECK_MSG -Wno-nullability-completeness -Wno-macro-redefined -I\"$(SRCROOT)/WebRTC/7827/libcxx-config\" -I\"$(SRCROOT)/WebRTC/7827/include\" -I\"$(SRCROOT)/WebRTC/7827/include/third_party/libyuv/include\""; }; };
+		4A0000010000000000000022 /* NewPipelineWebRTCBridge.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 4A0000010000000000000113 /* NewPipelineWebRTCBridge.cpp */; settings = {COMPILER_FLAGS = "-fno-rtti -DNDEBUG -DWEBRTC_POSIX=1 -DWEBRTC_MAC=1 -URTC_DISABLE_CHECK_MSG -Wno-nullability-completeness -Wno-macro-redefined -I\"$(SRCROOT)/WebRTC/7827/libcxx-config\" -I\"$(SRCROOT)/WebRTC/7827/include\" -I\"$(SRCROOT)/WebRTC/7827/include/third_party/libyuv/include\""; }; };
+		4A0000010000000000000017 /* AppKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 4A0000010000000000000201 /* AppKit.framework */; };
+		4A0000010000000000000018 /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 4A0000010000000000000202 /* Metal.framework */; };
+		4A0000010000000000000019 /* GameController.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 4A0000010000000000000203 /* GameController.framework */; };
+		4A000001000000000000001A /* libWickedEngine_MacOS.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4A0000010000000000000302 /* libWickedEngine_MacOS.a */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		4A0000010000000000000301 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 4A0000010000000000000300 /* WickedEngine.xcodeproj */;
+			proxyType = 2;
+			remoteGlobalIDString = 1EDA7BB12EE1E60500210D41;
+			remoteInfo = WickedEngine_MacOS;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		4A0000010000000000000101 /* main_macos_client.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = main_macos_client.mm; sourceTree = "<group>"; };
+		4A0000010000000000000102 /* main_macos_server.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = main_macos_server.mm; sourceTree = "<group>"; };
+		4A0000010000000000000103 /* NewPipelineClientApp.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = NewPipelineClientApp.cpp; sourceTree = "<group>"; };
+		4A0000010000000000000104 /* NewPipelineClientApp.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = NewPipelineClientApp.h; sourceTree = "<group>"; };
+		4A0000010000000000000105 /* NewPipelineClientRenderPath.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = NewPipelineClientRenderPath.cpp; sourceTree = "<group>"; };
+		4A0000010000000000000106 /* NewPipelineClientRenderPath.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = NewPipelineClientRenderPath.h; sourceTree = "<group>"; };
+		4A0000010000000000000107 /* NewPipelineServerApp.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = NewPipelineServerApp.cpp; sourceTree = "<group>"; };
+		4A0000010000000000000108 /* NewPipelineServerApp.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = NewPipelineServerApp.h; sourceTree = "<group>"; };
+		4A0000010000000000000109 /* NewPipelineRuntime.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = NewPipelineRuntime.cpp; sourceTree = "<group>"; };
+		4A000001000000000000010A /* NewPipelineRuntime.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = NewPipelineRuntime.h; sourceTree = "<group>"; };
+		4A000001000000000000010B /* NewPipelineProtocol.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = NewPipelineProtocol.cpp; sourceTree = "<group>"; };
+		4A000001000000000000010C /* NewPipelineProtocol.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = NewPipelineProtocol.h; sourceTree = "<group>"; };
+		4A000001000000000000010D /* NewPipelineTransport.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = NewPipelineTransport.cpp; sourceTree = "<group>"; };
+		4A000001000000000000010E /* NewPipelineTransport.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = NewPipelineTransport.h; sourceTree = "<group>"; };
+		4A000001000000000000010F /* NewPipelineServerRenderPath.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = NewPipelineServerRenderPath.cpp; sourceTree = "<group>"; };
+		4A0000010000000000000110 /* NewPipelineServerRenderPath.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = NewPipelineServerRenderPath.h; sourceTree = "<group>"; };
+		4A0000010000000000000111 /* NewPipelineScene.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = NewPipelineScene.cpp; sourceTree = "<group>"; };
+		4A0000010000000000000112 /* NewPipelineScene.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = NewPipelineScene.h; sourceTree = "<group>"; };
+		4A0000010000000000000113 /* NewPipelineWebRTCBridge.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = NewPipelineWebRTCBridge.cpp; sourceTree = "<group>"; };
+		4A0000010000000000000114 /* NewPipelineWebRTCBridge.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = NewPipelineWebRTCBridge.h; sourceTree = "<group>"; };
+		4A0000010000000000000201 /* AppKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AppKit.framework; path = System/Library/Frameworks/AppKit.framework; sourceTree = SDKROOT; };
+		4A0000010000000000000202 /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
+		4A0000010000000000000203 /* GameController.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = GameController.framework; path = System/Library/Frameworks/GameController.framework; sourceTree = SDKROOT; };
+		4A0000010000000000000300 /* WickedEngine.xcodeproj */ = {isa = PBXFileReference; lastKnownFileType = "wrapper.pb-project"; name = WickedEngine.xcodeproj; path = ../../WickedEngine/WickedEngine.xcodeproj; sourceTree = "<group>"; };
+		4A0000010000000000000401 /* NewPipeline_Wicked_Client_MacOS.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = NewPipeline_Wicked_Client_MacOS.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		4A0000010000000000000402 /* NewPipeline_Wicked_Server_MacOS.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = NewPipeline_Wicked_Server_MacOS.app; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		4A0000010000000000000501 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				4A0000010000000000000007 /* AppKit.framework in Frameworks */,
+				4A0000010000000000000008 /* Metal.framework in Frameworks */,
+				4A0000010000000000000009 /* GameController.framework in Frameworks */,
+				4A000001000000000000000A /* libWickedEngine_MacOS.a in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		4A0000010000000000000502 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				4A0000010000000000000017 /* AppKit.framework in Frameworks */,
+				4A0000010000000000000018 /* Metal.framework in Frameworks */,
+				4A0000010000000000000019 /* GameController.framework in Frameworks */,
+				4A000001000000000000001A /* libWickedEngine_MacOS.a in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		4A0000010000000000000601 = {
+			isa = PBXGroup;
+			children = (
+				4A0000010000000000000602 /* Sources */,
+				4A0000010000000000000603 /* Frameworks */,
+				4A0000010000000000000604 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		4A0000010000000000000602 /* Sources */ = {
+			isa = PBXGroup;
+			children = (
+				4A0000010000000000000101 /* main_macos_client.mm */,
+				4A0000010000000000000102 /* main_macos_server.mm */,
+				4A0000010000000000000103 /* NewPipelineClientApp.cpp */,
+				4A0000010000000000000104 /* NewPipelineClientApp.h */,
+				4A0000010000000000000105 /* NewPipelineClientRenderPath.cpp */,
+				4A0000010000000000000106 /* NewPipelineClientRenderPath.h */,
+				4A0000010000000000000107 /* NewPipelineServerApp.cpp */,
+				4A0000010000000000000108 /* NewPipelineServerApp.h */,
+				4A000001000000000000010F /* NewPipelineServerRenderPath.cpp */,
+				4A0000010000000000000110 /* NewPipelineServerRenderPath.h */,
+				4A0000010000000000000109 /* NewPipelineRuntime.cpp */,
+				4A000001000000000000010A /* NewPipelineRuntime.h */,
+				4A000001000000000000010B /* NewPipelineProtocol.cpp */,
+				4A000001000000000000010C /* NewPipelineProtocol.h */,
+				4A000001000000000000010D /* NewPipelineTransport.cpp */,
+				4A000001000000000000010E /* NewPipelineTransport.h */,
+				4A0000010000000000000111 /* NewPipelineScene.cpp */,
+				4A0000010000000000000112 /* NewPipelineScene.h */,
+				4A0000010000000000000113 /* NewPipelineWebRTCBridge.cpp */,
+				4A0000010000000000000114 /* NewPipelineWebRTCBridge.h */,
+			);
+			name = Sources;
+			sourceTree = "<group>";
+		};
+		4A0000010000000000000603 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				4A0000010000000000000201 /* AppKit.framework */,
+				4A0000010000000000000202 /* Metal.framework */,
+				4A0000010000000000000203 /* GameController.framework */,
+				4A0000010000000000000300 /* WickedEngine.xcodeproj */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+		4A0000010000000000000604 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				4A0000010000000000000401 /* NewPipeline_Wicked_Client_MacOS.app */,
+				4A0000010000000000000402 /* NewPipeline_Wicked_Server_MacOS.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		4A0000010000000000000605 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				4A0000010000000000000302 /* libWickedEngine_MacOS.a */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		4A0000010000000000000701 /* NewPipeline_Wicked_Client_MacOS */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 4A0000010000000000000903 /* Build configuration list for PBXNativeTarget "NewPipeline_Wicked_Client_MacOS" */;
+			buildPhases = (
+					4A0000010000000000000B03 /* Prepare WebRTC Archive */,
+					4A0000010000000000000801 /* Sources */,
+					4A0000010000000000000501 /* Frameworks */,
+					4A0000010000000000000B01 /* Copy Wicked Runtime Resources */,
+				);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = NewPipeline_Wicked_Client_MacOS;
+			packageProductDependencies = (
+			);
+			productName = NewPipeline_Wicked_Client_MacOS;
+			productReference = 4A0000010000000000000401 /* NewPipeline_Wicked_Client_MacOS.app */;
+			productType = "com.apple.product-type.application";
+		};
+		4A0000010000000000000702 /* NewPipeline_Wicked_Server_MacOS */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 4A0000010000000000000904 /* Build configuration list for PBXNativeTarget "NewPipeline_Wicked_Server_MacOS" */;
+			buildPhases = (
+					4A0000010000000000000B04 /* Prepare WebRTC Archive */,
+					4A0000010000000000000802 /* Sources */,
+					4A0000010000000000000502 /* Frameworks */,
+					4A0000010000000000000B02 /* Copy Wicked Runtime Resources */,
+				);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = NewPipeline_Wicked_Server_MacOS;
+			packageProductDependencies = (
+			);
+			productName = NewPipeline_Wicked_Server_MacOS;
+			productReference = 4A0000010000000000000402 /* NewPipeline_Wicked_Server_MacOS.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		4A0000010000000000000901 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastUpgradeCheck = 2610;
+				TargetAttributes = {
+					4A0000010000000000000701 = {
+						CreatedOnToolsVersion = 26.1.1;
+					};
+					4A0000010000000000000702 = {
+						CreatedOnToolsVersion = 26.1.1;
+					};
+				};
+			};
+			buildConfigurationList = 4A0000010000000000000902 /* Build configuration list for PBXProject "NewPipeline_Wicked_MacOS" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = 4A0000010000000000000601;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = 4A0000010000000000000604 /* Products */;
+			projectDirPath = "";
+			projectReferences = (
+				{
+					ProductGroup = 4A0000010000000000000605 /* Products */;
+					ProjectRef = 4A0000010000000000000300 /* WickedEngine.xcodeproj */;
+				},
+			);
+			projectRoot = "";
+			targets = (
+				4A0000010000000000000701 /* NewPipeline_Wicked_Client_MacOS */,
+				4A0000010000000000000702 /* NewPipeline_Wicked_Server_MacOS */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXReferenceProxy section */
+		4A0000010000000000000302 /* libWickedEngine_MacOS.a */ = {
+			isa = PBXReferenceProxy;
+			fileType = archive.ar;
+			path = libWickedEngine_MacOS.a;
+			remoteRef = 4A0000010000000000000301 /* PBXContainerItemProxy */;
+			sourceTree = BUILT_PRODUCTS_DIR;
+		};
+	/* End PBXReferenceProxy section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		4A0000010000000000000B01 /* Copy Wicked Runtime Resources */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Copy Wicked Runtime Resources";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -euo pipefail\n\nRESOURCES_DIR=\"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}\"\nmkdir -p \"${RESOURCES_DIR}/shaders\"\n\nrsync -a --delete \"${SRCROOT}/../../Editor/shaders/metal/\" \"${RESOURCES_DIR}/shaders/metal/\"\ncp -f \"${SRCROOT}/../../WickedEngine/libdxcompiler.dylib\" \"${RESOURCES_DIR}/libdxcompiler.dylib\"\nrm -rf \"${RESOURCES_DIR}/Content\"\nln -s \"${SRCROOT}/../../Content\" \"${RESOURCES_DIR}/Content\"\n";
+		};
+		4A0000010000000000000B02 /* Copy Wicked Runtime Resources */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Copy Wicked Runtime Resources";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -euo pipefail\n\nRESOURCES_DIR=\"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}\"\nmkdir -p \"${RESOURCES_DIR}/shaders\"\n\nrsync -a --delete \"${SRCROOT}/../../Editor/shaders/metal/\" \"${RESOURCES_DIR}/shaders/metal/\"\ncp -f \"${SRCROOT}/../../WickedEngine/libdxcompiler.dylib\" \"${RESOURCES_DIR}/libdxcompiler.dylib\"\nrm -rf \"${RESOURCES_DIR}/Content\"\nln -s \"${SRCROOT}/../../Content\" \"${RESOURCES_DIR}/Content\"\n";
+		};
+		4A0000010000000000000B03 /* Prepare WebRTC Archive */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+				"$(SRCROOT)/WebRTC/7827/debug/libwebrtc.a",
+				"$(SRCROOT)/WebRTC/7827/release/libwebrtc.a",
+			);
+			name = "Prepare WebRTC Archive";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(DERIVED_FILE_DIR)/WebRTC/libwebrtc.a",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -euo pipefail\n\nFLAVOR=release\nif [ \"${CONFIGURATION}\" = \"Debug\" ]; then FLAVOR=debug; fi\nSOURCE_ARCHIVE=\"${SRCROOT}/WebRTC/7827/${FLAVOR}/libwebrtc.a\"\nOUTPUT_ARCHIVE=\"${DERIVED_FILE_DIR}/WebRTC/libwebrtc.a\"\nmkdir -p \"$(dirname \"${OUTPUT_ARCHIVE}\")\"\ncp -f \"${SOURCE_ARCHIVE}\" \"${OUTPUT_ARCHIVE}\"\nfor OBJECT in cppgen_plugin.o protozero_plugin.o cpp_plugin.o main.o psnr_ssim_analyzer.o frame_analyzer.o data_channel_benchmark.o; do\n    /usr/bin/ar -d \"${OUTPUT_ARCHIVE}\" \"${OBJECT}\" 2>/dev/null || true\ndone\n/usr/bin/ranlib \"${OUTPUT_ARCHIVE}\"\n";
+		};
+		4A0000010000000000000B04 /* Prepare WebRTC Archive */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+				"$(SRCROOT)/WebRTC/7827/debug/libwebrtc.a",
+				"$(SRCROOT)/WebRTC/7827/release/libwebrtc.a",
+			);
+			name = "Prepare WebRTC Archive";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(DERIVED_FILE_DIR)/WebRTC/libwebrtc.a",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -euo pipefail\n\nFLAVOR=release\nif [ \"${CONFIGURATION}\" = \"Debug\" ]; then FLAVOR=debug; fi\nSOURCE_ARCHIVE=\"${SRCROOT}/WebRTC/7827/${FLAVOR}/libwebrtc.a\"\nOUTPUT_ARCHIVE=\"${DERIVED_FILE_DIR}/WebRTC/libwebrtc.a\"\nmkdir -p \"$(dirname \"${OUTPUT_ARCHIVE}\")\"\ncp -f \"${SOURCE_ARCHIVE}\" \"${OUTPUT_ARCHIVE}\"\nfor OBJECT in cppgen_plugin.o protozero_plugin.o cpp_plugin.o main.o psnr_ssim_analyzer.o frame_analyzer.o data_channel_benchmark.o; do\n    /usr/bin/ar -d \"${OUTPUT_ARCHIVE}\" \"${OBJECT}\" 2>/dev/null || true\ndone\n/usr/bin/ranlib \"${OUTPUT_ARCHIVE}\"\n";
+		};
+/* End PBXShellScriptBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		4A0000010000000000000801 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				4A0000010000000000000001 /* main_macos_client.mm in Sources */,
+				4A0000010000000000000002 /* NewPipelineClientApp.cpp in Sources */,
+				4A0000010000000000000003 /* NewPipelineClientRenderPath.cpp in Sources */,
+				4A0000010000000000000004 /* NewPipelineRuntime.cpp in Sources */,
+				4A0000010000000000000005 /* NewPipelineProtocol.cpp in Sources */,
+				4A0000010000000000000006 /* NewPipelineTransport.cpp in Sources */,
+				4A000001000000000000000B /* NewPipelineScene.cpp in Sources */,
+				4A0000010000000000000021 /* NewPipelineWebRTCBridge.cpp in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		4A0000010000000000000802 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				4A0000010000000000000011 /* main_macos_server.mm in Sources */,
+				4A0000010000000000000012 /* NewPipelineServerApp.cpp in Sources */,
+				4A0000010000000000000013 /* NewPipelineServerRenderPath.cpp in Sources */,
+				4A0000010000000000000014 /* NewPipelineRuntime.cpp in Sources */,
+				4A0000010000000000000015 /* NewPipelineProtocol.cpp in Sources */,
+				4A0000010000000000000016 /* NewPipelineTransport.cpp in Sources */,
+				4A000001000000000000001B /* NewPipelineScene.cpp in Sources */,
+				4A0000010000000000000022 /* NewPipelineWebRTCBridge.cpp in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		4A0000010000000000000A01 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
+				MACOSX_DEPLOYMENT_TARGET = 15.6;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				ONLY_ACTIVE_ARCH = YES;
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"$(DERIVED_FILE_DIR)/WebRTC/libwebrtc.a",
+					"-lpthread", "-ldl", "-liconv", "-lz", "-lbz2",
+					"-framework", CoreFoundation, "-framework", Foundation,
+					"-framework", Security, "-framework", SystemConfiguration,
+					"-framework", CoreServices, "-framework", IOKit,
+					"-framework", AppKit, "-framework", CoreGraphics,
+					"-framework", CoreAudio, "-framework", AudioToolbox,
+					"-framework", AVFoundation, "-framework", CoreMedia,
+					"-framework", CoreVideo, "-framework", IOSurface,
+					"-framework", ScreenCaptureKit, "-framework", VideoToolbox,
+					"-framework", Metal, "-framework", QuartzCore,
+					"-framework", OpenGL, "-framework", ApplicationServices,
+					"-framework", Cocoa,
+				);
+				SDKROOT = macosx;
+			};
+			name = Debug;
+		};
+		4A0000010000000000000A02 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
+				MACOSX_DEPLOYMENT_TARGET = 15.6;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"$(DERIVED_FILE_DIR)/WebRTC/libwebrtc.a",
+					"-lpthread", "-ldl", "-liconv", "-lz", "-lbz2",
+					"-framework", CoreFoundation, "-framework", Foundation,
+					"-framework", Security, "-framework", SystemConfiguration,
+					"-framework", CoreServices, "-framework", IOKit,
+					"-framework", AppKit, "-framework", CoreGraphics,
+					"-framework", CoreAudio, "-framework", AudioToolbox,
+					"-framework", AVFoundation, "-framework", CoreMedia,
+					"-framework", CoreVideo, "-framework", IOSurface,
+					"-framework", ScreenCaptureKit, "-framework", VideoToolbox,
+					"-framework", Metal, "-framework", QuartzCore,
+					"-framework", OpenGL, "-framework", ApplicationServices,
+					"-framework", Cocoa,
+				);
+				SDKROOT = macosx;
+			};
+			name = Release;
+		};
+		4A0000010000000000000A03 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_APP_SANDBOX = NO;
+				GCC_ENABLE_CPP_EXCEPTIONS = NO;
+				GCC_ENABLE_CPP_RTTI = NO;
+				"GCC_PREPROCESSOR_DEFINITIONS[arch=*]" = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				GENERATE_INFOPLIST_FILE = YES;
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)",
+					"$(SRCROOT)/../../WickedEngine",
+				);
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				INFOPLIST_KEY_NSPrincipalClass = NSApplication;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(PROJECT_DIR)",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "local.NewPipeline-Wicked-Client-MacOS";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SYSTEM_HEADER_SEARCH_PATHS = "$(SRCROOT)/../../WickedEngine/Utility/metal";
+			};
+			name = Debug;
+		};
+		4A0000010000000000000A04 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_APP_SANDBOX = NO;
+				GCC_ENABLE_CPP_EXCEPTIONS = NO;
+				GCC_ENABLE_CPP_RTTI = NO;
+				GENERATE_INFOPLIST_FILE = YES;
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)",
+					"$(SRCROOT)/../../WickedEngine",
+				);
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				INFOPLIST_KEY_NSPrincipalClass = NSApplication;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(PROJECT_DIR)",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "local.NewPipeline-Wicked-Client-MacOS";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SYSTEM_HEADER_SEARCH_PATHS = "$(SRCROOT)/../../WickedEngine/Utility/metal";
+			};
+			name = Release;
+		};
+		4A0000010000000000000A05 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_APP_SANDBOX = NO;
+				GCC_ENABLE_CPP_EXCEPTIONS = NO;
+				GCC_ENABLE_CPP_RTTI = NO;
+				"GCC_PREPROCESSOR_DEFINITIONS[arch=*]" = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				GENERATE_INFOPLIST_FILE = YES;
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)",
+					"$(SRCROOT)/../../WickedEngine",
+				);
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				INFOPLIST_KEY_NSPrincipalClass = NSApplication;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(PROJECT_DIR)",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "local.NewPipeline-Wicked-Server-MacOS";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SYSTEM_HEADER_SEARCH_PATHS = "$(SRCROOT)/../../WickedEngine/Utility/metal";
+			};
+			name = Debug;
+		};
+		4A0000010000000000000A06 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_APP_SANDBOX = NO;
+				GCC_ENABLE_CPP_EXCEPTIONS = NO;
+				GCC_ENABLE_CPP_RTTI = NO;
+				GENERATE_INFOPLIST_FILE = YES;
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)",
+					"$(SRCROOT)/../../WickedEngine",
+				);
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				INFOPLIST_KEY_NSPrincipalClass = NSApplication;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(PROJECT_DIR)",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "local.NewPipeline-Wicked-Server-MacOS";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SYSTEM_HEADER_SEARCH_PATHS = "$(SRCROOT)/../../WickedEngine/Utility/metal";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		4A0000010000000000000902 /* Build configuration list for PBXProject "NewPipeline_Wicked_MacOS" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				4A0000010000000000000A01 /* Debug */,
+				4A0000010000000000000A02 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		4A0000010000000000000903 /* Build configuration list for PBXNativeTarget "NewPipeline_Wicked_Client_MacOS" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				4A0000010000000000000A03 /* Debug */,
+				4A0000010000000000000A04 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		4A0000010000000000000904 /* Build configuration list for PBXNativeTarget "NewPipeline_Wicked_Server_MacOS" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				4A0000010000000000000A05 /* Debug */,
+				4A0000010000000000000A06 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 4A0000010000000000000901 /* Project object */;
+}

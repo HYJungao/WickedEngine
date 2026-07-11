@@ -96,6 +96,7 @@ namespace wi
 		bool fsrEnabled = false;
 		bool fsr2Enabled = false;
 		bool mesh_blend = true;
+		bool visibilitySurfaceResourcesForced = false;
 		bool crtFilterEnabled = false;
 
 		mutable bool first_frame = true;
@@ -304,6 +305,7 @@ namespace wi
 		constexpr bool getFSREnabled() const { return fsrEnabled; }
 		constexpr bool getFSR2Enabled() const { return fsr2Enabled; }
 		constexpr bool getVisibilityComputeShadingEnabled() const { return visibility_shading_in_compute; }
+		constexpr bool getVisibilitySurfaceResourcesForced() const { return visibilitySurfaceResourcesForced; }
 		constexpr bool getMeshBlendEnabled() const { return mesh_blend; }
 
 		constexpr void setExposure(float value) { exposure = value; }
@@ -336,6 +338,7 @@ namespace wi
 		constexpr void setSSGIDepthRejection(float value) { ssgiDepthRejection = value; }
 		constexpr void setTonemap(wi::renderer::Tonemap value) { tonemap = value; }
 		constexpr void setVisibilityComputeShadingEnabled(bool value) { visibility_shading_in_compute = value; }
+		constexpr void setVisibilitySurfaceResourcesForced(bool value) { visibilitySurfaceResourcesForced = value; }
 		constexpr void setRaytracedDiffuseQuality(wi::renderer::PostProcessQuality value) { raytracedDiffuseQuality = value; }
 		constexpr void setRaytracedReflectionsQuality(wi::renderer::PostProcessQuality value) { raytracedReflectionsQuality = value; }
 		constexpr void setSSRQuality(wi::renderer::PostProcessQuality value) { ssrQuality = value; }

@@ -1,5 +1,9 @@
 cmake_minimum_required(VERSION 3.19)
 
+if(POLICY CMP0091)
+    cmake_policy(SET CMP0091 NEW)
+endif()
+
 # enable "codegen" target if supported by CMake
 if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.31)
     cmake_policy(SET CMP0171 NEW)
@@ -38,8 +42,15 @@ if(UNIX)
 endif()
 if(UNIX)
     option(WICKED_LINUX_TEMPLATE "Build WickedEngine Linux template" ON)
+    option(WICKED_NEWPIPELINE_TEMPLATE "Build WickedEngine NewPipeline migration template" ON)
 elseif(WIN32)
     option(WICKED_WINDOWS_TEMPLATE "Build WickedEngine Windows template" ON)
+    option(WICKED_NEWPIPELINE_TEMPLATE "Build WickedEngine NewPipeline migration template" ON)
+    option(WICKED_MSVC_STATIC_RUNTIME "Use /MTd and /MT for all MSVC targets" ${WICKED_NEWPIPELINE_TEMPLATE})
+endif()
+
+if(MSVC AND WICKED_MSVC_STATIC_RUNTIME)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
 if (CMAKE_HOST_WIN32)
@@ -205,6 +216,10 @@ endif()
 
 if (WICKED_LINUX_TEMPLATE)
     add_subdirectory(Samples/Template_Linux)
+endif()
+
+if (WICKED_NEWPIPELINE_TEMPLATE)
+    add_subdirectory(Samples/NewPipeline_Wicked)
 endif()
 
 if (WICKED_WINDOWS_TEMPLATE)

@@ -628,7 +628,8 @@ namespace wi
 			wi::renderer::GetScreenSpaceShadowsEnabled() ||
 			wi::renderer::GetRaytracedShadowsEnabled() ||
 			wi::renderer::GetDDGIEnabled() ||
-			wi::renderer::GetVXGIEnabled()
+			wi::renderer::GetVXGIEnabled() ||
+			getVisibilitySurfaceResourcesForced()
 			)
 		{
 			if (!visibilityResources.IsValid())
@@ -1041,7 +1042,8 @@ namespace wi
 				wi::renderer::GetScreenSpaceShadowsEnabled() ||
 				wi::renderer::GetRaytracedShadowsEnabled() ||
 				wi::renderer::GetDDGIEnabled() ||
-				wi::renderer::GetVXGIEnabled()
+				wi::renderer::GetVXGIEnabled() ||
+				getVisibilitySurfaceResourcesForced()
 				)
 			{
 				// These post effects require surface normals and/or roughness

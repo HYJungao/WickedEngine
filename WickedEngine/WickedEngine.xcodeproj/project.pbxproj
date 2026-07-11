@@ -164,7 +164,7 @@
 		1EDA7B042EE1DFE300210D41 /* wiNetwork_Linux.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 1EDA7AA82EE1DFE300210D41 /* wiNetwork_Linux.cpp */; };
 		1EDA7B062EE1DFE300210D41 /* wiScene_Components.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 1EDA7AD92EE1DFE300210D41 /* wiScene_Components.cpp */; };
 		1EDA7B072EE1DFE300210D41 /* wiTrailRenderer_BindLua.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 1EDA7AF62EE1DFE300210D41 /* wiTrailRenderer_BindLua.cpp */; };
-		1EDA7B082EE1DFE300210D41 /* wiPrimitive.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 1EDA7AB72EE1DFE300210D41 /* wiPrimitive.cpp */; };
+		1EDA7B082EE1DFE300210D41 /* wiPrimitive.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 1EDA7AB72EE1DFE300210D41 /* wiPrimitive.cpp */; settings = {COMPILER_FLAGS = "-O0"; }; };
 		1EDA7B092EE1DFE300210D41 /* wiEmittedParticle.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 1EDA7A742EE1DFE300210D41 /* wiEmittedParticle.cpp */; };
 		1EDA7B0A2EE1DFE300210D41 /* wiProfiler.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 1EDA7ABB2EE1DFE300210D41 /* wiProfiler.cpp */; };
 		1EDA7B0B2EE1DFE300210D41 /* wiVoxelGrid.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 1EDA7B012EE1DFE300210D41 /* wiVoxelGrid.cpp */; };
@@ -177,7 +177,7 @@
 		1EDA7B132EE1DFE300210D41 /* wiTextureHelper.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 1EDA7AF12EE1DFE300210D41 /* wiTextureHelper.cpp */; };
 		1EDA7B142EE1DFE300210D41 /* wiLua.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 1EDA7A9E2EE1DFE300210D41 /* wiLua.cpp */; };
 		1EDA7B152EE1DFE300210D41 /* wiSpriteAnim_BindLua.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 1EDA7AE72EE1DFE300210D41 /* wiSpriteAnim_BindLua.cpp */; };
-		1EDA7B162EE1DFE300210D41 /* wiTerrain.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 1EDA7AED2EE1DFE300210D41 /* wiTerrain.cpp */; };
+		1EDA7B162EE1DFE300210D41 /* wiTerrain.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 1EDA7AED2EE1DFE300210D41 /* wiTerrain.cpp */; settings = {COMPILER_FLAGS = "-O0"; }; };
 		1EDA7B172EE1DFE300210D41 /* wiSpriteFont_BindLua.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 1EDA7AEB2EE1DFE300210D41 /* wiSpriteFont_BindLua.cpp */; };
 		1EDA7B182EE1DFE300210D41 /* wiInitializer.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 1EDA7A902EE1DFE300210D41 /* wiInitializer.cpp */; };
 		1EDA7B192EE1DFE300210D41 /* wiRenderer.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 1EDA7AC22EE1DFE300210D41 /* wiRenderer.cpp */; };
