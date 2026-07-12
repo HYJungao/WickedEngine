@@ -7,6 +7,40 @@
 
 namespace wicked_newpipeline
 {
+void NewPipelineServerApp::CreateDebugUI()
+{
+    if (debug_ui_created)
+        return;
+
+    debug_window.Create("NewPipeline Server Debug",
+        wi::gui::Window::WindowControls::MOVE | wi::gui::Window::WindowControls::COLLAPSE);
+    debug_window.SetPos(XMFLOAT2(20.0f, 80.0f));
+    debug_window.SetSize(XMFLOAT2(360.0f, 155.0f));
+
+    preview_buffer_combo.Create("Preview Buffer: ");
+    preview_buffer_combo.SetPos(XMFLOAT2(165.0f, 10.0f));
+    preview_buffer_combo.SetSize(XMFLOAT2(170.0f, 18.0f));
+    preview_buffer_combo.AddItem("Final", static_cast<uint64_t>(DebugPreviewMode::Final));
+    preview_buffer_combo.AddItem("Local Indirect Diffuse", static_cast<uint64_t>(DebugPreviewMode::LocalIndirectDiffuse));
+    preview_buffer_combo.AddItem("Local AO", static_cast<uint64_t>(DebugPreviewMode::LocalAO));
+    preview_buffer_combo.AddItem("Local Specular Indirect", static_cast<uint64_t>(DebugPreviewMode::LocalSpecularIndirect));
+    preview_buffer_combo.AddItem("Local Shadow Visibility", static_cast<uint64_t>(DebugPreviewMode::LocalShadowVisibility));
+    preview_buffer_combo.SetSelectedByUserdataWithoutCallback(static_cast<uint64_t>(render_path.GetDebugPreviewMode()));
+    preview_buffer_combo.OnSelect([this](const wi::gui::EventArgs& args) {
+        render_path.SetDebugPreviewMode(static_cast<DebugPreviewMode>(args.userdata));
+    });
+    debug_window.AddWidget(&preview_buffer_combo);
+
+    algorithm_label.Create("Effective algorithms");
+    algorithm_label.SetText(render_path.GetEffectiveAlgorithmSummary());
+    algorithm_label.SetPos(XMFLOAT2(10.0f, 48.0f));
+    algorithm_label.SetSize(XMFLOAT2(325.0f, 55.0f));
+    debug_window.AddWidget(&algorithm_label);
+
+    render_path.GetGUI().AddWidget(&debug_window);
+    debug_ui_created = true;
+}
+
 namespace
 {
 bool HasStartupArgument(int argc, char* argv[], const std::string& name)
@@ -124,6 +158,10 @@ void NewPipelineServerApp::ConfigureFromCommandLine(int argc, char* argv[])
 void NewPipelineServerApp::Initialize()
 {
     wi::Application::Initialize();
+    // The server must keep rendering, publishing and consuming control while
+    // another window owns focus. The base initializer resets this field from
+    // command-line arguments, therefore apply the production default after it.
+    alwaysactive = true;
 
     if (!configured)
     {
@@ -143,6 +181,15 @@ void NewPipelineServerApp::Initialize()
     infoDisplay.device_name = true;
 
     ActivatePath(&render_path);
+}
+
+void NewPipelineServerApp::Update(float dt)
+{
+    // Defer GUI creation until Wicked's asynchronous font initialization has
+    // completed. Otherwise the first glyph-atlas update can observe an empty
+    // font-style table and fail during startup.
+    CreateDebugUI();
+    wi::Application::Update(dt);
 }
 
 std::string NewPipelineServerApp::GetWindowTitle() const

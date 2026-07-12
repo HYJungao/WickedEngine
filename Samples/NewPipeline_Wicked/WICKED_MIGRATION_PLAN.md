@@ -21,6 +21,9 @@
 - 本地 signaling 下独立 Client/Server 已建立 PeerConnection。
 - Server 收到 Client 通过 `np.control` 发出的首个控制帧。
 - Client 从 `np.remote.video` 解码并接受完整 remote frame。
+- Client/Server 失焦后仍持续 Update/Render/WebRTC；两端同时切到第三方窗口后，远端 frame id 仍连续增长。
+- Client 默认显示 Final，不会因收到远端帧自动切换；Client/Server 已提供本地/远端 Buffer 调试面板。
+- Client 静置时不再自动 orbit，相机输入只在 Client 窗口聚焦时生效。
 - 一帧实际包含四个 Buffer：3 个 `2560×1440` 和 1 个 `1280×720`，合计 `47,923,200` RGBA bytes。
 - 视频内 checksum metadata 经真实 VP8 链路成功恢复，64-bit frame id 和 generation 连续生效。
 
@@ -28,9 +31,9 @@
 
 - Wicked 的四宫格 composite 只是 transport/debug preview，不是 UE 目标公式的最终生产 composite。
 - CPU readback、CPU I420 pack 和约 5120×2900 视频编码成本很高，尚未生产化。
-- `RemoteSpecularIndirect` 当前来自 SSR，`RemoteShadowVisibility` 当前依赖唯一 authoritative directional light 占 slice 0；都需要画质/场景矩阵验证。
+- `RemoteSpecularIndirect` 在硬件光追环境来自 RT Reflection、fallback 为 SSR；`RemoteShadowVisibility` 在硬件光追环境来自 RT Shadow、fallback 为 Screen Space Shadow，并依赖唯一 authoritative directional light 占 slice 0；都需要跨平台画质/场景矩阵验证。
 - 通用 CMake 现在会在 macOS 明确要求使用 Xcode 工程，并在 Linux 明确报告 Phase 7/WebRTC 平台库尚未实现，避免之前把 macOS 错当成 UNIX/SDL 并复制 `libdxcompiler.so`。
-- Linux、Windows 以及对应平台的 WebRTC archive/ABI/启动仍未完成。
+- Linux 尚未实现；Windows VS2022 x64 target/CMake 已完成，但仍需放入对应 MSVC WebRTC 库后在 Windows 主机执行编译和运行回归。
 
 ## 1. 目标
 
@@ -158,7 +161,7 @@
 验收：
 
 - Client 能本地移动相机。
-- macOS input 不完整时，Client 有自动 orbit fallback，避免静态空画面误判。
+- Client 无输入时相机保持静止；窗口失焦时忽略键鼠并结束 mouse-look，重新聚焦不发生跳转。
 - Server 能应用来自 mock/client control source 的 camera/environment state。
 - Client / Server 两个 Wicked `RenderPath3D` 均能正常输出 scene。
 - 基础 lighting、sky、shadow debug 能工作或有明确 fallback。

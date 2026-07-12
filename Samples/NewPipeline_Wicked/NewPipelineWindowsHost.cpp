@@ -12,9 +12,16 @@ LRESULT CALLBACK NewPipelineWindowProc(HWND window, UINT message, WPARAM wparam,
     switch (message)
     {
     case WM_SIZE:
-    case WM_DPICHANGED:
-        if (active_application && active_application->is_window_active)
+        if (wparam != SIZE_MINIMIZED && active_application)
             active_application->SetWindow(window);
+        return 0;
+    case WM_DPICHANGED:
+        if (active_application)
+            active_application->SetWindow(window);
+        return 0;
+    case WM_ACTIVATEAPP:
+        if (active_application)
+            active_application->is_window_active = wparam != FALSE;
         return 0;
     case WM_CHAR:
         if (wparam == VK_BACK)

@@ -1,6 +1,7 @@
 #include "NewPipelineServerRenderPath.h"
 
 #include "wiHelper.h"
+#include "wiImage.h"
 
 #include <algorithm>
 #include <chrono>
@@ -28,6 +29,19 @@ void NewPipelineServerRenderPath::SetServerSettings(const NewPipelineServerSetti
     settings = value;
     status_logged = false;
     ddgi_formal_status_logged = false;
+}
+
+void NewPipelineServerRenderPath::SetDebugPreviewMode(DebugPreviewMode mode)
+{
+    debug_preview_mode = mode;
+    debug_preview_invalid_logged = false;
+    wi::backlog::post(std::string{"Server debug preview mode: "} + ToString(debug_preview_mode));
+}
+
+std::string NewPipelineServerRenderPath::GetEffectiveAlgorithmSummary() const
+{
+    return std::string{"DDGI | "} + (hardware_raytracing ? "RTAO | RT Reflection | RT Shadow" :
+        "SSAO | SSR | Screen Space Shadow");
 }
 
 void NewPipelineServerRenderPath::Start()
@@ -72,6 +86,69 @@ void NewPipelineServerRenderPath::Update(float dt)
             (settings.ddgi_enabled && settings.ddgi_debug_formal ? "enabled" : "disabled"));
         status_logged = true;
     }
+}
+
+void NewPipelineServerRenderPath::ResizeBuffers()
+{
+    wi::RenderPath3D::ResizeBuffers();
+    local_shadow_preview_subresource = -1;
+    if (rtShadow.IsValid())
+    {
+        local_shadow_preview_subresource = wi::graphics::GetDevice()->CreateSubresource(
+            &rtShadow, wi::graphics::SubresourceType::SRV, 0, 1, 0, 1);
+    }
+}
+
+const wi::graphics::Texture* NewPipelineServerRenderPath::GetDebugPreviewTexture() const
+{
+    switch (debug_preview_mode)
+    {
+    case DebugPreviewMode::LocalIndirectDiffuse:
+        return GetDDGIRemoteIndirectDiffuseFormal().IsValid() ? &GetDDGIRemoteIndirectDiffuseFormal() : nullptr;
+    case DebugPreviewMode::LocalAO:
+        return rtAO.IsValid() ? &rtAO : nullptr;
+    case DebugPreviewMode::LocalSpecularIndirect:
+        return rtSSR.IsValid() ? &rtSSR : nullptr;
+    case DebugPreviewMode::LocalShadowVisibility:
+        return rtShadow.IsValid() && local_shadow_preview_subresource >= 0 ? &rtShadow : nullptr;
+    case DebugPreviewMode::Final:
+    default:
+        return nullptr;
+    }
+}
+
+void NewPipelineServerRenderPath::Compose(wi::graphics::CommandList cmd) const
+{
+    if (debug_preview_mode == DebugPreviewMode::Final)
+    {
+        wi::RenderPath3D::Compose(cmd);
+        return;
+    }
+
+    if (const wi::graphics::Texture* debug_texture = GetDebugPreviewTexture())
+    {
+        wi::image::Params fx;
+        fx.blendFlag = wi::enums::BLENDMODE_OPAQUE;
+        fx.quality = wi::image::QUALITY_LINEAR;
+        fx.sampleFlag = wi::image::SAMPLEMODE_CLAMP;
+        fx.enableFullScreen();
+        if (debug_preview_mode == DebugPreviewMode::LocalIndirectDiffuse ||
+            debug_preview_mode == DebugPreviewMode::LocalSpecularIndirect)
+            fx.intensity = 0.25f;
+        if (debug_preview_mode == DebugPreviewMode::LocalShadowVisibility)
+            fx.image_subresource = local_shadow_preview_subresource;
+        wi::image::Draw(debug_texture, fx, cmd);
+        wi::RenderPath2D::Compose(cmd);
+        return;
+    }
+
+    if (!debug_preview_invalid_logged)
+    {
+        wi::backlog::post(std::string{"Server debug preview unavailable, showing Final: "} +
+            ToString(debug_preview_mode));
+        debug_preview_invalid_logged = true;
+    }
+    wi::RenderPath3D::Compose(cmd);
 }
 
 void NewPipelineServerRenderPath::MaintainWebRTC(float dt)
@@ -321,7 +398,7 @@ void NewPipelineServerRenderPath::InitializeSceneIfNeeded()
 
 void NewPipelineServerRenderPath::ConfigureDDGI()
 {
-    const bool hardware_raytracing = wi::graphics::GetDevice()->CheckCapability(
+    hardware_raytracing = wi::graphics::GetDevice()->CheckCapability(
         wi::graphics::GraphicsDeviceCapability::RAYTRACING);
 
     wi::renderer::SetDDGIEnabled(settings.ddgi_enabled);

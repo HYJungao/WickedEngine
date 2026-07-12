@@ -18,9 +18,14 @@ class NewPipelineServerRenderPath final : public wi::RenderPath3D
 public:
     void SetRuntimeConfig(const RuntimeConfig& config);
     void SetServerSettings(const NewPipelineServerSettings& settings);
+    void SetDebugPreviewMode(DebugPreviewMode mode);
+    DebugPreviewMode GetDebugPreviewMode() const { return debug_preview_mode; }
+    std::string GetEffectiveAlgorithmSummary() const;
 
     void Start() override;
     void Update(float dt) override;
+    void Compose(wi::graphics::CommandList cmd) const override;
+    void ResizeBuffers() override;
 
 private:
     void InitializeSceneIfNeeded();
@@ -31,6 +36,7 @@ private:
     void MaintainWebRTC(float dt);
     bool EnsureTransportTexture(RemoteBufferSemantic semantic, uint32_t width, uint32_t height);
     bool EnsureShadowSliceTexture(uint32_t width, uint32_t height);
+    const wi::graphics::Texture* GetDebugPreviewTexture() const;
 
     RuntimeConfig config;
     NewPipelineServerSettings settings;
@@ -41,6 +47,9 @@ private:
     WebRTCVideoTransport webrtc_transport;
     std::array<wi::graphics::Texture, static_cast<size_t>(RemoteBufferSemantic::Count)> transport_textures;
     wi::graphics::Texture shadow_slice_texture;
+    DebugPreviewMode debug_preview_mode = DebugPreviewMode::Final;
+    bool hardware_raytracing = false;
+    int local_shadow_preview_subresource = -1;
     float mock_publish_accumulator = 0.0f;
     float webrtc_retry_accumulator = 0.0f;
     uint64_t last_applied_frame_id = 0;
@@ -52,5 +61,6 @@ private:
     bool mock_control_source_logged = false;
     bool mock_remote_publish_logged = false;
     bool mock_remote_disabled_logged = false;
+    mutable bool debug_preview_invalid_logged = false;
 };
 } // namespace wicked_newpipeline

@@ -276,7 +276,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "set -euo pipefail\n\nRESOURCES_DIR=\"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}\"\nmkdir -p \"${RESOURCES_DIR}/shaders\"\n\nrsync -a --delete \"${SRCROOT}/../../Editor/shaders/metal/\" \"${RESOURCES_DIR}/shaders/metal/\"\ncp -f \"${SRCROOT}/../../WickedEngine/libdxcompiler.dylib\" \"${RESOURCES_DIR}/libdxcompiler.dylib\"\nrm -rf \"${RESOURCES_DIR}/Content\"\nln -s \"${SRCROOT}/../../Content\" \"${RESOURCES_DIR}/Content\"\n";
+			shellScript = "set -euo pipefail\n\nRESOURCES_DIR=\"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}\"\nmkdir -p \"${RESOURCES_DIR}/shaders\"\n\nrsync -a --delete \"${SRCROOT}/../../Editor/shaders/metal/\" \"${RESOURCES_DIR}/shaders/metal/\"\ncp -f \"${SRCROOT}/../../WickedEngine/libdxcompiler.dylib\" \"${RESOURCES_DIR}/libdxcompiler.dylib\"\ncp -f \"${SRCROOT}/../../WickedEngine/libmetalirconverter.dylib\" \"${RESOURCES_DIR}/libmetalirconverter.dylib\"\nrm -rf \"${RESOURCES_DIR}/Content\"\nln -s \"${SRCROOT}/../../Content\" \"${RESOURCES_DIR}/Content\"\n";
 		};
 		4A0000010000000000000B02 /* Copy Wicked Runtime Resources */ = {
 			isa = PBXShellScriptBuildPhase;
@@ -295,7 +295,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "set -euo pipefail\n\nRESOURCES_DIR=\"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}\"\nmkdir -p \"${RESOURCES_DIR}/shaders\"\n\nrsync -a --delete \"${SRCROOT}/../../Editor/shaders/metal/\" \"${RESOURCES_DIR}/shaders/metal/\"\ncp -f \"${SRCROOT}/../../WickedEngine/libdxcompiler.dylib\" \"${RESOURCES_DIR}/libdxcompiler.dylib\"\nrm -rf \"${RESOURCES_DIR}/Content\"\nln -s \"${SRCROOT}/../../Content\" \"${RESOURCES_DIR}/Content\"\n";
+			shellScript = "set -euo pipefail\n\nRESOURCES_DIR=\"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}\"\nmkdir -p \"${RESOURCES_DIR}/shaders\"\n\nrsync -a --delete \"${SRCROOT}/../../Editor/shaders/metal/\" \"${RESOURCES_DIR}/shaders/metal/\"\ncp -f \"${SRCROOT}/../../WickedEngine/libdxcompiler.dylib\" \"${RESOURCES_DIR}/libdxcompiler.dylib\"\ncp -f \"${SRCROOT}/../../WickedEngine/libmetalirconverter.dylib\" \"${RESOURCES_DIR}/libmetalirconverter.dylib\"\nrm -rf \"${RESOURCES_DIR}/Content\"\nln -s \"${SRCROOT}/../../Content\" \"${RESOURCES_DIR}/Content\"\n";
 		};
 		4A0000010000000000000B03 /* Prepare WebRTC Archive */ = {
 			isa = PBXShellScriptBuildPhase;

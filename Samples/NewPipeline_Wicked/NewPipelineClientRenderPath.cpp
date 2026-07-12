@@ -68,28 +68,22 @@ std::string EnabledString(bool value)
 }
 } // namespace
 
-const char* ToString(ClientDebugPreviewMode mode)
-{
-    switch (mode)
-    {
-    case ClientDebugPreviewMode::Final:
-        return "final";
-    case ClientDebugPreviewMode::GBufferDepth:
-        return "gbuffer_depth";
-    case ClientDebugPreviewMode::GBufferNormalRoughness:
-        return "gbuffer_normal_roughness";
-    case ClientDebugPreviewMode::GBufferNormalXY:
-        return "gbuffer_normal_xy";
-    case ClientDebugPreviewMode::GBufferRoughness:
-        return "gbuffer_roughness";
-    default:
-        return "unknown";
-    }
-}
-
 void NewPipelineClientRenderPath::SetRuntimeConfig(const RuntimeConfig& value)
 {
     config        = value;
+    switch (config.remote_debug_mode)
+    {
+    case RemoteDebugMode::Raw:
+        debug_preview_mode = DebugPreviewMode::RemoteIndirectDiffuse;
+        break;
+    case RemoteDebugMode::DebugComposite:
+        debug_preview_mode = DebugPreviewMode::RemoteOverview;
+        break;
+    case RemoteDebugMode::Local:
+    default:
+        debug_preview_mode = DebugPreviewMode::Final;
+        break;
+    }
     status_logged = false;
     remote_acquire_logged = false;
 }
@@ -102,11 +96,26 @@ void NewPipelineClientRenderPath::SetSunState(const NewPipelineSunState& value)
         ApplySunStateToScene(local_scene, sun_state);
 }
 
-void NewPipelineClientRenderPath::SetDebugPreviewMode(ClientDebugPreviewMode mode)
+void NewPipelineClientRenderPath::SetDebugPreviewMode(DebugPreviewMode mode)
 {
     debug_preview_mode = mode;
     debug_preview_invalid_logged = false;
     wi::backlog::post(std::string{"Client debug preview mode: "} + ToString(debug_preview_mode));
+}
+
+std::string NewPipelineClientRenderPath::GetEffectiveAlgorithmSummary() const
+{
+    return std::string{"DDGI | "} + (hardware_raytracing ? "RTAO | RT Reflection | RT Shadow" :
+        "SSAO | SSR | Screen Space Shadow");
+}
+
+void NewPipelineClientRenderPath::SetInputActive(bool active)
+{
+    if (input_active == active)
+        return;
+    input_active = active;
+    camera_control_start = true;
+    wi::input::HidePointer(false);
 }
 
 void NewPipelineClientRenderPath::SetRenderSettings(const NewPipelineClientRenderSettings& settings)
@@ -139,6 +148,7 @@ void NewPipelineClientRenderPath::SetRenderSettings(const NewPipelineClientRende
 void NewPipelineClientRenderPath::Start()
 {
     InitializeSceneIfNeeded();
+    ConfigureComparableLocalBuffers();
     setVisibilitySurfaceResourcesForced(true);
     ApplyRenderSettings(true);
     wi::RenderPath3D::Start();
@@ -158,6 +168,17 @@ void NewPipelineClientRenderPath::Start()
         wi::backlog::post("Client remote debug composite is a preview mode, not final material GI composite.");
     }
     status_logged = true;
+}
+
+void NewPipelineClientRenderPath::ResizeBuffers()
+{
+    wi::RenderPath3D::ResizeBuffers();
+    local_shadow_preview_subresource = -1;
+    if (rtShadow.IsValid())
+    {
+        local_shadow_preview_subresource = wi::graphics::GetDevice()->CreateSubresource(
+            &rtShadow, wi::graphics::SubresourceType::SRV, 0, 1, 0, 1);
+    }
 }
 
 void NewPipelineClientRenderPath::Update(float dt)
@@ -248,15 +269,33 @@ void NewPipelineClientRenderPath::ApplyRenderSettings(bool log_changes)
     }
 }
 
+void NewPipelineClientRenderPath::ConfigureComparableLocalBuffers()
+{
+    hardware_raytracing = wi::graphics::GetDevice()->CheckCapability(
+        wi::graphics::GraphicsDeviceCapability::RAYTRACING);
+    local_scene.ddgi.grid_dimensions = XMUINT3(8, 4, 8);
+    wi::renderer::SetDDGIEnabled(true);
+    wi::renderer::SetDDGIRayCount(32);
+    wi::renderer::SetDDGIBlendSpeed(0.1f);
+    wi::renderer::SetDDGIDebugEnabled(false);
+    setRaytracedReflectionsEnabled(hardware_raytracing);
+    setSSREnabled(!hardware_raytracing);
+    wi::backlog::post("Client local preview algorithms: " + GetEffectiveAlgorithmSummary());
+}
+
 void NewPipelineClientRenderPath::ApplyShadowSettings(bool log_changes)
 {
     setShadowsEnabled(render_settings.shadow_maps_enabled);
     wi::renderer::SetShadowsEnabled(render_settings.shadow_maps_enabled);
     wi::renderer::SetShadowProps2D(render_settings.shadow_maps_enabled ? kMobileShadow2DResolution : 0);
     wi::renderer::SetShadowPropsCube(render_settings.shadow_maps_enabled ? kMobileShadowCubeResolution : 0);
+    wi::renderer::SetRaytracedShadowsEnabled(render_settings.shadow_maps_enabled && hardware_raytracing);
+    wi::renderer::SetScreenSpaceShadowsEnabled(render_settings.shadow_maps_enabled && !hardware_raytracing);
     if (log_changes)
     {
-        wi::backlog::post("Client shadow maps: " + EnabledString(render_settings.shadow_maps_enabled));
+        wi::backlog::post(std::string{"Client local shadows ("} +
+            (hardware_raytracing ? "RT Shadow" : "Screen Space Shadow") + "): " +
+            EnabledString(render_settings.shadow_maps_enabled));
     }
 }
 
@@ -265,10 +304,13 @@ void NewPipelineClientRenderPath::ApplySSAOSettings(bool log_changes)
     setAORange(1.0f);
     setAOSampleCount(8);
     setAOPower(1.0f);
-    setAO(render_settings.ssao_enabled ? wi::RenderPath3D::AO_SSAO : wi::RenderPath3D::AO_DISABLED);
+    setAO(render_settings.ssao_enabled
+        ? (hardware_raytracing ? wi::RenderPath3D::AO_RTAO : wi::RenderPath3D::AO_SSAO)
+        : wi::RenderPath3D::AO_DISABLED);
     if (log_changes)
     {
-        wi::backlog::post("Client SSAO: " + EnabledString(render_settings.ssao_enabled));
+        wi::backlog::post(std::string{"Client local AO ("} +
+            (hardware_raytracing ? "RTAO" : "SSAO") + "): " + EnabledString(render_settings.ssao_enabled));
     }
 }
 
@@ -479,6 +521,13 @@ bool NewPipelineClientRenderPath::ObjectSupportsLightmapBake(const wi::scene::Ob
 
 void NewPipelineClientRenderPath::UpdateLocalCamera(float dt)
 {
+    if (!input_active)
+    {
+        camera_control_start = true;
+        wi::input::HidePointer(false);
+        local_camera.UpdateCamera();
+        return;
+    }
     const bool mouse_look_down = IsDown(wi::input::MOUSE_BUTTON_MIDDLE) || IsDown(wi::input::MOUSE_BUTTON_RIGHT);
     const bool gui_interacting = GetGUI().IsTyping() ||
         (GetGUI().HasFocus() && !mouse_look_down && IsDown(wi::input::MOUSE_BUTTON_LEFT));
@@ -496,8 +545,6 @@ void NewPipelineClientRenderPath::UpdateLocalCamera(float dt)
     const float base_speed = IsDown(wi::input::KEYBOARD_BUTTON_LSHIFT) || IsDown(wi::input::KEYBOARD_BUTTON_RSHIFT) ? 12.0f : 4.0f;
     const float move_speed = base_speed * dt;
 
-    bool moved_by_input = false;
-
     if (camera_control_start)
     {
         camera_control_origin = wi::input::GetPointer();
@@ -512,7 +559,6 @@ void NewPipelineClientRenderPath::UpdateLocalCamera(float dt)
         camera_rotation.x = std::max(wi::math::DegreesToRadians(-89.0f), std::min(wi::math::DegreesToRadians(89.0f), camera_rotation.x));
         wi::input::SetPointer(camera_control_origin);
         wi::input::HidePointer(true);
-        moved_by_input = true;
     }
     else
     {
@@ -533,33 +579,24 @@ void NewPipelineClientRenderPath::UpdateLocalCamera(float dt)
         camera_position.x += forward.x * move_speed;
         camera_position.y += forward.y * move_speed;
         camera_position.z += forward.z * move_speed;
-        moved_by_input = true;
     }
     if (IsCharacterDown('S') || IsDown(wi::input::KEYBOARD_BUTTON_DOWN))
     {
         camera_position.x -= forward.x * move_speed;
         camera_position.y -= forward.y * move_speed;
         camera_position.z -= forward.z * move_speed;
-        moved_by_input = true;
     }
     if (IsCharacterDown('D') || IsDown(wi::input::KEYBOARD_BUTTON_RIGHT))
     {
         camera_position.x += right.x * move_speed;
         camera_position.y += right.y * move_speed;
         camera_position.z += right.z * move_speed;
-        moved_by_input = true;
     }
     if (IsCharacterDown('A') || IsDown(wi::input::KEYBOARD_BUTTON_LEFT))
     {
         camera_position.x -= right.x * move_speed;
         camera_position.y -= right.y * move_speed;
         camera_position.z -= right.z * move_speed;
-        moved_by_input = true;
-    }
-
-    if (!moved_by_input)
-    {
-        camera_rotation.y += dt * 0.05f;
     }
 
     transform.ClearTransform();
@@ -895,28 +932,34 @@ void NewPipelineClientRenderPath::AcquireRemoteVideoFrame(float dt)
     AcceptRemoteFrame(frame);
 }
 
-bool NewPipelineClientRenderPath::ShouldDisplayRemote() const
-{
-    if (config.remote_debug_mode == RemoteDebugMode::Local)
-        return false;
-    const size_t indirect_index = static_cast<size_t>(RemoteBufferSemantic::RemoteIndirectDiffuse);
-    if (!remote_consume.accepted_valid || !accepted_remote_textures[indirect_index].IsValid())
-        return false;
-    return config.remote_debug_mode == RemoteDebugMode::Raw ||
-        config.remote_debug_mode == RemoteDebugMode::DebugComposite;
-}
-
 const wi::graphics::Texture* NewPipelineClientRenderPath::GetDebugPreviewTexture() const
 {
     switch (debug_preview_mode)
     {
-    case ClientDebugPreviewMode::GBufferDepth:
+    case DebugPreviewMode::GBufferDepth:
         return depthBuffer_Copy.IsValid() ? &depthBuffer_Copy : nullptr;
-    case ClientDebugPreviewMode::GBufferNormalRoughness:
-    case ClientDebugPreviewMode::GBufferNormalXY:
-    case ClientDebugPreviewMode::GBufferRoughness:
+    case DebugPreviewMode::GBufferNormalRoughness:
+    case DebugPreviewMode::GBufferNormalXY:
+    case DebugPreviewMode::GBufferRoughness:
         return visibilityResources.texture_normal_roughness.IsValid() ? &visibilityResources.texture_normal_roughness : nullptr;
-    case ClientDebugPreviewMode::Final:
+    case DebugPreviewMode::LocalIndirectDiffuse:
+        return GetDDGIRemoteIndirectDiffuseFormal().IsValid() ? &GetDDGIRemoteIndirectDiffuseFormal() : nullptr;
+    case DebugPreviewMode::LocalAO:
+        return rtAO.IsValid() ? &rtAO : nullptr;
+    case DebugPreviewMode::LocalSpecularIndirect:
+        return rtSSR.IsValid() ? &rtSSR : nullptr;
+    case DebugPreviewMode::LocalShadowVisibility:
+        return rtShadow.IsValid() && local_shadow_preview_subresource >= 0 ? &rtShadow : nullptr;
+    case DebugPreviewMode::RemoteIndirectDiffuse:
+        return remote_consume.accepted_valid && accepted_remote_textures[0].IsValid() ? &accepted_remote_textures[0] : nullptr;
+    case DebugPreviewMode::RemoteAO:
+        return remote_consume.accepted_valid && accepted_remote_textures[1].IsValid() ? &accepted_remote_textures[1] : nullptr;
+    case DebugPreviewMode::RemoteSpecularIndirect:
+        return remote_consume.accepted_valid && accepted_remote_textures[2].IsValid() ? &accepted_remote_textures[2] : nullptr;
+    case DebugPreviewMode::RemoteShadowVisibility:
+        return remote_consume.accepted_valid && accepted_remote_textures[3].IsValid() ? &accepted_remote_textures[3] : nullptr;
+    case DebugPreviewMode::Final:
+    case DebugPreviewMode::RemoteOverview:
     default:
         return nullptr;
     }
@@ -924,70 +967,62 @@ const wi::graphics::Texture* NewPipelineClientRenderPath::GetDebugPreviewTexture
 
 void NewPipelineClientRenderPath::Compose(wi::graphics::CommandList cmd) const
 {
-    if (debug_preview_mode != ClientDebugPreviewMode::Final)
-    {
-        const wi::graphics::Texture* debug_texture = GetDebugPreviewTexture();
-        if (debug_texture != nullptr)
-        {
-            wi::image::Params fx;
-            fx.blendFlag = wi::enums::BLENDMODE_OPAQUE;
-            fx.quality = wi::image::QUALITY_NEAREST;
-            fx.sampleFlag = wi::image::SAMPLEMODE_CLAMP;
-            fx.enableFullScreen();
-            if (debug_preview_mode == ClientDebugPreviewMode::GBufferNormalXY)
-            {
-                fx.color = XMFLOAT4(1.0f, 1.0f, 0.0f, 1.0f);
-            }
-            else if (debug_preview_mode == ClientDebugPreviewMode::GBufferRoughness)
-            {
-                fx.color = XMFLOAT4(0.0f, 0.0f, 4.0f, 1.0f);
-            }
-            wi::image::Draw(debug_texture, fx, cmd);
-            wi::RenderPath2D::Compose(cmd);
-            return;
-        }
-
-        if (!debug_preview_invalid_logged)
-        {
-            wi::backlog::post(std::string{"Client debug preview unavailable, falling back to final: "} +
-                ToString(debug_preview_mode));
-            debug_preview_invalid_logged = true;
-        }
-    }
-
-    if (!ShouldDisplayRemote())
+    if (debug_preview_mode == DebugPreviewMode::Final)
     {
         wi::RenderPath3D::Compose(cmd);
         return;
     }
 
-    if (config.remote_debug_mode == RemoteDebugMode::Raw)
+    if (debug_preview_mode == DebugPreviewMode::RemoteOverview)
+    {
+        if (remote_consume.accepted_valid)
+        {
+            const float half_width = GetLogicalWidth() * 0.5f;
+            const float half_height = GetLogicalHeight() * 0.5f;
+            for (size_t index = 0; index < accepted_remote_textures.size(); ++index)
+            {
+                if (!accepted_remote_textures[index].IsValid())
+                    continue;
+                wi::image::Params fx;
+                fx.blendFlag = wi::enums::BLENDMODE_OPAQUE;
+                fx.quality = wi::image::QUALITY_LINEAR;
+                fx.sampleFlag = wi::image::SAMPLEMODE_CLAMP;
+                fx.pos = XMFLOAT3((index & 1u) * half_width, (index / 2u) * half_height, 0.0f);
+                fx.siz = XMFLOAT2(half_width, half_height);
+                wi::image::Draw(&accepted_remote_textures[index], fx, cmd);
+            }
+            wi::RenderPath2D::Compose(cmd);
+            return;
+        }
+    }
+    else if (const wi::graphics::Texture* debug_texture = GetDebugPreviewTexture())
     {
         wi::image::Params fx;
         fx.blendFlag = wi::enums::BLENDMODE_OPAQUE;
         fx.quality = wi::image::QUALITY_LINEAR;
+        fx.sampleFlag = wi::image::SAMPLEMODE_CLAMP;
         fx.enableFullScreen();
-        wi::image::Draw(&accepted_remote_textures[static_cast<size_t>(RemoteBufferSemantic::RemoteIndirectDiffuse)], fx, cmd);
-    }
-    else
-    {
-        // DebugComposite deliberately visualizes the four formal video tiles. The production
-        // material formula is implemented by the UE renderer injection path, not by this preview.
-        const float half_width = GetLogicalWidth() * 0.5f;
-        const float half_height = GetLogicalHeight() * 0.5f;
-        for (size_t index = 0; index < accepted_remote_textures.size(); ++index)
-        {
-            if (!accepted_remote_textures[index].IsValid())
-                continue;
-            wi::image::Params fx;
-            fx.blendFlag = wi::enums::BLENDMODE_OPAQUE;
-            fx.quality = wi::image::QUALITY_LINEAR;
-            fx.pos = XMFLOAT3((index & 1u) * half_width, (index / 2u) * half_height, 0.0f);
-            fx.siz = XMFLOAT2(half_width, half_height);
-            wi::image::Draw(&accepted_remote_textures[index], fx, cmd);
-        }
+        if (debug_preview_mode == DebugPreviewMode::GBufferNormalXY)
+            fx.color = XMFLOAT4(1.0f, 1.0f, 0.0f, 1.0f);
+        else if (debug_preview_mode == DebugPreviewMode::GBufferRoughness)
+            fx.color = XMFLOAT4(0.0f, 0.0f, 4.0f, 1.0f);
+        else if (debug_preview_mode == DebugPreviewMode::LocalIndirectDiffuse ||
+            debug_preview_mode == DebugPreviewMode::LocalSpecularIndirect)
+            fx.intensity = 0.25f;
+        if (debug_preview_mode == DebugPreviewMode::LocalShadowVisibility)
+            fx.image_subresource = local_shadow_preview_subresource;
+        wi::image::Draw(debug_texture, fx, cmd);
+        wi::RenderPath2D::Compose(cmd);
+        return;
     }
 
-    wi::RenderPath2D::Compose(cmd);
+    if (!debug_preview_invalid_logged)
+    {
+        wi::backlog::post(std::string{"Client debug preview unavailable, showing Final: "} +
+            ToString(debug_preview_mode));
+        debug_preview_invalid_logged = true;
+    }
+
+    wi::RenderPath3D::Compose(cmd);
 }
 } // namespace wicked_newpipeline

@@ -52,6 +52,24 @@ enum class RemoteDebugMode : uint8_t
     DebugComposite
 };
 
+enum class DebugPreviewMode : uint8_t
+{
+    Final,
+    GBufferDepth,
+    GBufferNormalRoughness,
+    GBufferNormalXY,
+    GBufferRoughness,
+    LocalIndirectDiffuse,
+    LocalAO,
+    LocalSpecularIndirect,
+    LocalShadowVisibility,
+    RemoteIndirectDiffuse,
+    RemoteAO,
+    RemoteSpecularIndirect,
+    RemoteShadowVisibility,
+    RemoteOverview,
+};
+
 struct RemoteFrameMetadata
 {
     uint64_t           frame_id          = 0;
@@ -99,7 +117,7 @@ struct RemoteStreamConfig
 struct RuntimeConfig
 {
     RemoteSourceMode        remote_source = RemoteSourceMode::WebRTC;
-    RemoteDebugMode         remote_debug_mode = RemoteDebugMode::DebugComposite;
+    RemoteDebugMode         remote_debug_mode = RemoteDebugMode::Local;
     std::string             signaling_url = "ws://127.0.0.1:39876";
     std::string             room_id = "NewPipeline.Wicked.V1";
     bool                    use_internet_ice = false;
@@ -115,6 +133,7 @@ const char* ToString(RemoteBufferSemantic semantic);
 const char* ToString(RemoteSourceMode mode);
 const char* ToString(RemoteDynamicRange range);
 const char* ToString(RemoteDebugMode mode);
+const char* ToString(DebugPreviewMode mode);
 
 RemoteSourceMode ParseRemoteSourceMode(const std::string& value, RemoteSourceMode fallback);
 RemoteDebugMode ParseRemoteDebugMode(const std::string& value, RemoteDebugMode fallback);

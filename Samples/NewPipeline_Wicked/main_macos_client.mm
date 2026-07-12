@@ -90,6 +90,16 @@ int main(int argc, char* argv[])
 }
 
 @implementation WindowDelegate
+- (void)windowDidBecomeKey:(NSNotification*)notification
+{
+    application.is_window_active = true;
+}
+
+- (void)windowDidResignKey:(NSNotification*)notification
+{
+    application.is_window_active = false;
+}
+
 - (void)windowWillClose:(NSNotification*)notification
 {
     running = false;

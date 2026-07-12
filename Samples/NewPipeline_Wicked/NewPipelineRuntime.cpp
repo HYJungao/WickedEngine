@@ -126,6 +126,28 @@ const char* ToString(RemoteDebugMode mode)
     }
 }
 
+const char* ToString(DebugPreviewMode mode)
+{
+    switch (mode)
+    {
+    case DebugPreviewMode::Final: return "final";
+    case DebugPreviewMode::GBufferDepth: return "gbuffer_depth";
+    case DebugPreviewMode::GBufferNormalRoughness: return "gbuffer_normal_roughness";
+    case DebugPreviewMode::GBufferNormalXY: return "gbuffer_normal_xy";
+    case DebugPreviewMode::GBufferRoughness: return "gbuffer_roughness";
+    case DebugPreviewMode::LocalIndirectDiffuse: return "local_indirect_diffuse";
+    case DebugPreviewMode::LocalAO: return "local_ao";
+    case DebugPreviewMode::LocalSpecularIndirect: return "local_specular_indirect";
+    case DebugPreviewMode::LocalShadowVisibility: return "local_shadow_visibility";
+    case DebugPreviewMode::RemoteIndirectDiffuse: return "remote_indirect_diffuse";
+    case DebugPreviewMode::RemoteAO: return "remote_ao";
+    case DebugPreviewMode::RemoteSpecularIndirect: return "remote_specular_indirect";
+    case DebugPreviewMode::RemoteShadowVisibility: return "remote_shadow_visibility";
+    case DebugPreviewMode::RemoteOverview: return "remote_overview";
+    default: return "unknown";
+    }
+}
+
 RemoteSourceMode ParseRemoteSourceMode(const std::string& value, RemoteSourceMode fallback)
 {
     const std::string token = NormalizeToken(value);

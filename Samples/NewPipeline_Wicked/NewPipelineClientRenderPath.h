@@ -7,17 +7,6 @@
 
 namespace wicked_newpipeline
 {
-enum class ClientDebugPreviewMode : uint8_t
-{
-    Final,
-    GBufferDepth,
-    GBufferNormalRoughness,
-    GBufferNormalXY,
-    GBufferRoughness,
-};
-
-const char* ToString(ClientDebugPreviewMode mode);
-
 struct NewPipelineClientRenderSettings
 {
     bool shadow_maps_enabled = true;
@@ -53,14 +42,17 @@ public:
     void SetRuntimeConfig(const RuntimeConfig& config);
     void SetSunState(const NewPipelineSunState& state);
     const NewPipelineSunState& GetSunState() const { return sun_state; }
-    void SetDebugPreviewMode(ClientDebugPreviewMode mode);
-    ClientDebugPreviewMode GetDebugPreviewMode() const { return debug_preview_mode; }
+    void SetDebugPreviewMode(DebugPreviewMode mode);
+    DebugPreviewMode GetDebugPreviewMode() const { return debug_preview_mode; }
+    std::string GetEffectiveAlgorithmSummary() const;
+    void SetInputActive(bool active);
     void SetRenderSettings(const NewPipelineClientRenderSettings& settings);
     const NewPipelineClientRenderSettings& GetRenderSettings() const { return render_settings; }
 
     void Start() override;
     void Update(float dt) override;
     void Compose(wi::graphics::CommandList cmd) const override;
+    void ResizeBuffers() override;
 
 private:
     void InitializeSceneIfNeeded();
@@ -73,9 +65,9 @@ private:
     void AcceptRemoteFrame(const RemoteRawFrame& frame);
     void InvalidateRemote(const std::string& reason);
     bool UploadRemoteTextures(const RemoteRawFrame& frame);
-    bool ShouldDisplayRemote() const;
     const wi::graphics::Texture* GetDebugPreviewTexture() const;
     void ApplyRenderSettings(bool log_changes);
+    void ConfigureComparableLocalBuffers();
     void ApplyShadowSettings(bool log_changes);
     void ApplySSAOSettings(bool log_changes);
     void ApplyEnvironmentProbeSettings(bool log_changes);
@@ -96,7 +88,7 @@ private:
 
     NewPipelineClientRenderSettings render_settings;
     NewPipelineSunState sun_state = MakeSunStateFromAngles(true, -35.0f, 50.0f);
-    ClientDebugPreviewMode debug_preview_mode = ClientDebugPreviewMode::Final;
+    DebugPreviewMode debug_preview_mode = DebugPreviewMode::Final;
     wi::scene::Scene local_scene;
     wi::scene::CameraComponent local_camera;
     wi::vector<SavedLightmap> saved_lightmaps;
@@ -118,6 +110,9 @@ private:
     bool has_published_control_packet = false;
     bool scene_initialized = false;
     bool camera_control_start = true;
+    bool input_active = true;
+    bool hardware_raytracing = false;
+    int local_shadow_preview_subresource = -1;
     bool          status_logged = false;
     bool mock_control_publish_logged = false;
     bool remote_acquire_logged = false;

@@ -24,6 +24,20 @@ real-WebRTC path. Use `--remote_source=mock` (or `--no_webrtc`) only for mock
 testing. `--webrtc_signal`, `--webrtc_room`, `--webrtc_internet`, and
 `--remote_fps` override the production-path defaults.
 
+## Focus and buffer previews
+
+Client and Server continue updating, rendering and servicing WebRTC while their
+windows are unfocused. Client camera input is disabled while unfocused and no
+automatic camera orbit is applied.
+
+The Client starts on `Final`; receiving a remote frame never changes the
+selection. Its **Preview Buffer** menu contains local DDGI/AO/reflection/shadow,
+the four accepted remote buffers, and an explicit `Remote 2x2 Overview`. The
+Server debug panel contains `Final` and its four local producer buffers. The
+legacy options remain compatible: `--remote_debug=local` selects `Final`,
+`raw` selects `Remote Indirect Diffuse`, and `debug_composite` selects the
+explicit remote overview.
+
 ## macOS
 
 Open `NewPipeline_Wicked_MacOS.xcodeproj`, start the signaling relay, then run
@@ -66,4 +80,5 @@ required.
 The server always uses DDGI for `RemoteIndirectDiffuse`. Hardware ray-tracing
 devices use RTAO, RT Reflection, and RT Shadow for the other three buffers.
 Devices without ray tracing automatically use SSAO, SSR, and Screen Space
-Shadow; the effective selection is printed at startup.
+Shadow; Client local previews use the same selection. The effective algorithms
+are printed at startup and displayed in both debug panels.

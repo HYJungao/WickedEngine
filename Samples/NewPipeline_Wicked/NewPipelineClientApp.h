@@ -14,6 +14,7 @@ public:
     void ConfigureFromCommandLine(int argc, char* argv[]);
 
     void Initialize() override;
+    void Update(float dt) override;
 
     const RuntimeConfig& GetRuntimeConfig() const { return runtime_config; }
     std::string GetWindowTitle() const;
@@ -28,6 +29,7 @@ private:
     wi::gui::Slider              sun_yaw_slider;
     wi::gui::Slider              sun_pitch_slider;
     wi::gui::ComboBox            preview_buffer_combo;
+    wi::gui::Label               algorithm_label;
     wi::gui::CheckBox            shadow_maps_checkbox;
     wi::gui::CheckBox            ssao_checkbox;
     wi::gui::CheckBox            environment_probe_checkbox;
