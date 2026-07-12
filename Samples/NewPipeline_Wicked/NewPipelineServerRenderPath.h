@@ -9,7 +9,7 @@ struct NewPipelineServerSettings
 {
     bool ddgi_enabled = true;
     bool ddgi_debug_formal = false;
-    uint32_t ddgi_ray_count = 32;
+    uint32_t ddgi_ray_count = 64;
     float remote_publish_fps = 1.0f;
 };
 
@@ -27,6 +27,7 @@ public:
     void Compose(wi::graphics::CommandList cmd) const override;
     void ResizeBuffers() override;
     void RenderAO(wi::graphics::CommandList cmd) const override;
+    void RenderPostprocessChain(wi::graphics::CommandList cmd) const override;
 
 private:
     void InitializeSceneIfNeeded();
@@ -47,11 +48,10 @@ private:
     FileMockRemoteMailbox mock_remote_mailbox;
     WebRTCVideoTransport webrtc_transport;
     std::array<wi::graphics::Texture, static_cast<size_t>(RemoteBufferSemantic::Count)> transport_textures;
-    wi::graphics::Texture shadow_slice_texture;
+    mutable wi::graphics::Texture shadow_slice_texture;
     mutable wi::graphics::Texture local_ao_snapshot;
     DebugPreviewMode debug_preview_mode = DebugPreviewMode::Final;
     bool hardware_raytracing = false;
-    int local_shadow_preview_subresource = -1;
     float mock_publish_accumulator = 0.0f;
     float webrtc_retry_accumulator = 0.0f;
     uint64_t last_applied_frame_id = 0;

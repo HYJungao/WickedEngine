@@ -100,11 +100,9 @@ void NewPipelineServerRenderPath::ResizeBuffers()
         wi::graphics::GetDevice()->CreateTexture(&desc, nullptr, &local_ao_snapshot);
         wi::graphics::GetDevice()->SetName(&local_ao_snapshot, "newpipeline.server.local_ao_snapshot");
     }
-    local_shadow_preview_subresource = -1;
     if (rtShadow.IsValid())
     {
-        local_shadow_preview_subresource = wi::graphics::GetDevice()->CreateSubresource(
-            &rtShadow, wi::graphics::SubresourceType::SRV, 0, 1, 0, 1);
+        EnsureShadowSliceTexture(rtShadow.GetDesc().width, rtShadow.GetDesc().height);
     }
 }
 
@@ -115,6 +113,30 @@ void NewPipelineServerRenderPath::RenderAO(wi::graphics::CommandList cmd) const
     // result while it is authoritative, before the base renderer reuses it.
     if (rtAO.IsValid() && local_ao_snapshot.IsValid())
         wi::renderer::CopyTexture2D(local_ao_snapshot, rtAO, cmd);
+}
+
+void NewPipelineServerRenderPath::RenderPostprocessChain(wi::graphics::CommandList cmd) const
+{
+    wi::RenderPath3D::RenderPostprocessChain(cmd);
+    if (!rtShadow.IsValid() || !shadow_slice_texture.IsValid())
+        return;
+
+    wi::graphics::GraphicsDevice* device = wi::graphics::GetDevice();
+    const wi::graphics::GPUBarrier before[] = {
+        wi::graphics::GPUBarrier::Image(
+            &rtShadow, rtShadow.GetDesc().layout, wi::graphics::ResourceState::COPY_SRC, -1, 0),
+        wi::graphics::GPUBarrier::Image(
+            &shadow_slice_texture, shadow_slice_texture.GetDesc().layout, wi::graphics::ResourceState::COPY_DST),
+    };
+    device->Barrier(before, static_cast<uint32_t>(std::size(before)), cmd);
+    device->CopyTexture(&shadow_slice_texture, 0, 0, 0, 0, 0, &rtShadow, 0, 0, cmd);
+    const wi::graphics::GPUBarrier after[] = {
+        wi::graphics::GPUBarrier::Image(
+            &rtShadow, wi::graphics::ResourceState::COPY_SRC, rtShadow.GetDesc().layout, -1, 0),
+        wi::graphics::GPUBarrier::Image(
+            &shadow_slice_texture, wi::graphics::ResourceState::COPY_DST, shadow_slice_texture.GetDesc().layout),
+    };
+    device->Barrier(after, static_cast<uint32_t>(std::size(after)), cmd);
 }
 
 const wi::graphics::Texture* NewPipelineServerRenderPath::GetDebugPreviewTexture() const
@@ -128,7 +150,7 @@ const wi::graphics::Texture* NewPipelineServerRenderPath::GetDebugPreviewTexture
     case DebugPreviewMode::LocalSpecularIndirect:
         return rtSSR.IsValid() ? &rtSSR : nullptr;
     case DebugPreviewMode::LocalShadowVisibility:
-        return rtShadow.IsValid() && local_shadow_preview_subresource >= 0 ? &rtShadow : nullptr;
+        return shadow_slice_texture.IsValid() ? &shadow_slice_texture : nullptr;
     case DebugPreviewMode::Final:
     default:
         return nullptr;
@@ -156,8 +178,6 @@ void NewPipelineServerRenderPath::Compose(wi::graphics::CommandList cmd) const
         if (debug_preview_mode == DebugPreviewMode::LocalAO ||
             debug_preview_mode == DebugPreviewMode::LocalShadowVisibility)
             fx.enableExtractChannelR();
-        if (debug_preview_mode == DebugPreviewMode::LocalShadowVisibility)
-            fx.image_subresource = local_shadow_preview_subresource;
         wi::image::Draw(debug_texture, fx, cmd);
         wi::RenderPath2D::Compose(cmd);
         return;
@@ -283,7 +303,7 @@ void NewPipelineServerRenderPath::PublishRemotePayload(float dt)
         settings.ddgi_enabled ? &GetDDGIRemoteIndirectDiffuseFormal() : nullptr,
         local_ao_snapshot.IsValid() ? &local_ao_snapshot : nullptr,
         rtSSR.IsValid() ? &rtSSR : nullptr,
-        rtShadow.IsValid() ? &rtShadow : nullptr,
+        shadow_slice_texture.IsValid() ? &shadow_slice_texture : nullptr,
     };
     wi::graphics::GraphicsDevice* device = wi::graphics::GetDevice();
     wi::graphics::CommandList cmd = device->BeginCommandList();
@@ -298,19 +318,7 @@ void NewPipelineServerRenderPath::PublishRemotePayload(float dt)
         if (!EnsureTransportTexture(semantic, source_desc.width, source_desc.height))
             continue;
 
-        if (semantic == RemoteBufferSemantic::RemoteShadowVisibility)
-        {
-            if (!EnsureShadowSliceTexture(source_desc.width, source_desc.height))
-                continue;
-            // The authoritative NewPipeline sun is the only active directional shadow caster,
-            // therefore its screen-space visibility occupies slice zero.
-            device->CopyTexture(&shadow_slice_texture, 0, 0, 0, 0, 0, source, 0, 0, cmd);
-            wi::renderer::CopyTexture2D(transport_textures[index], shadow_slice_texture, cmd);
-        }
-        else
-        {
-            wi::renderer::CopyTexture2D(transport_textures[index], *source, cmd);
-        }
+        wi::renderer::CopyTexture2D(transport_textures[index], *source, cmd);
         available_mask |= RemoteBufferKindMask(semantic);
     }
     if (available_mask == 0)
@@ -400,7 +408,7 @@ void NewPipelineServerRenderPath::InitializeSceneIfNeeded()
         (uint32_t)GetLogicalHeight(),
         result.kind,
         &local_scene);
-    local_scene.ddgi.grid_dimensions = XMUINT3(8, 4, 8);
+    local_scene.ddgi.grid_dimensions = XMUINT3(16, 8, 16);
 
     std::string scene_message = std::string{"Server scene initialized: "} + ToString(result.kind);
     if (!result.loaded_asset_path.empty())
@@ -417,7 +425,7 @@ void NewPipelineServerRenderPath::InitializeSceneIfNeeded()
     wi::backlog::post(config.remote_source == RemoteSourceMode::Mock
         ? "Server using file mock control source: " + mock_control_mailbox.GetRootDirectory()
         : "Server using WebRTC DataChannel for client control only; frame output is video-track only.");
-    wi::backlog::post("Server DDGI grid dimensions: 8 x 4 x 8.");
+    wi::backlog::post("Server DDGI grid dimensions: 16 x 8 x 16 (quality preset).");
 
     scene_initialized = true;
 }
@@ -429,7 +437,7 @@ void NewPipelineServerRenderPath::ConfigureDDGI()
 
     wi::renderer::SetDDGIEnabled(settings.ddgi_enabled);
     wi::renderer::SetDDGIRayCount(settings.ddgi_enabled ? settings.ddgi_ray_count : 0u);
-    wi::renderer::SetDDGIBlendSpeed(0.1f);
+    wi::renderer::SetDDGIBlendSpeed(0.05f);
     wi::renderer::SetDDGIDebugEnabled(false);
     setAO(hardware_raytracing ? wi::RenderPath3D::AO_RTAO : wi::RenderPath3D::AO_SSAO);
     setRaytracedReflectionsEnabled(hardware_raytracing);

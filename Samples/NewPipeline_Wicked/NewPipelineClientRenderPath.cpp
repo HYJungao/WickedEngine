@@ -182,11 +182,16 @@ void NewPipelineClientRenderPath::ResizeBuffers()
         wi::graphics::GetDevice()->CreateTexture(&desc, nullptr, &local_ao_snapshot);
         wi::graphics::GetDevice()->SetName(&local_ao_snapshot, "newpipeline.client.local_ao_snapshot");
     }
-    local_shadow_preview_subresource = -1;
+    local_shadow_snapshot = {};
     if (rtShadow.IsValid())
     {
-        local_shadow_preview_subresource = wi::graphics::GetDevice()->CreateSubresource(
-            &rtShadow, wi::graphics::SubresourceType::SRV, 0, 1, 0, 1);
+        wi::graphics::TextureDesc desc = rtShadow.GetDesc();
+        desc.type = wi::graphics::TextureDesc::Type::TEXTURE_2D;
+        desc.array_size = 1;
+        desc.bind_flags = wi::graphics::BindFlag::SHADER_RESOURCE;
+        desc.layout = wi::graphics::ResourceState::SHADER_RESOURCE;
+        wi::graphics::GetDevice()->CreateTexture(&desc, nullptr, &local_shadow_snapshot);
+        wi::graphics::GetDevice()->SetName(&local_shadow_snapshot, "newpipeline.client.local_shadow_snapshot");
     }
 }
 
@@ -195,6 +200,30 @@ void NewPipelineClientRenderPath::RenderAO(wi::graphics::CommandList cmd) const
     wi::RenderPath3D::RenderAO(cmd);
     if (rtAO.IsValid() && local_ao_snapshot.IsValid())
         wi::renderer::CopyTexture2D(local_ao_snapshot, rtAO, cmd);
+}
+
+void NewPipelineClientRenderPath::RenderPostprocessChain(wi::graphics::CommandList cmd) const
+{
+    wi::RenderPath3D::RenderPostprocessChain(cmd);
+    if (!rtShadow.IsValid() || !local_shadow_snapshot.IsValid())
+        return;
+
+    wi::graphics::GraphicsDevice* device = wi::graphics::GetDevice();
+    const wi::graphics::GPUBarrier before[] = {
+        wi::graphics::GPUBarrier::Image(
+            &rtShadow, rtShadow.GetDesc().layout, wi::graphics::ResourceState::COPY_SRC, -1, 0),
+        wi::graphics::GPUBarrier::Image(
+            &local_shadow_snapshot, local_shadow_snapshot.GetDesc().layout, wi::graphics::ResourceState::COPY_DST),
+    };
+    device->Barrier(before, static_cast<uint32_t>(std::size(before)), cmd);
+    device->CopyTexture(&local_shadow_snapshot, 0, 0, 0, 0, 0, &rtShadow, 0, 0, cmd);
+    const wi::graphics::GPUBarrier after[] = {
+        wi::graphics::GPUBarrier::Image(
+            &rtShadow, wi::graphics::ResourceState::COPY_SRC, rtShadow.GetDesc().layout, -1, 0),
+        wi::graphics::GPUBarrier::Image(
+            &local_shadow_snapshot, wi::graphics::ResourceState::COPY_DST, local_shadow_snapshot.GetDesc().layout),
+    };
+    device->Barrier(after, static_cast<uint32_t>(std::size(after)), cmd);
 }
 
 void NewPipelineClientRenderPath::Update(float dt)
@@ -296,10 +325,10 @@ void NewPipelineClientRenderPath::ConfigureComparableLocalBuffers()
 {
     hardware_raytracing = wi::graphics::GetDevice()->CheckCapability(
         wi::graphics::GraphicsDeviceCapability::RAYTRACING);
-    local_scene.ddgi.grid_dimensions = XMUINT3(8, 4, 8);
+    local_scene.ddgi.grid_dimensions = XMUINT3(16, 8, 16);
     wi::renderer::SetDDGIEnabled(true);
-    wi::renderer::SetDDGIRayCount(32);
-    wi::renderer::SetDDGIBlendSpeed(0.1f);
+    wi::renderer::SetDDGIRayCount(64);
+    wi::renderer::SetDDGIBlendSpeed(0.05f);
     wi::renderer::SetDDGIDebugEnabled(false);
     setRaytracedReflectionsEnabled(hardware_raytracing);
     setSSREnabled(!hardware_raytracing);
@@ -972,7 +1001,7 @@ const wi::graphics::Texture* NewPipelineClientRenderPath::GetDebugPreviewTexture
     case DebugPreviewMode::LocalSpecularIndirect:
         return rtSSR.IsValid() ? &rtSSR : nullptr;
     case DebugPreviewMode::LocalShadowVisibility:
-        return rtShadow.IsValid() && local_shadow_preview_subresource >= 0 ? &rtShadow : nullptr;
+        return local_shadow_snapshot.IsValid() ? &local_shadow_snapshot : nullptr;
     case DebugPreviewMode::RemoteIndirectDiffuse:
         return remote_consume.accepted_valid && accepted_remote_textures[0].IsValid() ? &accepted_remote_textures[0] : nullptr;
     case DebugPreviewMode::RemoteAO:
@@ -1040,8 +1069,6 @@ void NewPipelineClientRenderPath::Compose(wi::graphics::CommandList cmd) const
             debug_preview_mode == DebugPreviewMode::RemoteAO ||
             debug_preview_mode == DebugPreviewMode::RemoteShadowVisibility)
             fx.enableExtractChannelR();
-        if (debug_preview_mode == DebugPreviewMode::LocalShadowVisibility)
-            fx.image_subresource = local_shadow_preview_subresource;
         wi::image::Draw(debug_texture, fx, cmd);
         wi::RenderPath2D::Compose(cmd);
         return;

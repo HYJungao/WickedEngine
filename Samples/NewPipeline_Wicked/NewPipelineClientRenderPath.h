@@ -54,6 +54,7 @@ public:
     void Compose(wi::graphics::CommandList cmd) const override;
     void ResizeBuffers() override;
     void RenderAO(wi::graphics::CommandList cmd) const override;
+    void RenderPostprocessChain(wi::graphics::CommandList cmd) const override;
 
 private:
     void InitializeSceneIfNeeded();
@@ -113,8 +114,8 @@ private:
     bool camera_control_start = true;
     bool input_active = true;
     bool hardware_raytracing = false;
-    int local_shadow_preview_subresource = -1;
     mutable wi::graphics::Texture local_ao_snapshot;
+    mutable wi::graphics::Texture local_shadow_snapshot;
     bool          status_logged = false;
     bool mock_control_publish_logged = false;
     bool remote_acquire_logged = false;
