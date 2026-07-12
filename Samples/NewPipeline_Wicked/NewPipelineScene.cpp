@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cmath>
 #include <filesystem>
+#include <limits>
 #include <vector>
 
 namespace wicked_newpipeline
@@ -16,7 +17,7 @@ namespace
 constexpr uint32_t kDefaultViewportWidth  = 1280;
 constexpr uint32_t kDefaultViewportHeight = 720;
 constexpr const char* kNewPipelineSunName = "NewPipelineSun";
-constexpr float kDefaultSunIntensity = 3.0f;
+constexpr float kDefaultSunIntensity = 10.0f;
 constexpr float kDefaultSunRange = 100.0f;
 
 std::string SceneStatsString(const SceneInitializationResult& result)
@@ -94,15 +95,18 @@ bool TryLoadPrimaryScene(
 
 void ApplyDefaultWeather(wi::scene::Scene& scene)
 {
-    if (scene.weathers.GetCount() == 0)
-    {
-        scene.weathers.Create(wi::ecs::CreateEntity());
-    }
+    // Preserve authored .wiscene sky, environment map and fog just like the Editor.
+    if (scene.weathers.GetCount() > 0)
+        return;
 
-    wi::scene::WeatherComponent& weather = scene.weathers[0];
-    weather.ambient = XMFLOAT3(0.2f, 0.2f, 0.2f);
-    weather.horizon = XMFLOAT3(0.38f, 0.38f, 0.38f);
-    weather.zenith = XMFLOAT3(0.42f, 0.42f, 0.42f);
+    // Match the Editor's empty-scene fallback instead of forcing the previous
+    // dim gray weather, which made an unbaked Sponza almost black.
+    wi::scene::WeatherComponent& weather = scene.weathers.Create(wi::ecs::CreateEntity());
+    weather.ambient = XMFLOAT3(0.9f, 0.9f, 0.9f);
+    weather.horizon = XMFLOAT3(10.0f / 255.0f, 10.0f / 255.0f, 20.0f / 255.0f);
+    weather.zenith = XMFLOAT3(30.0f / 255.0f, 40.0f / 255.0f, 60.0f / 255.0f);
+    weather.fogStart = std::numeric_limits<float>::max();
+    weather.fogDensity = 0.0f;
 }
 
 XMFLOAT3 NormalizeOrDefault(const XMFLOAT3& value)
@@ -173,6 +177,21 @@ wi::ecs::Entity EnsureNewPipelineSun(wi::scene::Scene& scene)
     if (sun != wi::ecs::INVALID_ENTITY)
         return sun;
 
+    // Reuse the first authored directional light. Sponza ships with a tuned
+    // 16-intensity shadow-casting sun; replacing it was the main reason the
+    // NewPipeline scene did not match the Editor.
+    for (size_t i = 0; i < scene.lights.GetCount(); ++i)
+    {
+        if (scene.lights[i].GetType() != wi::scene::LightComponent::DIRECTIONAL)
+            continue;
+        sun = scene.lights.GetEntity(i);
+        wi::scene::NameComponent* name = scene.names.GetComponent(sun);
+        if (name == nullptr)
+            name = &scene.names.Create(sun);
+        name->name = kNewPipelineSunName;
+        return sun;
+    }
+
     sun = scene.Entity_CreateLight(
         kNewPipelineSunName,
         XMFLOAT3(0, 8, -4),
@@ -199,6 +218,14 @@ void MuteImportedDirectionalLights(wi::scene::Scene& scene)
             light.SetCastShadow(false);
         }
     }
+}
+
+void PromoteAuthoritativeSunToFirstLight(wi::scene::Scene& scene)
+{
+    const wi::ecs::Entity authoritative_sun = FindNewPipelineSun(scene);
+    const size_t index = scene.lights.GetIndex(authoritative_sun);
+    if (index != wi::ecs::INVALID_INDEX && index != 0)
+        scene.lights.MoveItem(index, 0);
 }
 
 bool CreateProceduralFallbackScene(wi::scene::Scene& scene)
@@ -302,6 +329,20 @@ SceneInitializationResult InitializeDefaultScene(wi::scene::Scene& scene)
     {
         result.kind = SceneInitializationKind::PrimaryAsset;
         result.diagnostic = "loaded Sponza primary asset: " + SceneStatsString(result);
+        wi::backlog::post(
+            "Sponza authored environment: cameras=" + std::to_string(scene.cameras.GetCount()) +
+            " lights=" + std::to_string(scene.lights.GetCount()) +
+            " weathers=" + std::to_string(scene.weathers.GetCount()) +
+            " probes=" + std::to_string(scene.probes.GetCount()));
+        for (size_t i = 0; i < scene.lights.GetCount(); ++i)
+        {
+            const wi::scene::LightComponent& light = scene.lights[i];
+            wi::backlog::post(
+                "Sponza authored light[" + std::to_string(i) + "]: type=" +
+                std::to_string(static_cast<uint32_t>(light.GetType())) +
+                " intensity=" + std::to_string(light.intensity) +
+                " shadow=" + (light.IsCastingShadow() ? std::string{"1"} : std::string{"0"}));
+        }
     }
 
     if (!result.loaded_primary_asset)
@@ -319,8 +360,13 @@ SceneInitializationResult InitializeDefaultScene(wi::scene::Scene& scene)
     }
 
     ApplyDefaultWeather(scene);
-    ApplySunStateToScene(scene, MakeSunStateFromAngles(true, -35.0f, 50.0f));
+    const wi::ecs::Entity authoritative_sun = EnsureNewPipelineSun(scene);
+    if (wi::scene::LightComponent* light = scene.lights.GetComponent(authoritative_sun))
+        light->SetCastShadow(true);
     MuteImportedDirectionalLights(scene);
+    // Wicked's RT shadow array is indexed by the packed light order. Both the
+    // wire contract and debug panels reserve slice zero for the authoritative sun.
+    PromoteAuthoritativeSunToFirstLight(scene);
 
     return result;
 }
@@ -330,8 +376,10 @@ NewPipelineCameraPreset GetDefaultCameraPreset(SceneInitializationKind kind)
     NewPipelineCameraPreset preset;
     if (kind == SceneInitializationKind::PrimaryAsset)
     {
-        preset.position = XMFLOAT3(0.0f, 3.0f, -10.0f);
-        preset.rotation = XMFLOAT3(wi::math::DegreesToRadians(8.0f), 0.0f, 0.0f);
+        // Match Editor CameraWindow::ResetCam() for a .wiscene without an
+        // embedded camera, so Sponza opens with the same familiar framing.
+        preset.position = XMFLOAT3(0.0f, 2.0f, -10.0f);
+        preset.rotation = XMFLOAT3(0.0f, 0.0f, 0.0f);
     }
     return preset;
 }
@@ -340,10 +388,26 @@ void InitializeDefaultCamera(
     wi::scene::CameraComponent& camera,
     uint32_t width,
     uint32_t height,
-    SceneInitializationKind kind)
+    SceneInitializationKind kind,
+    const wi::scene::Scene* source_scene)
 {
     const uint32_t viewport_width = width == 0 ? kDefaultViewportWidth : width;
     const uint32_t viewport_height = height == 0 ? kDefaultViewportHeight : height;
+
+    // The Editor selects the first camera embedded in a loaded .wiscene.
+    // Preserve that authored framing before falling back to a generic camera.
+    if (source_scene != nullptr && source_scene->cameras.GetCount() > 0)
+    {
+        camera = source_scene->cameras[0];
+        camera.CreatePerspective(
+            (float)viewport_width,
+            (float)viewport_height,
+            camera.zNearP,
+            camera.zFarP,
+            camera.fov);
+        camera.UpdateCamera();
+        return;
+    }
 
     camera.CreatePerspective((float)viewport_width, (float)viewport_height, 0.1f, 1000.0f, XM_PIDIV4);
 
@@ -365,6 +429,7 @@ void ApplySunStateToScene(wi::scene::Scene& scene, const NewPipelineSunState& st
     if (light != nullptr)
     {
         light->SetType(wi::scene::LightComponent::DIRECTIONAL);
+        light->SetCastShadow(true);
         light->color = state.color;
         light->range = kDefaultSunRange;
         light->intensity = state.enabled ? std::max(0.0f, state.intensity) : 0.0f;

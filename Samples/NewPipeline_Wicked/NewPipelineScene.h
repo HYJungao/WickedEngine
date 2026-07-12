@@ -37,7 +37,8 @@ void InitializeDefaultCamera(
     wi::scene::CameraComponent& camera,
     uint32_t width,
     uint32_t height,
-    SceneInitializationKind kind);
+    SceneInitializationKind kind,
+    const wi::scene::Scene* source_scene = nullptr);
 void ApplySunStateToScene(wi::scene::Scene& scene, const NewPipelineSunState& state);
 NewPipelineSunState ExtractSunStateFromScene(const wi::scene::Scene& scene);
 void ApplyControlPacketToCameraAndScene(

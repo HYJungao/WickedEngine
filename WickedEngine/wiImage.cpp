@@ -163,6 +163,14 @@ namespace wi::image
 			image.highlight_xy = wi::math::pack_half2(params.highlight_pos.x * canvas_aspect, params.highlight_pos.y);
 			image.highlight_color_spread = wi::math::pack_half4(params.highlight_color.x, params.highlight_color.y, params.highlight_color.z, params.highlight_spread);
 		}
+		if (params.isExtractChannelREnabled())
+		{
+			image.flags |= IMAGE_FLAG_EXTRACT_CHANNEL_R;
+		}
+		if (params.isDebugTonemapEnabled())
+		{
+			image.flags |= IMAGE_FLAG_DEBUG_TONEMAP;
+		}
 		if (texture != nullptr && has_flag(texture->GetDesc().misc_flags, ResourceMiscFlag::TEXTURECUBE))
 		{
 			image.flags |= IMAGE_FLAG_CUBEMAP_BASE;

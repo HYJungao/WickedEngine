@@ -62,6 +62,8 @@ namespace wi::image
 			ANGULAR_INVERSE = 1 << 11,
 			DISTORTION_MASK = 1 << 12,
 			HIGHLIGHT = 1 << 13,
+			EXTRACT_CHANNEL_R = 1 << 14,
+			DEBUG_TONEMAP = 1 << 15,
 		};
 		uint32_t _flags = EMPTY;
 
@@ -153,6 +155,8 @@ namespace wi::image
 		constexpr bool isAngularSoftnessInverse() const { return _flags & ANGULAR_INVERSE; }
 		constexpr bool isDistortionMaskEnabled() const { return _flags & DISTORTION_MASK; }
 		constexpr bool isHighlightEnabled() const { return _flags & HIGHLIGHT; }
+		constexpr bool isExtractChannelREnabled() const { return _flags & EXTRACT_CHANNEL_R; }
+		constexpr bool isDebugTonemapEnabled() const { return _flags & DEBUG_TONEMAP; }
 
 		// enables draw rectangle for base texture (cutout texture outside draw rectangle)
 		constexpr void enableDrawRect(const XMFLOAT4& rect) { _flags |= DRAWRECT; drawRect = rect; }
@@ -178,6 +182,10 @@ namespace wi::image
 		// Mask texture RG will be used for distortion of screen UVs for background image, A will be used as opacity
 		constexpr void enableDistortionMask() { _flags |= DISTORTION_MASK; }
 		constexpr void enableHighlight() { _flags |= HIGHLIGHT; }
+		// Replicate the texture's red channel to RGB, useful for scalar debug buffers.
+		constexpr void enableExtractChannelR() { _flags |= EXTRACT_CHANNEL_R; }
+		// Apply a stable, display-only Reinhard mapping to linear HDR debug data.
+		constexpr void enableDebugTonemap() { _flags |= DEBUG_TONEMAP; }
 
 		// disable draw rectangle for base texture (whole texture will be drawn, no cutout)
 		constexpr void disableDrawRect() { _flags &= ~DRAWRECT; }

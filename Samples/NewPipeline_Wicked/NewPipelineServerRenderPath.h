@@ -26,6 +26,7 @@ public:
     void Update(float dt) override;
     void Compose(wi::graphics::CommandList cmd) const override;
     void ResizeBuffers() override;
+    void RenderAO(wi::graphics::CommandList cmd) const override;
 
 private:
     void InitializeSceneIfNeeded();
@@ -47,6 +48,7 @@ private:
     WebRTCVideoTransport webrtc_transport;
     std::array<wi::graphics::Texture, static_cast<size_t>(RemoteBufferSemantic::Count)> transport_textures;
     wi::graphics::Texture shadow_slice_texture;
+    mutable wi::graphics::Texture local_ao_snapshot;
     DebugPreviewMode debug_preview_mode = DebugPreviewMode::Final;
     bool hardware_raytracing = false;
     int local_shadow_preview_subresource = -1;

@@ -173,12 +173,28 @@ void NewPipelineClientRenderPath::Start()
 void NewPipelineClientRenderPath::ResizeBuffers()
 {
     wi::RenderPath3D::ResizeBuffers();
+    local_ao_snapshot = {};
+    if (rtAO.IsValid())
+    {
+        wi::graphics::TextureDesc desc = rtAO.GetDesc();
+        desc.bind_flags = wi::graphics::BindFlag::SHADER_RESOURCE | wi::graphics::BindFlag::UNORDERED_ACCESS;
+        desc.layout = wi::graphics::ResourceState::SHADER_RESOURCE_COMPUTE;
+        wi::graphics::GetDevice()->CreateTexture(&desc, nullptr, &local_ao_snapshot);
+        wi::graphics::GetDevice()->SetName(&local_ao_snapshot, "newpipeline.client.local_ao_snapshot");
+    }
     local_shadow_preview_subresource = -1;
     if (rtShadow.IsValid())
     {
         local_shadow_preview_subresource = wi::graphics::GetDevice()->CreateSubresource(
             &rtShadow, wi::graphics::SubresourceType::SRV, 0, 1, 0, 1);
     }
+}
+
+void NewPipelineClientRenderPath::RenderAO(wi::graphics::CommandList cmd) const
+{
+    wi::RenderPath3D::RenderAO(cmd);
+    if (rtAO.IsValid() && local_ao_snapshot.IsValid())
+        wi::renderer::CopyTexture2D(local_ao_snapshot, rtAO, cmd);
 }
 
 void NewPipelineClientRenderPath::Update(float dt)
@@ -234,11 +250,18 @@ void NewPipelineClientRenderPath::InitializeSceneIfNeeded()
     camera = &local_camera;
 
     const SceneInitializationResult result = InitializeDefaultScene(local_scene);
-    ApplySunStateToScene(local_scene, sun_state);
-    InitializeDefaultCamera(local_camera, (uint32_t)GetLogicalWidth(), (uint32_t)GetLogicalHeight(), result.kind);
-    const NewPipelineCameraPreset camera_preset = GetDefaultCameraPreset(result.kind);
-    camera_position = camera_preset.position;
-    camera_rotation = camera_preset.rotation;
+    sun_state = ExtractSunStateFromScene(local_scene);
+    InitializeDefaultCamera(
+        local_camera,
+        (uint32_t)GetLogicalWidth(),
+        (uint32_t)GetLogicalHeight(),
+        result.kind,
+        &local_scene);
+    camera_position = local_camera.Eye;
+    const XMFLOAT3 forward = NormalizeDirectionOrDefault(local_camera.At);
+    camera_rotation.x = -std::asin(std::clamp(forward.y, -1.0f, 1.0f));
+    camera_rotation.y = std::atan2(forward.x, forward.z);
+    camera_rotation.z = 0.0f;
 
     std::string scene_message = std::string{"Client scene initialized: "} + ToString(result.kind);
     if (!result.loaded_asset_path.empty())
@@ -945,7 +968,7 @@ const wi::graphics::Texture* NewPipelineClientRenderPath::GetDebugPreviewTexture
     case DebugPreviewMode::LocalIndirectDiffuse:
         return GetDDGIRemoteIndirectDiffuseFormal().IsValid() ? &GetDDGIRemoteIndirectDiffuseFormal() : nullptr;
     case DebugPreviewMode::LocalAO:
-        return rtAO.IsValid() ? &rtAO : nullptr;
+        return local_ao_snapshot.IsValid() ? &local_ao_snapshot : nullptr;
     case DebugPreviewMode::LocalSpecularIndirect:
         return rtSSR.IsValid() ? &rtSSR : nullptr;
     case DebugPreviewMode::LocalShadowVisibility:
@@ -989,6 +1012,9 @@ void NewPipelineClientRenderPath::Compose(wi::graphics::CommandList cmd) const
                 fx.sampleFlag = wi::image::SAMPLEMODE_CLAMP;
                 fx.pos = XMFLOAT3((index & 1u) * half_width, (index / 2u) * half_height, 0.0f);
                 fx.siz = XMFLOAT2(half_width, half_height);
+                if (index == static_cast<size_t>(RemoteBufferSemantic::RemoteAO) ||
+                    index == static_cast<size_t>(RemoteBufferSemantic::RemoteShadowVisibility))
+                    fx.enableExtractChannelR();
                 wi::image::Draw(&accepted_remote_textures[index], fx, cmd);
             }
             wi::RenderPath2D::Compose(cmd);
@@ -1008,7 +1034,12 @@ void NewPipelineClientRenderPath::Compose(wi::graphics::CommandList cmd) const
             fx.color = XMFLOAT4(0.0f, 0.0f, 4.0f, 1.0f);
         else if (debug_preview_mode == DebugPreviewMode::LocalIndirectDiffuse ||
             debug_preview_mode == DebugPreviewMode::LocalSpecularIndirect)
-            fx.intensity = 0.25f;
+            fx.enableDebugTonemap();
+        if (debug_preview_mode == DebugPreviewMode::LocalAO ||
+            debug_preview_mode == DebugPreviewMode::LocalShadowVisibility ||
+            debug_preview_mode == DebugPreviewMode::RemoteAO ||
+            debug_preview_mode == DebugPreviewMode::RemoteShadowVisibility)
+            fx.enableExtractChannelR();
         if (debug_preview_mode == DebugPreviewMode::LocalShadowVisibility)
             fx.image_subresource = local_shadow_preview_subresource;
         wi::image::Draw(debug_texture, fx, cmd);

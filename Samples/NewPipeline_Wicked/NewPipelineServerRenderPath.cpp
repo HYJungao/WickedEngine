@@ -91,12 +91,30 @@ void NewPipelineServerRenderPath::Update(float dt)
 void NewPipelineServerRenderPath::ResizeBuffers()
 {
     wi::RenderPath3D::ResizeBuffers();
+    local_ao_snapshot = {};
+    if (rtAO.IsValid())
+    {
+        wi::graphics::TextureDesc desc = rtAO.GetDesc();
+        desc.bind_flags = wi::graphics::BindFlag::SHADER_RESOURCE | wi::graphics::BindFlag::UNORDERED_ACCESS;
+        desc.layout = wi::graphics::ResourceState::SHADER_RESOURCE_COMPUTE;
+        wi::graphics::GetDevice()->CreateTexture(&desc, nullptr, &local_ao_snapshot);
+        wi::graphics::GetDevice()->SetName(&local_ao_snapshot, "newpipeline.server.local_ao_snapshot");
+    }
     local_shadow_preview_subresource = -1;
     if (rtShadow.IsValid())
     {
         local_shadow_preview_subresource = wi::graphics::GetDevice()->CreateSubresource(
             &rtShadow, wi::graphics::SubresourceType::SRV, 0, 1, 0, 1);
     }
+}
+
+void NewPipelineServerRenderPath::RenderAO(wi::graphics::CommandList cmd) const
+{
+    wi::RenderPath3D::RenderAO(cmd);
+    // rtAO aliases particle-distortion memory in RenderPath3D. Preserve the AO
+    // result while it is authoritative, before the base renderer reuses it.
+    if (rtAO.IsValid() && local_ao_snapshot.IsValid())
+        wi::renderer::CopyTexture2D(local_ao_snapshot, rtAO, cmd);
 }
 
 const wi::graphics::Texture* NewPipelineServerRenderPath::GetDebugPreviewTexture() const
@@ -106,7 +124,7 @@ const wi::graphics::Texture* NewPipelineServerRenderPath::GetDebugPreviewTexture
     case DebugPreviewMode::LocalIndirectDiffuse:
         return GetDDGIRemoteIndirectDiffuseFormal().IsValid() ? &GetDDGIRemoteIndirectDiffuseFormal() : nullptr;
     case DebugPreviewMode::LocalAO:
-        return rtAO.IsValid() ? &rtAO : nullptr;
+        return local_ao_snapshot.IsValid() ? &local_ao_snapshot : nullptr;
     case DebugPreviewMode::LocalSpecularIndirect:
         return rtSSR.IsValid() ? &rtSSR : nullptr;
     case DebugPreviewMode::LocalShadowVisibility:
@@ -134,7 +152,10 @@ void NewPipelineServerRenderPath::Compose(wi::graphics::CommandList cmd) const
         fx.enableFullScreen();
         if (debug_preview_mode == DebugPreviewMode::LocalIndirectDiffuse ||
             debug_preview_mode == DebugPreviewMode::LocalSpecularIndirect)
-            fx.intensity = 0.25f;
+            fx.enableDebugTonemap();
+        if (debug_preview_mode == DebugPreviewMode::LocalAO ||
+            debug_preview_mode == DebugPreviewMode::LocalShadowVisibility)
+            fx.enableExtractChannelR();
         if (debug_preview_mode == DebugPreviewMode::LocalShadowVisibility)
             fx.image_subresource = local_shadow_preview_subresource;
         wi::image::Draw(debug_texture, fx, cmd);
@@ -260,7 +281,7 @@ void NewPipelineServerRenderPath::PublishRemotePayload(float dt)
 
     const std::array<const wi::graphics::Texture*, static_cast<size_t>(RemoteBufferSemantic::Count)> sources = {
         settings.ddgi_enabled ? &GetDDGIRemoteIndirectDiffuseFormal() : nullptr,
-        rtAO.IsValid() ? &rtAO : nullptr,
+        local_ao_snapshot.IsValid() ? &local_ao_snapshot : nullptr,
         rtSSR.IsValid() ? &rtSSR : nullptr,
         rtShadow.IsValid() ? &rtShadow : nullptr,
     };
@@ -373,7 +394,12 @@ void NewPipelineServerRenderPath::InitializeSceneIfNeeded()
     camera = &local_camera;
 
     const SceneInitializationResult result = InitializeDefaultScene(local_scene);
-    InitializeDefaultCamera(local_camera, (uint32_t)GetLogicalWidth(), (uint32_t)GetLogicalHeight(), result.kind);
+    InitializeDefaultCamera(
+        local_camera,
+        (uint32_t)GetLogicalWidth(),
+        (uint32_t)GetLogicalHeight(),
+        result.kind,
+        &local_scene);
     local_scene.ddgi.grid_dimensions = XMUINT3(8, 4, 8);
 
     std::string scene_message = std::string{"Server scene initialized: "} + ToString(result.kind);

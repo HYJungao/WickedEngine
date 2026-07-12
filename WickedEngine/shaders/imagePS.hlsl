@@ -39,6 +39,15 @@ float4 main(VertextoPixel input) : SV_TARGET
 		{
 			tex.rgb = tex.rgb * 2 - 1;
 		}
+		if (image.flags & IMAGE_FLAG_EXTRACT_CHANNEL_R)
+		{
+			tex = half4(tex.rrr, 1);
+		}
+		if (image.flags & IMAGE_FLAG_DEBUG_TONEMAP)
+		{
+			tex.rgb = max(0, tex.rgb);
+			tex.rgb = tex.rgb / (1 + tex.rgb);
+		}
 
 		color *= tex;
 	}
