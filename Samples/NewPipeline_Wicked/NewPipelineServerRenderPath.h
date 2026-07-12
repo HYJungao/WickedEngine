@@ -9,7 +9,7 @@ struct NewPipelineServerSettings
 {
     bool ddgi_enabled = true;
     bool ddgi_debug_formal = false;
-    uint32_t ddgi_ray_count = 64;
+    uint32_t ddgi_ray_count = 256;
     float remote_publish_fps = 1.0f;
 };
 
@@ -37,7 +37,7 @@ private:
     void PublishRemotePayload(float dt);
     void MaintainWebRTC(float dt);
     bool EnsureTransportTexture(RemoteBufferSemantic semantic, uint32_t width, uint32_t height);
-    bool EnsureShadowSliceTexture(uint32_t width, uint32_t height);
+    bool EnsureShadowSliceTexture(uint32_t width, uint32_t height) const;
     const wi::graphics::Texture* GetDebugPreviewTexture() const;
 
     RuntimeConfig config;

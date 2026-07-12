@@ -34,6 +34,9 @@ void NewPipelineServerRenderPath::SetServerSettings(const NewPipelineServerSetti
 void NewPipelineServerRenderPath::SetDebugPreviewMode(DebugPreviewMode mode)
 {
     debug_preview_mode = mode;
+    setDDGIOutputDebugPreview(mode == DebugPreviewMode::LocalIndirectDiffuse
+        ? wi::RenderPath3D::DDGIOutputDebugPreview::RemoteIndirectDiffuseFormal
+        : wi::RenderPath3D::DDGIOutputDebugPreview::Disabled);
     debug_preview_invalid_logged = false;
     wi::backlog::post(std::string{"Server debug preview mode: "} + ToString(debug_preview_mode));
 }
@@ -118,7 +121,9 @@ void NewPipelineServerRenderPath::RenderAO(wi::graphics::CommandList cmd) const
 void NewPipelineServerRenderPath::RenderPostprocessChain(wi::graphics::CommandList cmd) const
 {
     wi::RenderPath3D::RenderPostprocessChain(cmd);
-    if (!rtShadow.IsValid() || !shadow_slice_texture.IsValid())
+    if (!rtShadow.IsValid())
+        return;
+    if (!EnsureShadowSliceTexture(rtShadow.GetDesc().width, rtShadow.GetDesc().height))
         return;
 
     wi::graphics::GraphicsDevice* device = wi::graphics::GetDevice();
@@ -159,7 +164,8 @@ const wi::graphics::Texture* NewPipelineServerRenderPath::GetDebugPreviewTexture
 
 void NewPipelineServerRenderPath::Compose(wi::graphics::CommandList cmd) const
 {
-    if (debug_preview_mode == DebugPreviewMode::Final)
+    if (debug_preview_mode == DebugPreviewMode::Final ||
+        debug_preview_mode == DebugPreviewMode::LocalIndirectDiffuse)
     {
         wi::RenderPath3D::Compose(cmd);
         return;
@@ -172,8 +178,7 @@ void NewPipelineServerRenderPath::Compose(wi::graphics::CommandList cmd) const
         fx.quality = wi::image::QUALITY_LINEAR;
         fx.sampleFlag = wi::image::SAMPLEMODE_CLAMP;
         fx.enableFullScreen();
-        if (debug_preview_mode == DebugPreviewMode::LocalIndirectDiffuse ||
-            debug_preview_mode == DebugPreviewMode::LocalSpecularIndirect)
+        if (debug_preview_mode == DebugPreviewMode::LocalSpecularIndirect)
             fx.enableDebugTonemap();
         if (debug_preview_mode == DebugPreviewMode::LocalAO ||
             debug_preview_mode == DebugPreviewMode::LocalShadowVisibility)
@@ -250,7 +255,7 @@ bool NewPipelineServerRenderPath::EnsureTransportTexture(RemoteBufferSemantic se
     return true;
 }
 
-bool NewPipelineServerRenderPath::EnsureShadowSliceTexture(uint32_t width, uint32_t height)
+bool NewPipelineServerRenderPath::EnsureShadowSliceTexture(uint32_t width, uint32_t height) const
 {
     if (shadow_slice_texture.IsValid())
     {
@@ -408,7 +413,6 @@ void NewPipelineServerRenderPath::InitializeSceneIfNeeded()
         (uint32_t)GetLogicalHeight(),
         result.kind,
         &local_scene);
-    local_scene.ddgi.grid_dimensions = XMUINT3(16, 8, 16);
 
     std::string scene_message = std::string{"Server scene initialized: "} + ToString(result.kind);
     if (!result.loaded_asset_path.empty())
@@ -425,7 +429,10 @@ void NewPipelineServerRenderPath::InitializeSceneIfNeeded()
     wi::backlog::post(config.remote_source == RemoteSourceMode::Mock
         ? "Server using file mock control source: " + mock_control_mailbox.GetRootDirectory()
         : "Server using WebRTC DataChannel for client control only; frame output is video-track only.");
-    wi::backlog::post("Server DDGI grid dimensions: 16 x 8 x 16 (quality preset).");
+    wi::backlog::post("Server DDGI grid dimensions: " +
+        std::to_string(local_scene.ddgi.grid_dimensions.x) + " x " +
+        std::to_string(local_scene.ddgi.grid_dimensions.y) + " x " +
+        std::to_string(local_scene.ddgi.grid_dimensions.z) + " (scene/Editor setting).");
 
     scene_initialized = true;
 }
@@ -437,7 +444,7 @@ void NewPipelineServerRenderPath::ConfigureDDGI()
 
     wi::renderer::SetDDGIEnabled(settings.ddgi_enabled);
     wi::renderer::SetDDGIRayCount(settings.ddgi_enabled ? settings.ddgi_ray_count : 0u);
-    wi::renderer::SetDDGIBlendSpeed(0.05f);
+    wi::renderer::SetDDGIBlendSpeed(0.1f);
     wi::renderer::SetDDGIDebugEnabled(false);
     setAO(hardware_raytracing ? wi::RenderPath3D::AO_RTAO : wi::RenderPath3D::AO_SSAO);
     setRaytracedReflectionsEnabled(hardware_raytracing);
@@ -454,7 +461,8 @@ void NewPipelineServerRenderPath::ConfigureDDGI()
         " hardware_raytracing=" + (hardware_raytracing ? "1" : "0"));
 
     setDDGIOutputDebugPreview(
-        settings.ddgi_enabled && settings.ddgi_debug_formal
+        settings.ddgi_enabled &&
+            (settings.ddgi_debug_formal || debug_preview_mode == DebugPreviewMode::LocalIndirectDiffuse)
             ? wi::RenderPath3D::DDGIOutputDebugPreview::RemoteIndirectDiffuseFormal
             : wi::RenderPath3D::DDGIOutputDebugPreview::Disabled);
 }

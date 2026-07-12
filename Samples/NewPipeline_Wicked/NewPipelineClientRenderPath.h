@@ -68,6 +68,7 @@ private:
     void InvalidateRemote(const std::string& reason);
     bool UploadRemoteTextures(const RemoteRawFrame& frame);
     const wi::graphics::Texture* GetDebugPreviewTexture() const;
+    bool EnsureLocalShadowSnapshot(uint32_t width, uint32_t height) const;
     void ApplyRenderSettings(bool log_changes);
     void ConfigureComparableLocalBuffers();
     void ApplyShadowSettings(bool log_changes);

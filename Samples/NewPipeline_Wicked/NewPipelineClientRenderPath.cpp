@@ -99,6 +99,9 @@ void NewPipelineClientRenderPath::SetSunState(const NewPipelineSunState& value)
 void NewPipelineClientRenderPath::SetDebugPreviewMode(DebugPreviewMode mode)
 {
     debug_preview_mode = mode;
+    setDDGIOutputDebugPreview(mode == DebugPreviewMode::LocalIndirectDiffuse
+        ? wi::RenderPath3D::DDGIOutputDebugPreview::RemoteIndirectDiffuseFormal
+        : wi::RenderPath3D::DDGIOutputDebugPreview::Disabled);
     debug_preview_invalid_logged = false;
     wi::backlog::post(std::string{"Client debug preview mode: "} + ToString(debug_preview_mode));
 }
@@ -182,17 +185,31 @@ void NewPipelineClientRenderPath::ResizeBuffers()
         wi::graphics::GetDevice()->CreateTexture(&desc, nullptr, &local_ao_snapshot);
         wi::graphics::GetDevice()->SetName(&local_ao_snapshot, "newpipeline.client.local_ao_snapshot");
     }
-    local_shadow_snapshot = {};
     if (rtShadow.IsValid())
     {
-        wi::graphics::TextureDesc desc = rtShadow.GetDesc();
-        desc.type = wi::graphics::TextureDesc::Type::TEXTURE_2D;
-        desc.array_size = 1;
-        desc.bind_flags = wi::graphics::BindFlag::SHADER_RESOURCE;
-        desc.layout = wi::graphics::ResourceState::SHADER_RESOURCE;
-        wi::graphics::GetDevice()->CreateTexture(&desc, nullptr, &local_shadow_snapshot);
-        wi::graphics::GetDevice()->SetName(&local_shadow_snapshot, "newpipeline.client.local_shadow_snapshot");
+        EnsureLocalShadowSnapshot(rtShadow.GetDesc().width, rtShadow.GetDesc().height);
     }
+}
+
+bool NewPipelineClientRenderPath::EnsureLocalShadowSnapshot(uint32_t width, uint32_t height) const
+{
+    if (local_shadow_snapshot.IsValid())
+    {
+        const auto& current = local_shadow_snapshot.GetDesc();
+        if (current.width == width && current.height == height)
+            return true;
+    }
+    wi::graphics::TextureDesc desc;
+    desc.type = wi::graphics::TextureDesc::Type::TEXTURE_2D;
+    desc.width = width;
+    desc.height = height;
+    desc.format = wi::graphics::Format::R8_UNORM;
+    desc.bind_flags = wi::graphics::BindFlag::SHADER_RESOURCE;
+    desc.layout = wi::graphics::ResourceState::SHADER_RESOURCE;
+    const bool created = wi::graphics::GetDevice()->CreateTexture(&desc, nullptr, &local_shadow_snapshot);
+    if (created)
+        wi::graphics::GetDevice()->SetName(&local_shadow_snapshot, "newpipeline.client.local_shadow_snapshot");
+    return created;
 }
 
 void NewPipelineClientRenderPath::RenderAO(wi::graphics::CommandList cmd) const
@@ -205,7 +222,9 @@ void NewPipelineClientRenderPath::RenderAO(wi::graphics::CommandList cmd) const
 void NewPipelineClientRenderPath::RenderPostprocessChain(wi::graphics::CommandList cmd) const
 {
     wi::RenderPath3D::RenderPostprocessChain(cmd);
-    if (!rtShadow.IsValid() || !local_shadow_snapshot.IsValid())
+    if (!rtShadow.IsValid())
+        return;
+    if (!EnsureLocalShadowSnapshot(rtShadow.GetDesc().width, rtShadow.GetDesc().height))
         return;
 
     wi::graphics::GraphicsDevice* device = wi::graphics::GetDevice();
@@ -325,10 +344,9 @@ void NewPipelineClientRenderPath::ConfigureComparableLocalBuffers()
 {
     hardware_raytracing = wi::graphics::GetDevice()->CheckCapability(
         wi::graphics::GraphicsDeviceCapability::RAYTRACING);
-    local_scene.ddgi.grid_dimensions = XMUINT3(16, 8, 16);
     wi::renderer::SetDDGIEnabled(true);
-    wi::renderer::SetDDGIRayCount(64);
-    wi::renderer::SetDDGIBlendSpeed(0.05f);
+    wi::renderer::SetDDGIRayCount(256);
+    wi::renderer::SetDDGIBlendSpeed(0.1f);
     wi::renderer::SetDDGIDebugEnabled(false);
     setRaytracedReflectionsEnabled(hardware_raytracing);
     setSSREnabled(!hardware_raytracing);
@@ -1019,7 +1037,8 @@ const wi::graphics::Texture* NewPipelineClientRenderPath::GetDebugPreviewTexture
 
 void NewPipelineClientRenderPath::Compose(wi::graphics::CommandList cmd) const
 {
-    if (debug_preview_mode == DebugPreviewMode::Final)
+    if (debug_preview_mode == DebugPreviewMode::Final ||
+        debug_preview_mode == DebugPreviewMode::LocalIndirectDiffuse)
     {
         wi::RenderPath3D::Compose(cmd);
         return;
@@ -1061,8 +1080,7 @@ void NewPipelineClientRenderPath::Compose(wi::graphics::CommandList cmd) const
             fx.color = XMFLOAT4(1.0f, 1.0f, 0.0f, 1.0f);
         else if (debug_preview_mode == DebugPreviewMode::GBufferRoughness)
             fx.color = XMFLOAT4(0.0f, 0.0f, 4.0f, 1.0f);
-        else if (debug_preview_mode == DebugPreviewMode::LocalIndirectDiffuse ||
-            debug_preview_mode == DebugPreviewMode::LocalSpecularIndirect)
+        else if (debug_preview_mode == DebugPreviewMode::LocalSpecularIndirect)
             fx.enableDebugTonemap();
         if (debug_preview_mode == DebugPreviewMode::LocalAO ||
             debug_preview_mode == DebugPreviewMode::LocalShadowVisibility ||
