@@ -64,6 +64,8 @@ namespace wi::image
 			HIGHLIGHT = 1 << 13,
 			EXTRACT_CHANNEL_R = 1 << 14,
 			DEBUG_TONEMAP = 1 << 15,
+			HDR_TRANSPORT_ENCODE = 1 << 16,
+			HDR_TRANSPORT_DECODE = 1 << 17,
 		};
 		uint32_t _flags = EMPTY;
 
@@ -157,6 +159,8 @@ namespace wi::image
 		constexpr bool isHighlightEnabled() const { return _flags & HIGHLIGHT; }
 		constexpr bool isExtractChannelREnabled() const { return _flags & EXTRACT_CHANNEL_R; }
 		constexpr bool isDebugTonemapEnabled() const { return _flags & DEBUG_TONEMAP; }
+		constexpr bool isHDRTransportEncodeEnabled() const { return _flags & HDR_TRANSPORT_ENCODE; }
+		constexpr bool isHDRTransportDecodeEnabled() const { return _flags & HDR_TRANSPORT_DECODE; }
 
 		// enables draw rectangle for base texture (cutout texture outside draw rectangle)
 		constexpr void enableDrawRect(const XMFLOAT4& rect) { _flags |= DRAWRECT; drawRect = rect; }
@@ -186,6 +190,9 @@ namespace wi::image
 		constexpr void enableExtractChannelR() { _flags |= EXTRACT_CHANNEL_R; }
 		// Apply a stable, display-only Reinhard mapping to linear HDR debug data.
 		constexpr void enableDebugTonemap() { _flags |= DEBUG_TONEMAP; }
+		// Log2 packing maps linear [0,16] HDR into an 8-bit transport render target.
+		constexpr void enableHDRTransportEncode() { _flags |= HDR_TRANSPORT_ENCODE; }
+		constexpr void enableHDRTransportDecode() { _flags |= HDR_TRANSPORT_DECODE; }
 
 		// disable draw rectangle for base texture (whole texture will be drawn, no cutout)
 		constexpr void disableDrawRect() { _flags &= ~DRAWRECT; }

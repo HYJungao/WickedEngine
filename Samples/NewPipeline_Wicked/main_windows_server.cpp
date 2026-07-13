@@ -4,6 +4,14 @@
 #if defined(_WIN32)
 int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR command_line, int show_command)
 {
+    for (int i = 1; i < __argc; ++i)
+    {
+        if (std::string{__argv[i]} == "--transport_selftest")
+        {
+            std::string error;
+            return wicked_newpipeline::ValidateRemoteVideoV2RoundTrip(&error) ? 0 : 1;
+        }
+    }
     wicked_newpipeline::NewPipelineServerApp application;
     wi::arguments::Parse(command_line);
     application.ConfigureFromCommandLine(__argc, __argv);

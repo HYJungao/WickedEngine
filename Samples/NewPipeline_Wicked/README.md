@@ -33,7 +33,9 @@ automatic camera orbit is applied.
 The Client starts on `Final`; receiving a remote frame never changes the
 selection. Its **Preview Buffer** menu contains local DDGI/AO/reflection/shadow,
 the four accepted remote buffers, and an explicit `Remote 2x2 Overview`. The
-Server debug panel contains `Final` and its four local producer buffers. The
+Server debug panel contains `Final`, its four local producer buffers, and four
+pre-I420 `Transport` previews. Missing buffers render an explicit black/red
+`UNAVAILABLE` placeholder instead of silently falling back to Final. The
 legacy options remain compatible: `--remote_debug=local` selects `Final`,
 `raw` selects `Remote Indirect Diffuse`, and `debug_composite` selects the
 explicit remote overview.
@@ -79,6 +81,21 @@ required.
 
 The server always uses DDGI for `RemoteIndirectDiffuse`. Hardware ray-tracing
 devices use RTAO, RT Reflection, and RT Shadow for the other three buffers.
-Devices without ray tracing automatically use SSAO, SSR, and Screen Space
-Shadow; Client local previews use the same selection. The effective algorithms
+Devices without ray tracing use full-resolution MSAO, high-quality SSR, and
+Screen Space Shadow; Client local previews use the same selection. RT and SSR
+reflection resources use the High (full-resolution) quality preset. The effective algorithms
 are printed at startup and displayed in both debug panels.
+
+## Remote video V2
+
+All four buffers remain on the single `np.remote.video` WebRTC video track.
+DDGI and reflection are GPU-packed with a Log2 mapping for linear HDR values in
+the `[0,16]` range, then restored to `RGBA16F` by the Client. AO and Shadow use
+full-resolution I420 Y only with neutral chroma. Every tile has 16 pixels of
+padding to isolate chroma and codec block filtering. The Server uses a three-slot
+asynchronous GPU readback ring and a latest-frame encoding worker.
+
+Both panels report DDGI frame/convergence state. Scene-generation and significant
+authoritative-sun changes clear DDGI history and publish the reset reason in the
+video metadata. `--transport_selftest` runs the CPU V2 LogHDR/luma/padding round-trip
+test without opening a window.

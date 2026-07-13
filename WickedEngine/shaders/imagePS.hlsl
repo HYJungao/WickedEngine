@@ -43,6 +43,16 @@ float4 main(VertextoPixel input) : SV_TARGET
 		{
 			tex = half4(tex.rrr, 1);
 		}
+		if (image.flags & IMAGE_FLAG_HDR_TRANSPORT_ENCODE)
+		{
+			tex.rgb = log2(1 + clamp(tex.rgb, 0, 16)) / log2(17.0);
+			tex.a = 1;
+		}
+		if (image.flags & IMAGE_FLAG_HDR_TRANSPORT_DECODE)
+		{
+			tex.rgb = exp2(saturate(tex.rgb) * log2(17.0)) - 1;
+			tex.a = 1;
+		}
 		if (image.flags & IMAGE_FLAG_DEBUG_TONEMAP)
 		{
 			tex.rgb = max(0, tex.rgb);

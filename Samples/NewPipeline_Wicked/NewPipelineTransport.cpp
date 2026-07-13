@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <cstdlib>
 #include <filesystem>
@@ -26,6 +27,8 @@ constexpr uint64_t kMaxControlPacketAgeUsec = 2'000'000;
 // WebRTC bridge at 8192 pixels per dimension.
 constexpr uint32_t kMaxRemoteBufferDimension = 4096;
 constexpr uint32_t kMetadataBitCellSize = 4;
+constexpr uint32_t kTilePadding = 16;
+constexpr float kHDRTransportMaximum = 16.0f;
 
 #pragma pack(push, 1)
 struct RemoteVideoWireBuffer
@@ -34,6 +37,7 @@ struct RemoteVideoWireBuffer
     uint32_t width = 0;
     uint32_t height = 0;
     uint32_t available = 0;
+    uint32_t encoding = 0;
 };
 
 struct RemoteVideoWireMetadata
@@ -50,7 +54,10 @@ struct RemoteVideoWireMetadata
     uint32_t continuity_mask = 0;
     uint32_t available_buffer_mask = 0;
     uint32_t dynamic_range = 0;
+    uint32_t tile_padding = kTilePadding;
     uint32_t flags = 0;
+    uint32_t ddgi_frame_index = 0;
+    uint32_t ddgi_reset_reason = 0;
     float confidence = 0.0f;
     float near_plane = 0.0f;
     float far_plane = 0.0f;
@@ -180,6 +187,8 @@ RemoteVideoWireMetadata MakeWireMetadata(const RemoteRawFrame& frame, uint32_t t
         (frame.metadata.reset_this_frame ? kRemoteVideoFlagResetThisFrame : 0u) |
         (frame.metadata.camera_cut ? kRemoteVideoFlagCameraCut : 0u) |
         (frame.metadata.valid ? kRemoteVideoFlagValid : 0u);
+    wire.ddgi_frame_index = frame.metadata.ddgi_frame_index;
+    wire.ddgi_reset_reason = static_cast<uint32_t>(frame.metadata.ddgi_reset_reason);
     wire.confidence = frame.metadata.confidence;
     wire.near_plane = frame.metadata.near_plane;
     wire.far_plane = frame.metadata.far_plane;
@@ -204,6 +213,7 @@ RemoteVideoWireMetadata MakeWireMetadata(const RemoteRawFrame& frame, uint32_t t
         destination.width = source.width;
         destination.height = source.height;
         destination.available = source.available ? 1u : 0u;
+        destination.encoding = static_cast<uint32_t>(source.encoding);
         if (source.available)
             wire.available_buffer_mask |= RemoteBufferKindMask(source.semantic);
     }
@@ -220,7 +230,8 @@ bool ValidateWireMetadata(RemoteVideoWireMetadata wire)
     if (wire.magic != kRemoteVideoWireMagic || wire.version != kRemoteVideoWireVersion ||
         wire.byte_size != sizeof(RemoteVideoWireMetadata) || expected_checksum != Fnv1a32(&wire, sizeof(wire)) ||
         wire.frame_id == 0 || wire.width == 0 || wire.height == 0 ||
-        wire.width > kMaxRemoteBufferDimension || wire.height > kMaxRemoteBufferDimension)
+        wire.width > kMaxRemoteBufferDimension || wire.height > kMaxRemoteBufferDimension ||
+        wire.ddgi_reset_reason > static_cast<uint32_t>(DDGIResetReason::GridChanged))
     {
         return false;
     }
@@ -229,6 +240,7 @@ bool ValidateWireMetadata(RemoteVideoWireMetadata wire)
     {
         const RemoteVideoWireBuffer& buffer = wire.buffers[index];
         if (buffer.semantic != index || buffer.available > 1u ||
+            buffer.encoding > static_cast<uint32_t>(RemoteBufferEncoding::ScalarLuma8) ||
             (buffer.available != 0u &&
              (buffer.width == 0 || buffer.height == 0 || buffer.width > wire.width || buffer.height > wire.height)))
         {
@@ -645,15 +657,17 @@ bool EncodeRemoteVideoFrame(const RemoteRawFrame& frame, PackedRemoteVideoFrame&
 
     tile_width = AlignEven(tile_width);
     tile_height = AlignEven(tile_height);
-    const uint32_t video_width = tile_width * 2u;
+    const uint32_t tile_stride_x = tile_width + kTilePadding * 2u;
+    const uint32_t tile_stride_y = tile_height + kTilePadding * 2u;
+    const uint32_t video_width = tile_stride_x * 2u;
     const uint32_t metadata_rows = MetadataRows(video_width);
     if (metadata_rows == 0 || tile_width > std::numeric_limits<uint32_t>::max() / 2u ||
-        tile_height > (std::numeric_limits<uint32_t>::max() - metadata_rows) / 2u)
+        tile_stride_y > (std::numeric_limits<uint32_t>::max() - metadata_rows) / 2u)
     {
         SetError(error, "remote video dimensions overflow");
         return false;
     }
-    const uint32_t video_height = metadata_rows + tile_height * 2u;
+    const uint32_t video_height = metadata_rows + tile_stride_y * 2u;
     const uint32_t chroma_width = video_width / 2u;
     const uint32_t chroma_height = video_height / 2u;
     size_t y_size = 0;
@@ -697,8 +711,8 @@ bool EncodeRemoteVideoFrame(const RemoteRawFrame& frame, PackedRemoteVideoFrame&
         if (!buffer.available)
             continue;
 
-        const uint32_t origin_x = static_cast<uint32_t>(buffer_index & 1u) * tile_width;
-        const uint32_t origin_y = metadata_rows + static_cast<uint32_t>(buffer_index / 2u) * tile_height;
+        const uint32_t origin_x = static_cast<uint32_t>(buffer_index & 1u) * tile_stride_x + kTilePadding;
+        const uint32_t origin_y = metadata_rows + static_cast<uint32_t>(buffer_index / 2u) * tile_stride_y + kTilePadding;
         for (uint32_t y = 0; y < buffer.height; ++y)
         {
             for (uint32_t x = 0; x < buffer.width; ++x)
@@ -707,13 +721,24 @@ bool EncodeRemoteVideoFrame(const RemoteRawFrame& frame, PackedRemoteVideoFrame&
                 uint8_t y_value = 16;
                 uint8_t u_value = 128;
                 uint8_t v_value = 128;
-                RGBToYUV(buffer.payload_rgba8[source_index + 0u],
-                    buffer.payload_rgba8[source_index + 1u],
-                    buffer.payload_rgba8[source_index + 2u],
-                    y_value, u_value, v_value);
+                if (buffer.encoding == RemoteBufferEncoding::ScalarLuma8)
+                {
+                    const uint8_t scalar = buffer.payload_rgba8[source_index];
+                    RGBToYUV(scalar, scalar, scalar, y_value, u_value, v_value);
+                }
+                else
+                {
+                    RGBToYUV(buffer.payload_rgba8[source_index + 0u],
+                        buffer.payload_rgba8[source_index + 1u],
+                        buffer.payload_rgba8[source_index + 2u],
+                        y_value, u_value, v_value);
+                }
                 y_plane[static_cast<size_t>(origin_y + y) * video_width + origin_x + x] = y_value;
             }
         }
+
+        if (buffer.encoding == RemoteBufferEncoding::ScalarLuma8)
+            continue; // U/V stay neutral; the scalar uses full-resolution Y only.
 
         for (uint32_t y = 0; y < buffer.height; y += 2u)
         {
@@ -799,8 +824,10 @@ bool DecodeRemoteVideoFrame(const PackedRemoteVideoFrame& video, RemoteRawFrame&
             wire_bytes[bit_index / 8ull] |= static_cast<uint8_t>(1u << (bit_index & 7ull));
     }
 
-    if (!ValidateWireMetadata(wire) || wire.width * 2u != video.width ||
-        metadata_rows + wire.height * 2u != video.height)
+    const uint32_t tile_stride_x = wire.width + wire.tile_padding * 2u;
+    const uint32_t tile_stride_y = wire.height + wire.tile_padding * 2u;
+    if (!ValidateWireMetadata(wire) || tile_stride_x * 2u != video.width ||
+        metadata_rows + tile_stride_y * 2u != video.height || wire.tile_padding != kTilePadding)
     {
         SetError(error, "remote video metadata checksum or layout is invalid");
         return false;
@@ -832,6 +859,8 @@ bool DecodeRemoteVideoFrame(const PackedRemoteVideoFrame& video, RemoteRawFrame&
     frame.metadata.reset_this_frame = (wire.flags & kRemoteVideoFlagResetThisFrame) != 0;
     frame.metadata.camera_cut = (wire.flags & kRemoteVideoFlagCameraCut) != 0;
     frame.metadata.valid = (wire.flags & kRemoteVideoFlagValid) != 0;
+    frame.metadata.ddgi_frame_index = wire.ddgi_frame_index;
+    frame.metadata.ddgi_reset_reason = static_cast<DDGIResetReason>(wire.ddgi_reset_reason);
     frame.metadata.confidence = wire.confidence;
     frame.metadata.local_receive_timestamp_usec = NowUsec();
 
@@ -844,6 +873,7 @@ bool DecodeRemoteVideoFrame(const PackedRemoteVideoFrame& video, RemoteRawFrame&
         buffer.width = source.width;
         buffer.height = source.height;
         buffer.available = source.available != 0;
+        buffer.encoding = static_cast<RemoteBufferEncoding>(source.encoding);
         if (!buffer.available)
             continue;
 
@@ -854,8 +884,10 @@ bool DecodeRemoteVideoFrame(const PackedRemoteVideoFrame& video, RemoteRawFrame&
             return false;
         }
         buffer.payload_rgba8.resize(payload_size);
-        const uint32_t origin_x = static_cast<uint32_t>(buffer_index & 1u) * wire.width;
-        const uint32_t origin_y = metadata_rows + static_cast<uint32_t>(buffer_index / 2u) * wire.height;
+        const uint32_t origin_x = static_cast<uint32_t>(buffer_index & 1u) * tile_stride_x + wire.tile_padding;
+        const uint32_t origin_y = metadata_rows + static_cast<uint32_t>(buffer_index / 2u) * tile_stride_y + wire.tile_padding;
+        if (buffer.encoding == RemoteBufferEncoding::LogHDR16F)
+            buffer.payload_rgba16f.resize(static_cast<size_t>(buffer.width) * buffer.height * 4u);
         for (uint32_t y = 0; y < buffer.height; ++y)
         {
             for (uint32_t x = 0; x < buffer.width; ++x)
@@ -867,11 +899,27 @@ bool DecodeRemoteVideoFrame(const PackedRemoteVideoFrame& video, RemoteRawFrame&
                 uint8_t green = 0;
                 uint8_t blue = 0;
                 YUVToRGB(y_value, u_plane[chroma_index], v_plane[chroma_index], red, green, blue);
+                if (buffer.encoding == RemoteBufferEncoding::ScalarLuma8)
+                {
+                    green = red;
+                    blue = red;
+                }
                 const size_t destination_index = (static_cast<size_t>(y) * buffer.width + x) * 4u;
                 buffer.payload_rgba8[destination_index + 0u] = red;
                 buffer.payload_rgba8[destination_index + 1u] = green;
                 buffer.payload_rgba8[destination_index + 2u] = blue;
                 buffer.payload_rgba8[destination_index + 3u] = 255u;
+                if (buffer.encoding == RemoteBufferEncoding::LogHDR16F)
+                {
+                    const float scale = std::log2(1.0f + kHDRTransportMaximum);
+                    const float decoded_r = std::exp2((red / 255.0f) * scale) - 1.0f;
+                    const float decoded_g = std::exp2((green / 255.0f) * scale) - 1.0f;
+                    const float decoded_b = std::exp2((blue / 255.0f) * scale) - 1.0f;
+                    buffer.payload_rgba16f[destination_index + 0u] = static_cast<uint16_t>(wi::math::f32tof16(decoded_r));
+                    buffer.payload_rgba16f[destination_index + 1u] = static_cast<uint16_t>(wi::math::f32tof16(decoded_g));
+                    buffer.payload_rgba16f[destination_index + 2u] = static_cast<uint16_t>(wi::math::f32tof16(decoded_b));
+                    buffer.payload_rgba16f[destination_index + 3u] = static_cast<uint16_t>(wi::math::f32tof16(1.0f));
+                }
             }
         }
     }
@@ -879,6 +927,54 @@ bool DecodeRemoteVideoFrame(const PackedRemoteVideoFrame& video, RemoteRawFrame&
     if (!frame.metadata.valid || frame.metadata.available_buffer_mask == 0)
     {
         SetError(error, "decoded remote frame is not usable");
+        return false;
+    }
+    return true;
+}
+
+bool ValidateRemoteVideoV2RoundTrip(std::string* error)
+{
+    RemoteRawFrame source;
+    source.metadata.frame_id = 1;
+    source.metadata.timestamp_usec = 1;
+    source.metadata.source_generation = 1;
+    source.metadata.continuity_mask = static_cast<uint32_t>(RemoteBufferKind::All);
+    source.metadata.available_buffer_mask = static_cast<uint32_t>(RemoteBufferKind::All);
+    source.metadata.dynamic_range = RemoteDynamicRange::HDR;
+    source.metadata.source_stream_id = kRemoteFrameStreamId;
+    source.metadata.valid = true;
+    source.metadata.ddgi_frame_index = 64;
+    source.metadata.history_valid = true;
+    for (size_t index = 0; index < source.buffers.size(); ++index)
+    {
+        RemoteRawBuffer& buffer = source.buffers[index];
+        buffer.width = 4;
+        buffer.height = 4;
+        buffer.available = true;
+        buffer.encoding = index == 0 || index == 2
+            ? RemoteBufferEncoding::LogHDR16F
+            : RemoteBufferEncoding::ScalarLuma8;
+        buffer.payload_rgba8.resize(4u * 4u * 4u);
+        for (size_t pixel = 0; pixel < 16; ++pixel)
+        {
+            const uint8_t value = static_cast<uint8_t>(32 + pixel * 12);
+            buffer.payload_rgba8[pixel * 4 + 0] = value;
+            buffer.payload_rgba8[pixel * 4 + 1] = buffer.encoding == RemoteBufferEncoding::ScalarLuma8 ? value : static_cast<uint8_t>(255 - value);
+            buffer.payload_rgba8[pixel * 4 + 2] = value / 2;
+            buffer.payload_rgba8[pixel * 4 + 3] = 255;
+        }
+    }
+    PackedRemoteVideoFrame packed;
+    if (!EncodeRemoteVideoFrame(source, packed, error))
+        return false;
+    RemoteRawFrame decoded;
+    if (!DecodeRemoteVideoFrame(packed, decoded, error))
+        return false;
+    if (decoded.metadata.ddgi_frame_index != 64 || !decoded.metadata.history_valid ||
+        decoded.metadata.available_buffer_mask != static_cast<uint32_t>(RemoteBufferKind::All) ||
+        decoded.buffers[0].payload_rgba16f.size() != 64 || decoded.buffers[2].payload_rgba16f.size() != 64)
+    {
+        SetError(error, "V2 HDR/scalar round-trip contract mismatch");
         return false;
     }
     return true;

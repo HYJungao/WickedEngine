@@ -30,6 +30,7 @@ struct NewPipelineCameraPreset
 
 const char* ToString(SceneInitializationKind kind);
 const char* GetNewPipelineSunName();
+uint32_t GetNewPipelineSunShadowIndex(const wi::scene::Scene& scene);
 NewPipelineSunState MakeSunStateFromAngles(bool enabled, float yaw_degrees, float pitch_degrees);
 SceneInitializationResult InitializeDefaultScene(wi::scene::Scene& scene);
 NewPipelineCameraPreset GetDefaultCameraPreset(SceneInitializationKind kind);

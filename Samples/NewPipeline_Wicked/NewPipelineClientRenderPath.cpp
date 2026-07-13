@@ -2,6 +2,8 @@
 
 #include "wiHelper.h"
 #include "wiImage.h"
+#include "wiFont.h"
+#include "wiTextureHelper.h"
 
 #include <chrono>
 #include <cmath>
@@ -93,7 +95,18 @@ void NewPipelineClientRenderPath::SetSunState(const NewPipelineSunState& value)
     sun_state = value;
     sun_state.direction = NormalizeDirectionOrDefault(sun_state.direction);
     if (scene_initialized)
+    {
         ApplySunStateToScene(local_scene, sun_state);
+        const float direction_dot = XMVectorGetX(XMVector3Dot(
+            XMVector3Normalize(XMLoadFloat3(&local_ddgi_reset_reference_sun.direction)),
+            XMVector3Normalize(XMLoadFloat3(&sun_state.direction))));
+        if (local_ddgi_reset_reference_sun.enabled != sun_state.enabled || direction_dot < 0.999f ||
+            std::abs(local_ddgi_reset_reference_sun.intensity - sun_state.intensity) > 0.05f)
+        {
+            ResetLocalDDGI(DDGIResetReason::LightingChanged);
+            local_ddgi_reset_reference_sun = sun_state;
+        }
+    }
 }
 
 void NewPipelineClientRenderPath::SetDebugPreviewMode(DebugPreviewMode mode)
@@ -108,8 +121,20 @@ void NewPipelineClientRenderPath::SetDebugPreviewMode(DebugPreviewMode mode)
 
 std::string NewPipelineClientRenderPath::GetEffectiveAlgorithmSummary() const
 {
-    return std::string{"DDGI | "} + (hardware_raytracing ? "RTAO | RT Reflection | RT Shadow" :
-        "SSAO | SSR | Screen Space Shadow");
+    return std::string{"DDGI | "} + (hardware_raytracing ? "RTAO | RT Reflection High | RT Shadow" :
+        "MSAO full-res | SSR High | Screen Space Shadow");
+}
+
+std::string NewPipelineClientRenderPath::GetDebugStatusSummary() const
+{
+    return GetEffectiveAlgorithmSummary() + "\nLocal DDGI: frame " +
+        std::to_string(local_scene.ddgi.frame_index) +
+        (local_scene.ddgi.frame_index >= 64 ? " converged" : " warming") +
+        " reset=" + ToString(local_ddgi_reset_reason) + "\nRemote decoded: " +
+        (remote_consume.accepted_valid ? std::string{"available"} : std::string{"unavailable"}) +
+        "\nRemote DDGI: frame " + std::to_string(remote_ddgi_frame_index) +
+        (remote_consume.history_valid ? " converged" : " warming") +
+        " reset=" + ToString(remote_ddgi_reset_reason);
 }
 
 void NewPipelineClientRenderPath::SetInputActive(bool active)
@@ -223,22 +248,37 @@ void NewPipelineClientRenderPath::RenderPostprocessChain(wi::graphics::CommandLi
 {
     wi::RenderPath3D::RenderPostprocessChain(cmd);
     if (!rtShadow.IsValid())
+    {
+        local_shadow_snapshot_valid = false;
         return;
+    }
     if (!EnsureLocalShadowSnapshot(rtShadow.GetDesc().width, rtShadow.GetDesc().height))
+    {
+        local_shadow_snapshot_valid = false;
         return;
+    }
+    local_shadow_index = GetNewPipelineSunShadowIndex(local_scene);
+    if (local_shadow_index >= rtShadow.GetDesc().array_size)
+    {
+        local_shadow_snapshot_valid = false;
+        return;
+    }
 
     wi::graphics::GraphicsDevice* device = wi::graphics::GetDevice();
     const wi::graphics::GPUBarrier before[] = {
         wi::graphics::GPUBarrier::Image(
-            &rtShadow, rtShadow.GetDesc().layout, wi::graphics::ResourceState::COPY_SRC, -1, 0),
+            &rtShadow, rtShadow.GetDesc().layout, wi::graphics::ResourceState::COPY_SRC, -1,
+            static_cast<int>(local_shadow_index)),
         wi::graphics::GPUBarrier::Image(
             &local_shadow_snapshot, local_shadow_snapshot.GetDesc().layout, wi::graphics::ResourceState::COPY_DST),
     };
     device->Barrier(before, static_cast<uint32_t>(std::size(before)), cmd);
-    device->CopyTexture(&local_shadow_snapshot, 0, 0, 0, 0, 0, &rtShadow, 0, 0, cmd);
+    device->CopyTexture(&local_shadow_snapshot, 0, 0, 0, 0, 0, &rtShadow, 0, local_shadow_index, cmd);
+    local_shadow_snapshot_valid = true;
     const wi::graphics::GPUBarrier after[] = {
         wi::graphics::GPUBarrier::Image(
-            &rtShadow, wi::graphics::ResourceState::COPY_SRC, rtShadow.GetDesc().layout, -1, 0),
+            &rtShadow, wi::graphics::ResourceState::COPY_SRC, rtShadow.GetDesc().layout, -1,
+            static_cast<int>(local_shadow_index)),
         wi::graphics::GPUBarrier::Image(
             &local_shadow_snapshot, wi::graphics::ResourceState::COPY_DST, local_shadow_snapshot.GetDesc().layout),
     };
@@ -325,7 +365,16 @@ void NewPipelineClientRenderPath::InitializeSceneIfNeeded()
         wi::backlog::post("Client scene diagnostic: " + result.diagnostic);
 
     scene_initialized = true;
+    local_ddgi_reset_reference_sun = sun_state;
+    ResetLocalDDGI(DDGIResetReason::InitialScene);
     ApplyEnvironmentProbeSettings(false);
+}
+
+void NewPipelineClientRenderPath::ResetLocalDDGI(DDGIResetReason reason)
+{
+    local_scene.ddgi.frame_index = std::numeric_limits<uint32_t>::max();
+    local_ddgi_reset_reason = reason;
+    wi::backlog::post(std::string{"Client local DDGI reset: "} + ToString(reason));
 }
 
 void NewPipelineClientRenderPath::ApplyRenderSettings(bool log_changes)
@@ -348,6 +397,8 @@ void NewPipelineClientRenderPath::ConfigureComparableLocalBuffers()
     wi::renderer::SetDDGIRayCount(256);
     wi::renderer::SetDDGIBlendSpeed(0.1f);
     wi::renderer::SetDDGIDebugEnabled(false);
+    setRaytracedReflectionsQuality(wi::renderer::PostProcessQuality::High);
+    setSSRQuality(wi::renderer::PostProcessQuality::High);
     setRaytracedReflectionsEnabled(hardware_raytracing);
     setSSREnabled(!hardware_raytracing);
     wi::backlog::post("Client local preview algorithms: " + GetEffectiveAlgorithmSummary());
@@ -372,15 +423,15 @@ void NewPipelineClientRenderPath::ApplyShadowSettings(bool log_changes)
 void NewPipelineClientRenderPath::ApplySSAOSettings(bool log_changes)
 {
     setAORange(1.0f);
-    setAOSampleCount(8);
+    setAOSampleCount(16);
     setAOPower(1.0f);
     setAO(render_settings.ssao_enabled
-        ? (hardware_raytracing ? wi::RenderPath3D::AO_RTAO : wi::RenderPath3D::AO_SSAO)
+        ? (hardware_raytracing ? wi::RenderPath3D::AO_RTAO : wi::RenderPath3D::AO_MSAO)
         : wi::RenderPath3D::AO_DISABLED);
     if (log_changes)
     {
         wi::backlog::post(std::string{"Client local AO ("} +
-            (hardware_raytracing ? "RTAO" : "SSAO") + "): " + EnabledString(render_settings.ssao_enabled));
+            (hardware_raytracing ? "RTAO" : "MSAO full-res") + "): " + EnabledString(render_settings.ssao_enabled));
     }
 }
 
@@ -748,22 +799,28 @@ bool NewPipelineClientRenderPath::UploadRemoteTextures(const RemoteRawFrame& fra
         const RemoteRawBuffer& buffer = frame.buffers[index];
         if (!buffer.available)
             continue;
+        const size_t element_count = static_cast<size_t>(buffer.width) * buffer.height * 4u;
+        const bool hdr = buffer.encoding == RemoteBufferEncoding::LogHDR16F;
         if (buffer.width == 0 || buffer.height == 0 ||
-            buffer.payload_rgba8.size() != static_cast<size_t>(buffer.width) * buffer.height * 4u)
+            (hdr ? buffer.payload_rgba16f.size() != element_count : buffer.payload_rgba8.size() != element_count))
             return false;
 
         wi::graphics::TextureDesc desc;
         desc.type = wi::graphics::TextureDesc::Type::TEXTURE_2D;
         desc.width = buffer.width;
         desc.height = buffer.height;
-        desc.format = wi::graphics::Format::R8G8B8A8_UNORM;
+        desc.format = hdr ? wi::graphics::Format::R16G16B16A16_FLOAT : wi::graphics::Format::R8G8B8A8_UNORM;
         desc.bind_flags = wi::graphics::BindFlag::SHADER_RESOURCE;
         desc.layout = wi::graphics::ResourceState::SHADER_RESOURCE;
         wi::vector<wi::graphics::SubresourceData> subresources;
-        wi::graphics::CreateTextureSubresourceDatas(desc, const_cast<uint8_t*>(buffer.payload_rgba8.data()), subresources);
+        void* texture_data = hdr
+            ? static_cast<void*>(const_cast<uint16_t*>(buffer.payload_rgba16f.data()))
+            : static_cast<void*>(const_cast<uint8_t*>(buffer.payload_rgba8.data()));
+        wi::graphics::CreateTextureSubresourceDatas(desc, texture_data, subresources);
         if (!wi::graphics::GetDevice()->CreateTexture(&desc, subresources.data(), &uploaded[index]))
             return false;
-        const std::string name = std::string{"newpipeline.client."} + ToString(buffer.semantic) + ".rgba8";
+        const std::string name = std::string{"newpipeline.client."} + ToString(buffer.semantic) +
+            (hdr ? ".rgba16f" : ".rgba8");
         wi::graphics::GetDevice()->SetName(&uploaded[index], name.c_str());
         uploaded_mask |= RemoteBufferKindMask(buffer.semantic);
     }
@@ -792,7 +849,7 @@ bool NewPipelineClientRenderPath::ValidateRemoteFrame(const RemoteRawFrame& fram
         reason = "empty resolution";
         return false;
     }
-    if (metadata.dynamic_range != RemoteDynamicRange::LDR)
+    if (metadata.dynamic_range != RemoteDynamicRange::HDR)
     {
         reason = "unexpected dynamic range";
         return false;
@@ -821,7 +878,10 @@ bool NewPipelineClientRenderPath::ValidateRemoteFrame(const RemoteRawFrame& fram
         if (!buffer.available)
             continue;
         const size_t expected_size = static_cast<size_t>(buffer.width) * buffer.height * 4u;
-        if (buffer.payload_rgba8.size() != expected_size)
+        const bool valid_size = buffer.encoding == RemoteBufferEncoding::LogHDR16F
+            ? buffer.payload_rgba16f.size() == expected_size
+            : buffer.payload_rgba8.size() == expected_size;
+        if (!valid_size)
         {
             reason = std::string{"payload size mismatch for "} + ToString(buffer.semantic);
             return false;
@@ -873,6 +933,8 @@ void NewPipelineClientRenderPath::AcceptRemoteFrame(const RemoteRawFrame& frame)
     remote_consume.height = metadata.height;
     remote_consume.confidence = metadata.confidence;
     remote_consume.accepted_valid = true;
+    remote_ddgi_frame_index = metadata.ddgi_frame_index;
+    remote_ddgi_reset_reason = metadata.ddgi_reset_reason;
     remote_consume.placeholder = false;
     remote_consume.stale_timer = 0.0f;
     remote_consume.stale_logged = false;
@@ -980,7 +1042,7 @@ void NewPipelineClientRenderPath::AcquireRemoteVideoFrame(float dt)
     {
         size_t payload_bytes = 0;
         for (const RemoteRawBuffer& buffer : frame.buffers)
-            payload_bytes += buffer.payload_rgba8.size();
+            payload_bytes += buffer.payload_rgba8.size() + buffer.payload_rgba16f.size() * sizeof(uint16_t);
         wi::backlog::post(std::string{config.remote_source == RemoteSourceMode::Mock
                 ? "Client mock packed-video frame decoded: "
                 : "Client WebRTC video-track frame decoded: "} +
@@ -1019,15 +1081,15 @@ const wi::graphics::Texture* NewPipelineClientRenderPath::GetDebugPreviewTexture
     case DebugPreviewMode::LocalSpecularIndirect:
         return rtSSR.IsValid() ? &rtSSR : nullptr;
     case DebugPreviewMode::LocalShadowVisibility:
-        return local_shadow_snapshot.IsValid() ? &local_shadow_snapshot : nullptr;
+        return local_shadow_snapshot_valid && local_shadow_snapshot.IsValid() ? &local_shadow_snapshot : nullptr;
     case DebugPreviewMode::RemoteIndirectDiffuse:
-        return remote_consume.accepted_valid && accepted_remote_textures[0].IsValid() ? &accepted_remote_textures[0] : nullptr;
+        return remote_consume.accepted_valid && (accepted_remote_buffer_mask & RemoteBufferKindMask(RemoteBufferSemantic::RemoteIndirectDiffuse)) && accepted_remote_textures[0].IsValid() ? &accepted_remote_textures[0] : nullptr;
     case DebugPreviewMode::RemoteAO:
-        return remote_consume.accepted_valid && accepted_remote_textures[1].IsValid() ? &accepted_remote_textures[1] : nullptr;
+        return remote_consume.accepted_valid && (accepted_remote_buffer_mask & RemoteBufferKindMask(RemoteBufferSemantic::RemoteAO)) && accepted_remote_textures[1].IsValid() ? &accepted_remote_textures[1] : nullptr;
     case DebugPreviewMode::RemoteSpecularIndirect:
-        return remote_consume.accepted_valid && accepted_remote_textures[2].IsValid() ? &accepted_remote_textures[2] : nullptr;
+        return remote_consume.accepted_valid && (accepted_remote_buffer_mask & RemoteBufferKindMask(RemoteBufferSemantic::RemoteSpecularIndirect)) && accepted_remote_textures[2].IsValid() ? &accepted_remote_textures[2] : nullptr;
     case DebugPreviewMode::RemoteShadowVisibility:
-        return remote_consume.accepted_valid && accepted_remote_textures[3].IsValid() ? &accepted_remote_textures[3] : nullptr;
+        return remote_consume.accepted_valid && (accepted_remote_buffer_mask & RemoteBufferKindMask(RemoteBufferSemantic::RemoteShadowVisibility)) && accepted_remote_textures[3].IsValid() ? &accepted_remote_textures[3] : nullptr;
     case DebugPreviewMode::Final:
     case DebugPreviewMode::RemoteOverview:
     default:
@@ -1037,23 +1099,49 @@ const wi::graphics::Texture* NewPipelineClientRenderPath::GetDebugPreviewTexture
 
 void NewPipelineClientRenderPath::Compose(wi::graphics::CommandList cmd) const
 {
-    if (debug_preview_mode == DebugPreviewMode::Final ||
-        debug_preview_mode == DebugPreviewMode::LocalIndirectDiffuse)
+    if (debug_preview_mode == DebugPreviewMode::Final)
     {
         wi::RenderPath3D::Compose(cmd);
+        return;
+    }
+    if (debug_preview_mode == DebugPreviewMode::LocalIndirectDiffuse)
+    {
+        if (GetDDGIRemoteIndirectDiffuseFormal().IsValid())
+            wi::RenderPath3D::Compose(cmd);
+        else
+            DrawUnavailablePreview(cmd);
         return;
     }
 
     if (debug_preview_mode == DebugPreviewMode::RemoteOverview)
     {
-        if (remote_consume.accepted_valid)
+        if (remote_consume.accepted_valid && accepted_remote_buffer_mask != 0)
         {
             const float half_width = GetLogicalWidth() * 0.5f;
             const float half_height = GetLogicalHeight() * 0.5f;
+            wi::image::Params background;
+            background.blendFlag = wi::enums::BLENDMODE_OPAQUE;
+            background.enableFullScreen();
+            wi::image::Draw(wi::texturehelper::getBlack(), background, cmd);
             for (size_t index = 0; index < accepted_remote_textures.size(); ++index)
             {
-                if (!accepted_remote_textures[index].IsValid())
+                if ((accepted_remote_buffer_mask & RemoteBufferKindMask(static_cast<RemoteBufferSemantic>(index))) == 0 ||
+                    !accepted_remote_textures[index].IsValid())
+                {
+                    wi::font::Params unavailable;
+                    unavailable.position = XMFLOAT3(
+                        ((index & 1u) + 0.5f) * half_width,
+                        ((index / 2u) + 0.5f) * half_height,
+                        0.0f);
+                    unavailable.h_align = wi::font::WIFALIGN_CENTER;
+                    unavailable.v_align = wi::font::WIFALIGN_CENTER;
+                    unavailable.size = 18;
+                    unavailable.color = wi::Color::Red();
+                    unavailable.shadowColor = wi::Color::Black();
+                    wi::font::Draw(std::string{"UNAVAILABLE: "} +
+                        ToString(static_cast<RemoteBufferSemantic>(index)), unavailable, cmd);
                     continue;
+                }
                 wi::image::Params fx;
                 fx.blendFlag = wi::enums::BLENDMODE_OPAQUE;
                 fx.quality = wi::image::QUALITY_LINEAR;
@@ -1063,6 +1151,8 @@ void NewPipelineClientRenderPath::Compose(wi::graphics::CommandList cmd) const
                 if (index == static_cast<size_t>(RemoteBufferSemantic::RemoteAO) ||
                     index == static_cast<size_t>(RemoteBufferSemantic::RemoteShadowVisibility))
                     fx.enableExtractChannelR();
+                else
+                    fx.enableDebugTonemap();
                 wi::image::Draw(&accepted_remote_textures[index], fx, cmd);
             }
             wi::RenderPath2D::Compose(cmd);
@@ -1080,7 +1170,9 @@ void NewPipelineClientRenderPath::Compose(wi::graphics::CommandList cmd) const
             fx.color = XMFLOAT4(1.0f, 1.0f, 0.0f, 1.0f);
         else if (debug_preview_mode == DebugPreviewMode::GBufferRoughness)
             fx.color = XMFLOAT4(0.0f, 0.0f, 4.0f, 1.0f);
-        else if (debug_preview_mode == DebugPreviewMode::LocalSpecularIndirect)
+        else if (debug_preview_mode == DebugPreviewMode::LocalSpecularIndirect ||
+            debug_preview_mode == DebugPreviewMode::RemoteIndirectDiffuse ||
+            debug_preview_mode == DebugPreviewMode::RemoteSpecularIndirect)
             fx.enableDebugTonemap();
         if (debug_preview_mode == DebugPreviewMode::LocalAO ||
             debug_preview_mode == DebugPreviewMode::LocalShadowVisibility ||
@@ -1094,11 +1186,28 @@ void NewPipelineClientRenderPath::Compose(wi::graphics::CommandList cmd) const
 
     if (!debug_preview_invalid_logged)
     {
-        wi::backlog::post(std::string{"Client debug preview unavailable, showing Final: "} +
+        wi::backlog::post(std::string{"Client debug preview unavailable: "} +
             ToString(debug_preview_mode));
         debug_preview_invalid_logged = true;
     }
 
-    wi::RenderPath3D::Compose(cmd);
+    DrawUnavailablePreview(cmd);
+}
+
+void NewPipelineClientRenderPath::DrawUnavailablePreview(wi::graphics::CommandList cmd) const
+{
+    wi::image::Params image;
+    image.blendFlag = wi::enums::BLENDMODE_OPAQUE;
+    image.enableFullScreen();
+    wi::image::Draw(wi::texturehelper::getBlack(), image, cmd);
+    wi::font::Params text;
+    text.position = XMFLOAT3(GetLogicalWidth() * 0.5f, GetLogicalHeight() * 0.5f, 0);
+    text.h_align = wi::font::WIFALIGN_CENTER;
+    text.v_align = wi::font::WIFALIGN_CENTER;
+    text.size = 28;
+    text.color = wi::Color::Red();
+    text.shadowColor = wi::Color::Black();
+    wi::font::Draw(std::string{"UNAVAILABLE: "} + ToString(debug_preview_mode), text, cmd);
+    wi::RenderPath2D::Compose(cmd);
 }
 } // namespace wicked_newpipeline

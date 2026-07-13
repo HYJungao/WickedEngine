@@ -2,9 +2,12 @@
 
 #include "wiHelper.h"
 #include "wiImage.h"
+#include "wiFont.h"
+#include "wiTextureHelper.h"
 
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 
 namespace wicked_newpipeline
 {
@@ -17,6 +20,11 @@ uint64_t NowUsec()
         clock::now().time_since_epoch()).count());
 }
 } // namespace
+
+NewPipelineServerRenderPath::~NewPipelineServerRenderPath()
+{
+    StopPublishWorker();
+}
 
 void NewPipelineServerRenderPath::SetRuntimeConfig(const RuntimeConfig& value)
 {
@@ -43,18 +51,40 @@ void NewPipelineServerRenderPath::SetDebugPreviewMode(DebugPreviewMode mode)
 
 std::string NewPipelineServerRenderPath::GetEffectiveAlgorithmSummary() const
 {
-    return std::string{"DDGI | "} + (hardware_raytracing ? "RTAO | RT Reflection | RT Shadow" :
-        "SSAO | SSR | Screen Space Shadow");
+    return std::string{"DDGI | "} + (hardware_raytracing ? "RTAO | RT Reflection High | RT Shadow" :
+        "MSAO full-res | SSR High | Screen Space Shadow");
+}
+
+std::string NewPipelineServerRenderPath::GetDebugStatusSummary() const
+{
+    size_t pending_count = 0;
+    for (const ReadbackSlot& slot : readback_ring)
+        pending_count += slot.pending ? 1u : 0u;
+    const std::string shadow = authoritative_shadow_index < 16
+        ? std::to_string(authoritative_shadow_index)
+        : std::string{"unavailable"};
+    return GetEffectiveAlgorithmSummary() + "\nSun shadow slice: " + shadow +
+        "\nReadback: async ring 3, pending " + std::to_string(pending_count) +
+        "\nDDGI: frame " + std::to_string(local_scene.ddgi.frame_index) +
+        (local_scene.ddgi.frame_index >= 64 ? " converged" : " warming") +
+        " reset=" + ToString(ddgi_reset_reason);
 }
 
 void NewPipelineServerRenderPath::Start()
 {
+    std::string codec_test_error;
+    if (!ValidateRemoteVideoV2RoundTrip(&codec_test_error))
+        wi::backlog::post("Remote video V2 self-test failed: " + codec_test_error);
+    else
+        wi::backlog::post("Remote video V2 self-test passed: LogHDR + scalar luma + padding.");
     InitializeSceneIfNeeded();
     ConfigureDDGI();
     wi::RenderPath3D::Start();
+    StartPublishWorker();
     if (config.remote_source == RemoteSourceMode::WebRTC)
     {
         std::string error;
+        std::lock_guard lock(webrtc_mutex);
         if (!webrtc_transport.Start(true, config, &error))
             wi::backlog::post("Server WebRTC start failed: " + error);
     }
@@ -122,22 +152,39 @@ void NewPipelineServerRenderPath::RenderPostprocessChain(wi::graphics::CommandLi
 {
     wi::RenderPath3D::RenderPostprocessChain(cmd);
     if (!rtShadow.IsValid())
+    {
+        shadow_snapshot_valid = false;
         return;
+    }
     if (!EnsureShadowSliceTexture(rtShadow.GetDesc().width, rtShadow.GetDesc().height))
+    {
+        shadow_snapshot_valid = false;
         return;
+    }
+    authoritative_shadow_index = GetNewPipelineSunShadowIndex(local_scene);
+    if (authoritative_shadow_index >= rtShadow.GetDesc().array_size)
+    {
+        shadow_snapshot_valid = false;
+        return;
+    }
 
     wi::graphics::GraphicsDevice* device = wi::graphics::GetDevice();
     const wi::graphics::GPUBarrier before[] = {
         wi::graphics::GPUBarrier::Image(
-            &rtShadow, rtShadow.GetDesc().layout, wi::graphics::ResourceState::COPY_SRC, -1, 0),
+            &rtShadow, rtShadow.GetDesc().layout, wi::graphics::ResourceState::COPY_SRC, -1,
+            static_cast<int>(authoritative_shadow_index)),
         wi::graphics::GPUBarrier::Image(
             &shadow_slice_texture, shadow_slice_texture.GetDesc().layout, wi::graphics::ResourceState::COPY_DST),
     };
     device->Barrier(before, static_cast<uint32_t>(std::size(before)), cmd);
-    device->CopyTexture(&shadow_slice_texture, 0, 0, 0, 0, 0, &rtShadow, 0, 0, cmd);
+    device->CopyTexture(
+        &shadow_slice_texture, 0, 0, 0, 0, 0,
+        &rtShadow, 0, authoritative_shadow_index, cmd);
+    shadow_snapshot_valid = true;
     const wi::graphics::GPUBarrier after[] = {
         wi::graphics::GPUBarrier::Image(
-            &rtShadow, wi::graphics::ResourceState::COPY_SRC, rtShadow.GetDesc().layout, -1, 0),
+            &rtShadow, wi::graphics::ResourceState::COPY_SRC, rtShadow.GetDesc().layout, -1,
+            static_cast<int>(authoritative_shadow_index)),
         wi::graphics::GPUBarrier::Image(
             &shadow_slice_texture, wi::graphics::ResourceState::COPY_DST, shadow_slice_texture.GetDesc().layout),
     };
@@ -155,7 +202,15 @@ const wi::graphics::Texture* NewPipelineServerRenderPath::GetDebugPreviewTexture
     case DebugPreviewMode::LocalSpecularIndirect:
         return rtSSR.IsValid() ? &rtSSR : nullptr;
     case DebugPreviewMode::LocalShadowVisibility:
-        return shadow_slice_texture.IsValid() ? &shadow_slice_texture : nullptr;
+        return shadow_snapshot_valid && shadow_slice_texture.IsValid() ? &shadow_slice_texture : nullptr;
+    case DebugPreviewMode::TransportIndirectDiffuse:
+        return transport_textures[0].IsValid() ? &transport_textures[0] : nullptr;
+    case DebugPreviewMode::TransportAO:
+        return transport_textures[1].IsValid() ? &transport_textures[1] : nullptr;
+    case DebugPreviewMode::TransportSpecularIndirect:
+        return transport_textures[2].IsValid() ? &transport_textures[2] : nullptr;
+    case DebugPreviewMode::TransportShadowVisibility:
+        return transport_textures[3].IsValid() ? &transport_textures[3] : nullptr;
     case DebugPreviewMode::Final:
     default:
         return nullptr;
@@ -164,10 +219,17 @@ const wi::graphics::Texture* NewPipelineServerRenderPath::GetDebugPreviewTexture
 
 void NewPipelineServerRenderPath::Compose(wi::graphics::CommandList cmd) const
 {
-    if (debug_preview_mode == DebugPreviewMode::Final ||
-        debug_preview_mode == DebugPreviewMode::LocalIndirectDiffuse)
+    if (debug_preview_mode == DebugPreviewMode::Final)
     {
         wi::RenderPath3D::Compose(cmd);
+        return;
+    }
+    if (debug_preview_mode == DebugPreviewMode::LocalIndirectDiffuse)
+    {
+        if (GetDDGIRemoteIndirectDiffuseFormal().IsValid())
+            wi::RenderPath3D::Compose(cmd);
+        else
+            DrawUnavailablePreview(cmd);
         return;
     }
 
@@ -180,8 +242,16 @@ void NewPipelineServerRenderPath::Compose(wi::graphics::CommandList cmd) const
         fx.enableFullScreen();
         if (debug_preview_mode == DebugPreviewMode::LocalSpecularIndirect)
             fx.enableDebugTonemap();
+        if (debug_preview_mode == DebugPreviewMode::TransportIndirectDiffuse ||
+            debug_preview_mode == DebugPreviewMode::TransportSpecularIndirect)
+        {
+            fx.enableHDRTransportDecode();
+            fx.enableDebugTonemap();
+        }
         if (debug_preview_mode == DebugPreviewMode::LocalAO ||
-            debug_preview_mode == DebugPreviewMode::LocalShadowVisibility)
+            debug_preview_mode == DebugPreviewMode::LocalShadowVisibility ||
+            debug_preview_mode == DebugPreviewMode::TransportAO ||
+            debug_preview_mode == DebugPreviewMode::TransportShadowVisibility)
             fx.enableExtractChannelR();
         wi::image::Draw(debug_texture, fx, cmd);
         wi::RenderPath2D::Compose(cmd);
@@ -190,11 +260,28 @@ void NewPipelineServerRenderPath::Compose(wi::graphics::CommandList cmd) const
 
     if (!debug_preview_invalid_logged)
     {
-        wi::backlog::post(std::string{"Server debug preview unavailable, showing Final: "} +
+        wi::backlog::post(std::string{"Server debug preview unavailable: "} +
             ToString(debug_preview_mode));
         debug_preview_invalid_logged = true;
     }
-    wi::RenderPath3D::Compose(cmd);
+    DrawUnavailablePreview(cmd);
+}
+
+void NewPipelineServerRenderPath::DrawUnavailablePreview(wi::graphics::CommandList cmd) const
+{
+    wi::image::Params image;
+    image.blendFlag = wi::enums::BLENDMODE_OPAQUE;
+    image.enableFullScreen();
+    wi::image::Draw(wi::texturehelper::getBlack(), image, cmd);
+    wi::font::Params text;
+    text.position = XMFLOAT3(GetLogicalWidth() * 0.5f, GetLogicalHeight() * 0.5f, 0);
+    text.h_align = wi::font::WIFALIGN_CENTER;
+    text.v_align = wi::font::WIFALIGN_CENTER;
+    text.size = 28;
+    text.color = wi::Color::Red();
+    text.shadowColor = wi::Color::Black();
+    wi::font::Draw(std::string{"UNAVAILABLE: "} + ToString(debug_preview_mode), text, cmd);
+    wi::RenderPath2D::Compose(cmd);
 }
 
 void NewPipelineServerRenderPath::MaintainWebRTC(float dt)
@@ -202,6 +289,7 @@ void NewPipelineServerRenderPath::MaintainWebRTC(float dt)
     webrtc_transport.Tick();
     if (config.remote_source != RemoteSourceMode::WebRTC)
         return;
+    std::lock_guard lock(webrtc_mutex);
     const WebRTCTransportStats stats = webrtc_transport.GetStats();
     if (stats.state != WebRTCTransportState::Failed)
     {
@@ -237,7 +325,7 @@ bool NewPipelineServerRenderPath::EnsureTransportTexture(RemoteBufferSemantic se
     desc.width = width;
     desc.height = height;
     desc.format = wi::graphics::Format::R8G8B8A8_UNORM;
-    desc.bind_flags = wi::graphics::BindFlag::SHADER_RESOURCE | wi::graphics::BindFlag::UNORDERED_ACCESS;
+    desc.bind_flags = wi::graphics::BindFlag::SHADER_RESOURCE | wi::graphics::BindFlag::RENDER_TARGET;
     desc.layout = wi::graphics::ResourceState::SHADER_RESOURCE;
 
     texture = {};
@@ -253,6 +341,38 @@ bool NewPipelineServerRenderPath::EnsureTransportTexture(RemoteBufferSemantic se
     wi::backlog::post(std::string{"Server remote: "} + ToString(semantic) + " transport texture " +
         std::to_string(width) + "x" + std::to_string(height) + " format=R8G8B8A8_UNORM.");
     return true;
+}
+
+void NewPipelineServerRenderPath::EncodeTransportTexture(
+    RemoteBufferSemantic semantic,
+    const wi::graphics::Texture& source,
+    wi::graphics::Texture& destination,
+    wi::graphics::CommandList cmd) const
+{
+    wi::graphics::GraphicsDevice* device = wi::graphics::GetDevice();
+    const wi::graphics::RenderPassImage renderpass = wi::graphics::RenderPassImage::RenderTarget(
+        &destination,
+        wi::graphics::RenderPassImage::LoadOp::CLEAR,
+        wi::graphics::RenderPassImage::StoreOp::STORE,
+        destination.GetDesc().layout,
+        destination.GetDesc().layout);
+    device->RenderPassBegin(&renderpass, 1, cmd);
+    wi::graphics::Viewport viewport;
+    viewport.width = static_cast<float>(destination.GetDesc().width);
+    viewport.height = static_cast<float>(destination.GetDesc().height);
+    device->BindViewports(1, &viewport, cmd);
+    wi::image::Params params;
+    params.blendFlag = wi::enums::BLENDMODE_OPAQUE;
+    params.quality = wi::image::QUALITY_NEAREST;
+    params.sampleFlag = wi::image::SAMPLEMODE_CLAMP;
+    params.enableFullScreen();
+    if (semantic == RemoteBufferSemantic::RemoteIndirectDiffuse ||
+        semantic == RemoteBufferSemantic::RemoteSpecularIndirect)
+        params.enableHDRTransportEncode();
+    else
+        params.enableExtractChannelR();
+    wi::image::Draw(&source, params, cmd);
+    device->RenderPassEnd(cmd);
 }
 
 bool NewPipelineServerRenderPath::EnsureShadowSliceTexture(uint32_t width, uint32_t height) const
@@ -280,6 +400,8 @@ bool NewPipelineServerRenderPath::EnsureShadowSliceTexture(uint32_t width, uint3
 
 void NewPipelineServerRenderPath::PublishRemotePayload(float dt)
 {
+    ConsumeCompletedReadback();
+
     if (settings.remote_publish_fps <= 0.0f)
     {
         if (!mock_remote_disabled_logged)
@@ -310,6 +432,15 @@ void NewPipelineServerRenderPath::PublishRemotePayload(float dt)
         rtSSR.IsValid() ? &rtSSR : nullptr,
         shadow_slice_texture.IsValid() ? &shadow_slice_texture : nullptr,
     };
+    ReadbackSlot& slot = readback_ring[readback_write_index];
+    if (slot.pending)
+    {
+        // The ring only advances when a copy is submitted. A still-pending slot
+        // means the producer outran the three-frame latency, so drop this capture
+        // instead of ever waiting for the GPU on the render thread.
+        return;
+    }
+
     wi::graphics::GraphicsDevice* device = wi::graphics::GetDevice();
     wi::graphics::CommandList cmd = device->BeginCommandList();
     uint32_t available_mask = 0;
@@ -323,79 +454,178 @@ void NewPipelineServerRenderPath::PublishRemotePayload(float dt)
         if (!EnsureTransportTexture(semantic, source_desc.width, source_desc.height))
             continue;
 
-        wi::renderer::CopyTexture2D(transport_textures[index], *source, cmd);
+        EncodeTransportTexture(semantic, *source, transport_textures[index], cmd);
+
+        wi::graphics::Texture& readback = slot.textures[index];
+        const auto& transport_desc = transport_textures[index].GetDesc();
+        if (!readback.IsValid() || readback.GetDesc().width != transport_desc.width ||
+            readback.GetDesc().height != transport_desc.height)
+        {
+            wi::graphics::TextureDesc readback_desc = transport_desc;
+            readback_desc.usage = wi::graphics::Usage::READBACK;
+            readback_desc.bind_flags = wi::graphics::BindFlag::NONE;
+            readback_desc.layout = wi::graphics::ResourceState::COPY_DST;
+            if (!device->CreateTexture(&readback_desc, nullptr, &readback))
+                continue;
+            const std::string name = "newpipeline.readback[" + std::to_string(readback_write_index) + "]." +
+                ToString(semantic);
+            device->SetName(&readback, name.c_str());
+        }
+        device->Barrier(wi::graphics::GPUBarrier::Image(
+            &transport_textures[index], transport_desc.layout, wi::graphics::ResourceState::COPY_SRC), cmd);
+        device->CopyResource(&readback, &transport_textures[index], cmd);
+        device->Barrier(wi::graphics::GPUBarrier::Image(
+            &transport_textures[index], wi::graphics::ResourceState::COPY_SRC, transport_desc.layout), cmd);
         available_mask |= RemoteBufferKindMask(semantic);
     }
     if (available_mask == 0)
         return;
+    slot.metadata = {};
+    slot.metadata.frame_id = ++remote_frame_id;
+    slot.metadata.timestamp_usec = NowUsec();
+    slot.metadata.source_generation = remote_generation;
+    slot.metadata.continuity_mask = available_mask;
+    slot.metadata.available_buffer_mask = available_mask;
+    slot.metadata.dynamic_range = RemoteDynamicRange::HDR;
+    slot.metadata.source_stream_id = kRemoteFrameStreamId;
+    slot.metadata.view_origin = local_camera.Eye;
+    XMStoreFloat3(&slot.metadata.view_forward,
+        XMVector3Normalize(XMVectorSubtract(XMLoadFloat3(&local_camera.At), XMLoadFloat3(&local_camera.Eye))));
+    slot.metadata.view = local_camera.View;
+    slot.metadata.projection = local_camera.Projection;
+    XMStoreFloat4x4(&slot.metadata.view_projection,
+        XMMatrixMultiply(XMLoadFloat4x4(&local_camera.View), XMLoadFloat4x4(&local_camera.Projection)));
+    XMStoreFloat4x4(&slot.metadata.inverse_view, XMMatrixInverse(nullptr, XMLoadFloat4x4(&slot.metadata.view)));
+    XMStoreFloat4x4(&slot.metadata.inverse_projection, XMMatrixInverse(nullptr, XMLoadFloat4x4(&slot.metadata.projection)));
+    XMStoreFloat4x4(&slot.metadata.inverse_view_projection,
+        XMMatrixInverse(nullptr, XMLoadFloat4x4(&slot.metadata.view_projection)));
+    slot.metadata.near_plane = local_camera.zNearP;
+    slot.metadata.far_plane = local_camera.zFarP;
+    slot.metadata.history_valid = local_scene.ddgi.frame_index >= 64;
+    slot.metadata.reset_this_frame = ddgi_announced_reset_serial != ddgi_reset_serial;
+    if (slot.metadata.reset_this_frame)
+        ddgi_announced_reset_serial = ddgi_reset_serial;
+    slot.metadata.confidence = available_mask == static_cast<uint32_t>(RemoteBufferKind::All) ? 1.0f : 0.75f;
+    slot.metadata.valid = true;
+    slot.metadata.ddgi_frame_index = local_scene.ddgi.frame_index;
+    slot.metadata.ddgi_reset_reason = ddgi_reset_reason;
+    slot.available_mask = available_mask;
+    slot.pending = true;
     device->SubmitCommandLists();
+    readback_write_index = (readback_write_index + 1) % kReadbackRingSize;
+}
+
+void NewPipelineServerRenderPath::ConsumeCompletedReadback()
+{
+    ReadbackSlot& slot = readback_ring[readback_write_index];
+    if (!slot.pending)
+        return;
 
     RemoteRawFrame frame;
-    frame.metadata.frame_id = ++remote_frame_id;
-    frame.metadata.timestamp_usec = NowUsec();
-    frame.metadata.source_generation = remote_generation;
-    frame.metadata.continuity_mask = available_mask;
-    frame.metadata.available_buffer_mask = available_mask;
-    frame.metadata.dynamic_range = RemoteDynamicRange::LDR;
-    frame.metadata.source_stream_id = kRemoteFrameStreamId;
-    frame.metadata.view_origin = local_camera.Eye;
-    XMStoreFloat3(&frame.metadata.view_forward,
-        XMVector3Normalize(XMVectorSubtract(XMLoadFloat3(&local_camera.At), XMLoadFloat3(&local_camera.Eye))));
-    frame.metadata.view = local_camera.View;
-    frame.metadata.projection = local_camera.Projection;
-    XMStoreFloat4x4(&frame.metadata.view_projection,
-        XMMatrixMultiply(XMLoadFloat4x4(&local_camera.View), XMLoadFloat4x4(&local_camera.Projection)));
-    XMStoreFloat4x4(&frame.metadata.inverse_view, XMMatrixInverse(nullptr, XMLoadFloat4x4(&frame.metadata.view)));
-    XMStoreFloat4x4(&frame.metadata.inverse_projection, XMMatrixInverse(nullptr, XMLoadFloat4x4(&frame.metadata.projection)));
-    XMStoreFloat4x4(&frame.metadata.inverse_view_projection,
-        XMMatrixInverse(nullptr, XMLoadFloat4x4(&frame.metadata.view_projection)));
-    frame.metadata.near_plane = local_camera.zNearP;
-    frame.metadata.far_plane = local_camera.zFarP;
-    frame.metadata.history_valid = remote_frame_id > 1;
-    frame.metadata.reset_this_frame = remote_frame_id == 1;
-    frame.metadata.confidence = available_mask == static_cast<uint32_t>(RemoteBufferKind::All) ? 1.0f : 0.75f;
-    frame.metadata.valid = true;
+    frame.metadata = slot.metadata;
     for (size_t index = 0; index < frame.buffers.size(); ++index)
     {
         const RemoteBufferSemantic semantic = static_cast<RemoteBufferSemantic>(index);
-        if ((available_mask & RemoteBufferKindMask(semantic)) == 0)
+        if ((slot.available_mask & RemoteBufferKindMask(semantic)) == 0)
             continue;
-        wi::vector<uint8_t> readback;
-        if (!wi::helper::saveTextureToMemory(transport_textures[index], readback))
+        const wi::graphics::Texture& readback = slot.textures[index];
+        if (!readback.IsValid() || readback.mapped_data == nullptr ||
+            readback.mapped_subresources == nullptr || readback.mapped_subresource_count == 0)
         {
-            wi::backlog::post(std::string{"Server remote readback failed for "} + ToString(semantic));
             frame.metadata.continuity_mask &= ~RemoteBufferKindMask(semantic);
             frame.metadata.available_buffer_mask &= ~RemoteBufferKindMask(semantic);
             continue;
         }
-        const wi::graphics::TextureDesc& desc = transport_textures[index].GetDesc();
+        const auto& desc = readback.GetDesc();
         RemoteRawBuffer& destination = frame.buffers[index];
         destination.width = desc.width;
         destination.height = desc.height;
         destination.available = true;
-        destination.payload_rgba8.assign(readback.begin(), readback.end());
+        destination.encoding =
+            semantic == RemoteBufferSemantic::RemoteIndirectDiffuse ||
+            semantic == RemoteBufferSemantic::RemoteSpecularIndirect
+            ? RemoteBufferEncoding::LogHDR16F
+            : RemoteBufferEncoding::ScalarLuma8;
+        destination.payload_rgba8.resize(static_cast<size_t>(desc.width) * desc.height * 4);
+        const uint8_t* source = static_cast<const uint8_t*>(readback.mapped_data);
+        const uint32_t source_pitch = readback.mapped_subresources[0].row_pitch;
+        const size_t destination_pitch = static_cast<size_t>(desc.width) * 4;
+        for (uint32_t y = 0; y < desc.height; ++y)
+        {
+            std::memcpy(destination.payload_rgba8.data() + y * destination_pitch,
+                source + static_cast<size_t>(y) * source_pitch, destination_pitch);
+        }
         frame.metadata.width = std::max(frame.metadata.width, desc.width);
         frame.metadata.height = std::max(frame.metadata.height, desc.height);
     }
+    slot.pending = false;
+    slot.available_mask = 0;
     if (frame.metadata.available_buffer_mask == 0)
         return;
 
-    std::string error;
-    const bool published = config.remote_source == RemoteSourceMode::Mock
-        ? mock_remote_mailbox.PublishLatest(frame, &error)
-        : webrtc_transport.SendFrame(frame);
-    if (!published)
-    {
-        if (config.remote_source == RemoteSourceMode::Mock || remote_frame_id == 1)
-            wi::backlog::post("Server remote publish failed: " + (error.empty() ? webrtc_transport.GetStats().status : error));
-        return;
-    }
+    QueueFrameForPublish(std::move(frame));
+}
 
-    if (remote_frame_id == 1)
+void NewPipelineServerRenderPath::StartPublishWorker()
+{
+    if (publish_worker.joinable())
+        return;
+    publish_worker_stop = false;
+    publish_worker = std::thread([this]() {
+        for (;;)
+        {
+            RemoteRawFrame frame;
+            {
+                std::unique_lock lock(publish_mutex);
+                publish_cv.wait(lock, [this]() { return publish_worker_stop || pending_publish_frame.has_value(); });
+                if (publish_worker_stop && !pending_publish_frame.has_value())
+                    return;
+                frame = std::move(*pending_publish_frame);
+                pending_publish_frame.reset();
+            }
+
+            std::string error;
+            bool published = false;
+            if (config.remote_source == RemoteSourceMode::Mock)
+            {
+                published = mock_remote_mailbox.PublishLatest(frame, &error);
+            }
+            else
+            {
+                std::lock_guard transport_lock(webrtc_mutex);
+                published = webrtc_transport.SendFrame(frame);
+                if (!published)
+                    error = webrtc_transport.GetStats().status;
+            }
+            if (!published)
+                wi::backlog::post("Server remote publish failed: " +
+                    (error.empty() ? std::string{"unknown transport error"} : error));
+            else if (frame.metadata.frame_id == 1)
+                wi::backlog::post("Server remote published first asynchronous frame: " +
+                    std::to_string(frame.metadata.width) + "x" + std::to_string(frame.metadata.height));
+        }
+    });
+}
+
+void NewPipelineServerRenderPath::StopPublishWorker()
+{
     {
-        wi::backlog::post("Server mock remote published first frame: " +
-            std::to_string(frame.metadata.width) + "x" + std::to_string(frame.metadata.height));
+        std::lock_guard lock(publish_mutex);
+        publish_worker_stop = true;
     }
+    publish_cv.notify_all();
+    if (publish_worker.joinable())
+        publish_worker.join();
+}
+
+void NewPipelineServerRenderPath::QueueFrameForPublish(RemoteRawFrame&& frame)
+{
+    {
+        std::lock_guard lock(publish_mutex);
+        // Latest-frame semantics: encoding never builds a backlog behind rendering.
+        pending_publish_frame = std::move(frame);
+    }
+    publish_cv.notify_one();
 }
 
 void NewPipelineServerRenderPath::InitializeSceneIfNeeded()
@@ -435,6 +665,7 @@ void NewPipelineServerRenderPath::InitializeSceneIfNeeded()
         std::to_string(local_scene.ddgi.grid_dimensions.z) + " (scene/Editor setting).");
 
     scene_initialized = true;
+    ResetDDGI(DDGIResetReason::InitialScene);
 }
 
 void NewPipelineServerRenderPath::ConfigureDDGI()
@@ -446,7 +677,9 @@ void NewPipelineServerRenderPath::ConfigureDDGI()
     wi::renderer::SetDDGIRayCount(settings.ddgi_enabled ? settings.ddgi_ray_count : 0u);
     wi::renderer::SetDDGIBlendSpeed(0.1f);
     wi::renderer::SetDDGIDebugEnabled(false);
-    setAO(hardware_raytracing ? wi::RenderPath3D::AO_RTAO : wi::RenderPath3D::AO_SSAO);
+    setRaytracedReflectionsQuality(wi::renderer::PostProcessQuality::High);
+    setSSRQuality(wi::renderer::PostProcessQuality::High);
+    setAO(hardware_raytracing ? wi::RenderPath3D::AO_RTAO : wi::RenderPath3D::AO_MSAO);
     setRaytracedReflectionsEnabled(hardware_raytracing);
     setSSREnabled(!hardware_raytracing);
     setShadowsEnabled(true);
@@ -455,8 +688,8 @@ void NewPipelineServerRenderPath::ConfigureDDGI()
     wi::renderer::SetScreenSpaceShadowsEnabled(!hardware_raytracing);
 
     wi::backlog::post(std::string{"Server remote algorithms: IndirectDiffuse=DDGI AO="} +
-        (hardware_raytracing ? "RTAO" : "SSAO(fallback)") +
-        " SpecularIndirect=" + (hardware_raytracing ? "RTReflection" : "SSR(fallback)") +
+        (hardware_raytracing ? "RTAO" : "MSAO(full-res fallback)") +
+        " SpecularIndirect=" + (hardware_raytracing ? "RTReflection(High)" : "SSR(High fallback)") +
         " ShadowVisibility=" + (hardware_raytracing ? "RTShadow" : "ScreenSpaceShadow(fallback)") +
         " hardware_raytracing=" + (hardware_raytracing ? "1" : "0"));
 
@@ -492,8 +725,42 @@ void NewPipelineServerRenderPath::ApplyLatestControlPacket()
     }
 
     const bool first_control = last_applied_frame_id == 0;
+    DDGIResetReason reset_reason = DDGIResetReason::None;
+    if (has_ddgi_reset_reference_control)
+    {
+        if (packet.scene_generation != ddgi_reset_reference_control.scene_generation)
+        {
+            reset_reason = DDGIResetReason::SceneGeneration;
+        }
+        else
+        {
+            const XMVECTOR old_direction = XMLoadFloat3(&ddgi_reset_reference_control.sun_direction);
+            const XMVECTOR new_direction = XMLoadFloat3(&packet.sun_direction);
+            const float direction_dot = XMVectorGetX(XMVector3Dot(
+                XMVector3Normalize(old_direction), XMVector3Normalize(new_direction)));
+            const float color_delta = XMVectorGetX(XMVector3LengthSq(
+                XMVectorSubtract(XMLoadFloat3(&ddgi_reset_reference_control.sun_color), XMLoadFloat3(&packet.sun_color))));
+            if (packet.sun_enabled != ddgi_reset_reference_control.sun_enabled || direction_dot < 0.999f ||
+                std::abs(packet.sun_intensity - ddgi_reset_reference_control.sun_intensity) > 0.05f || color_delta > 0.0025f)
+            {
+                reset_reason = DDGIResetReason::LightingChanged;
+            }
+        }
+    }
     ApplyControlPacketToCameraAndScene(packet, local_camera, local_scene);
+    if (reset_reason != DDGIResetReason::None)
+    {
+        ResetDDGI(reset_reason);
+        ddgi_reset_reference_control = packet;
+    }
     last_applied_frame_id = packet.frame_id;
+    last_applied_control = packet;
+    has_last_applied_control = true;
+    if (!has_ddgi_reset_reference_control)
+    {
+        ddgi_reset_reference_control = packet;
+        has_ddgi_reset_reference_control = true;
+    }
     if (first_control)
     {
         wi::backlog::post(std::string{config.remote_source == RemoteSourceMode::Mock
@@ -501,6 +768,17 @@ void NewPipelineServerRenderPath::ApplyLatestControlPacket()
                 : "Server WebRTC control applied first frame: "} + std::to_string(last_applied_frame_id) +
             " sun=" + (packet.sun_enabled ? std::string("enabled") : std::string("disabled")));
     }
+}
+
+void NewPipelineServerRenderPath::ResetDDGI(DDGIResetReason reason)
+{
+    // Scene::Update increments before renderer::DDGI. Wrapping UINT_MAX makes
+    // the renderer observe frame_index==0 and clear every DDGI history resource.
+    local_scene.ddgi.frame_index = std::numeric_limits<uint32_t>::max();
+    ddgi_reset_reason = reason;
+    ++ddgi_reset_serial;
+    ++remote_generation;
+    wi::backlog::post(std::string{"Server DDGI reset: "} + ToString(reason));
 }
 
 void NewPipelineServerRenderPath::LogDDGIStatusIfNeeded()

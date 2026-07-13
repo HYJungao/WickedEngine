@@ -303,6 +303,19 @@ const char* GetNewPipelineSunName()
     return kNewPipelineSunName;
 }
 
+uint32_t GetNewPipelineSunShadowIndex(const wi::scene::Scene& scene)
+{
+    const wi::ecs::Entity sun = FindNewPipelineSun(scene);
+    if (sun == wi::ecs::INVALID_ENTITY)
+        return std::numeric_limits<uint32_t>::max();
+    const size_t index = scene.lights.GetIndex(sun);
+    if (index == wi::ecs::INVALID_INDEX || index >= 16 || !scene.lights[index].IsCastingShadow())
+        return std::numeric_limits<uint32_t>::max();
+    // rtShadow slices use the light component offset from lights().first_item(),
+    // which is the Scene::lights component index on the CPU.
+    return static_cast<uint32_t>(index);
+}
+
 NewPipelineSunState MakeSunStateFromAngles(bool enabled, float yaw_degrees, float pitch_degrees)
 {
     NewPipelineSunState state;

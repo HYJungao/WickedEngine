@@ -16,7 +16,9 @@ struct RemoteRawBuffer
     uint32_t width = 0;
     uint32_t height = 0;
     bool available = false;
+    RemoteBufferEncoding encoding = RemoteBufferEncoding::LinearRGBA8;
     std::vector<uint8_t> payload_rgba8;
+    std::vector<uint16_t> payload_rgba16f;
 };
 
 struct RemoteRawFrame
@@ -40,6 +42,7 @@ struct PackedRemoteVideoFrame
 // No downstream frame payload or identity metadata is carried by a data channel.
 bool EncodeRemoteVideoFrame(const RemoteRawFrame& frame, PackedRemoteVideoFrame& video, std::string* error = nullptr);
 bool DecodeRemoteVideoFrame(const PackedRemoteVideoFrame& video, RemoteRawFrame& frame, std::string* error = nullptr);
+bool ValidateRemoteVideoV2RoundTrip(std::string* error = nullptr);
 
 class IRemoteTransport
 {

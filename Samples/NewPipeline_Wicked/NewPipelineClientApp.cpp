@@ -13,7 +13,7 @@ void NewPipelineClientApp::CreateDebugUI()
         "NewPipeline Debug",
         wi::gui::Window::WindowControls::MOVE | wi::gui::Window::WindowControls::COLLAPSE);
     debug_window.SetPos(XMFLOAT2(20.0f, 80.0f));
-    debug_window.SetSize(XMFLOAT2(340.0f, 355.0f));
+    debug_window.SetSize(XMFLOAT2(340.0f, 410.0f));
 
     sun_enabled_checkbox.Create("Sun Enabled: ");
     sun_enabled_checkbox.SetPos(XMFLOAT2(150.0f, 8.0f));
@@ -70,15 +70,15 @@ void NewPipelineClientApp::CreateDebugUI()
     debug_window.AddWidget(&preview_buffer_combo);
 
     algorithm_label.Create("Algorithms");
-    algorithm_label.SetText(render_path.GetEffectiveAlgorithmSummary());
+    algorithm_label.SetText(render_path.GetDebugStatusSummary());
     algorithm_label.SetPos(XMFLOAT2(10.0f, 116.0f));
-    algorithm_label.SetSize(XMFLOAT2(310.0f, 38.0f));
+    algorithm_label.SetSize(XMFLOAT2(310.0f, 90.0f));
     debug_window.AddWidget(&algorithm_label);
 
     const NewPipelineClientRenderSettings initial_render_settings = render_path.GetRenderSettings();
 
     shadow_maps_checkbox.Create("Local Shadows: ");
-    shadow_maps_checkbox.SetPos(XMFLOAT2(150.0f, 158.0f));
+    shadow_maps_checkbox.SetPos(XMFLOAT2(150.0f, 213.0f));
     shadow_maps_checkbox.SetSize(XMFLOAT2(18.0f, 18.0f));
     shadow_maps_checkbox.SetCheck(initial_render_settings.shadow_maps_enabled);
     shadow_maps_checkbox.OnClick([this](const wi::gui::EventArgs& args) {
@@ -89,7 +89,7 @@ void NewPipelineClientApp::CreateDebugUI()
     debug_window.AddWidget(&shadow_maps_checkbox);
 
     ssao_checkbox.Create("Local AO: ");
-    ssao_checkbox.SetPos(XMFLOAT2(150.0f, 184.0f));
+    ssao_checkbox.SetPos(XMFLOAT2(150.0f, 239.0f));
     ssao_checkbox.SetSize(XMFLOAT2(18.0f, 18.0f));
     ssao_checkbox.SetCheck(initial_render_settings.ssao_enabled);
     ssao_checkbox.OnClick([this](const wi::gui::EventArgs& args) {
@@ -100,7 +100,7 @@ void NewPipelineClientApp::CreateDebugUI()
     debug_window.AddWidget(&ssao_checkbox);
 
     environment_probe_checkbox.Create("Env Probe: ");
-    environment_probe_checkbox.SetPos(XMFLOAT2(150.0f, 210.0f));
+    environment_probe_checkbox.SetPos(XMFLOAT2(150.0f, 265.0f));
     environment_probe_checkbox.SetSize(XMFLOAT2(18.0f, 18.0f));
     environment_probe_checkbox.SetCheck(initial_render_settings.environment_probe_enabled);
     environment_probe_checkbox.OnClick([this](const wi::gui::EventArgs& args) {
@@ -111,7 +111,7 @@ void NewPipelineClientApp::CreateDebugUI()
     debug_window.AddWidget(&environment_probe_checkbox);
 
     baked_lightmaps_checkbox.Create("Use Baked Lightmaps: ");
-    baked_lightmaps_checkbox.SetPos(XMFLOAT2(150.0f, 236.0f));
+    baked_lightmaps_checkbox.SetPos(XMFLOAT2(150.0f, 291.0f));
     baked_lightmaps_checkbox.SetSize(XMFLOAT2(18.0f, 18.0f));
     baked_lightmaps_checkbox.SetCheck(initial_render_settings.baked_lightmaps_enabled);
     baked_lightmaps_checkbox.OnClick([this](const wi::gui::EventArgs& args) {
@@ -125,7 +125,7 @@ void NewPipelineClientApp::CreateDebugUI()
     debug_window.AddWidget(&baked_lightmaps_checkbox);
 
     bake_lightmaps_checkbox.Create("Bake Lightmaps: ");
-    bake_lightmaps_checkbox.SetPos(XMFLOAT2(150.0f, 262.0f));
+    bake_lightmaps_checkbox.SetPos(XMFLOAT2(150.0f, 317.0f));
     bake_lightmaps_checkbox.SetSize(XMFLOAT2(18.0f, 18.0f));
     bake_lightmaps_checkbox.SetCheck(initial_render_settings.lightmap_bake_requested);
     bake_lightmaps_checkbox.OnClick([this](const wi::gui::EventArgs& args) {
@@ -179,6 +179,8 @@ void NewPipelineClientApp::Update(float dt)
     // initialization has completed. Creating GUI widgets earlier can enqueue
     // glyphs before the default font style exists and race UpdateAtlas().
     CreateDebugUI();
+    if (debug_ui_created)
+        algorithm_label.SetText(render_path.GetDebugStatusSummary());
     render_path.SetInputActive(is_window_active);
     wi::Application::Update(dt);
 }

@@ -3,6 +3,7 @@
 #include "NewPipelineScene.h"
 #include "NewPipelineTransport.h"
 
+#include <limits>
 #include <string>
 
 namespace wicked_newpipeline
@@ -45,6 +46,7 @@ public:
     void SetDebugPreviewMode(DebugPreviewMode mode);
     DebugPreviewMode GetDebugPreviewMode() const { return debug_preview_mode; }
     std::string GetEffectiveAlgorithmSummary() const;
+    std::string GetDebugStatusSummary() const;
     void SetInputActive(bool active);
     void SetRenderSettings(const NewPipelineClientRenderSettings& settings);
     const NewPipelineClientRenderSettings& GetRenderSettings() const { return render_settings; }
@@ -69,8 +71,10 @@ private:
     bool UploadRemoteTextures(const RemoteRawFrame& frame);
     const wi::graphics::Texture* GetDebugPreviewTexture() const;
     bool EnsureLocalShadowSnapshot(uint32_t width, uint32_t height) const;
+    void DrawUnavailablePreview(wi::graphics::CommandList cmd) const;
     void ApplyRenderSettings(bool log_changes);
     void ConfigureComparableLocalBuffers();
+    void ResetLocalDDGI(DDGIResetReason reason);
     void ApplyShadowSettings(bool log_changes);
     void ApplySSAOSettings(bool log_changes);
     void ApplyEnvironmentProbeSettings(bool log_changes);
@@ -117,7 +121,13 @@ private:
     bool hardware_raytracing = false;
     mutable wi::graphics::Texture local_ao_snapshot;
     mutable wi::graphics::Texture local_shadow_snapshot;
+    mutable uint32_t local_shadow_index = std::numeric_limits<uint32_t>::max();
+    mutable bool local_shadow_snapshot_valid = false;
     bool          status_logged = false;
+    uint32_t remote_ddgi_frame_index = 0;
+    DDGIResetReason remote_ddgi_reset_reason = DDGIResetReason::None;
+    DDGIResetReason local_ddgi_reset_reason = DDGIResetReason::InitialScene;
+    NewPipelineSunState local_ddgi_reset_reference_sun;
     bool mock_control_publish_logged = false;
     bool remote_acquire_logged = false;
     bool remote_unchanged_skip_logged = false;

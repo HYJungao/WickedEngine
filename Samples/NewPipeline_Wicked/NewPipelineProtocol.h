@@ -8,9 +8,9 @@ namespace wicked_newpipeline
 {
 constexpr const char* kControlStreamName             = "np.control";
 constexpr const char* kRemoteVideoStreamName         = "np.remote.video";
-constexpr const char* kRemoteFrameStreamId            = "RemoteFrame.CloudBuffers.V1";
+constexpr const char* kRemoteFrameStreamId            = "RemoteFrame.CloudBuffers.V2";
 constexpr uint32_t    kRemoteVideoWireMagic           = 0x3156504Eu; // NPV1
-constexpr uint32_t    kRemoteVideoWireVersion         = 1u;
+constexpr uint32_t    kRemoteVideoWireVersion         = 2u;
 
 struct NewPipelineSunState
 {

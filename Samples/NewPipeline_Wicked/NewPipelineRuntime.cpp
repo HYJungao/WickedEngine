@@ -144,6 +144,34 @@ const char* ToString(DebugPreviewMode mode)
     case DebugPreviewMode::RemoteSpecularIndirect: return "remote_specular_indirect";
     case DebugPreviewMode::RemoteShadowVisibility: return "remote_shadow_visibility";
     case DebugPreviewMode::RemoteOverview: return "remote_overview";
+    case DebugPreviewMode::TransportIndirectDiffuse: return "transport_indirect_diffuse";
+    case DebugPreviewMode::TransportAO: return "transport_ao";
+    case DebugPreviewMode::TransportSpecularIndirect: return "transport_specular_indirect";
+    case DebugPreviewMode::TransportShadowVisibility: return "transport_shadow_visibility";
+    default: return "unknown";
+    }
+}
+
+const char* ToString(RemoteBufferEncoding encoding)
+{
+    switch (encoding)
+    {
+    case RemoteBufferEncoding::LinearRGBA8: return "linear_rgba8";
+    case RemoteBufferEncoding::LogHDR16F: return "log_hdr16f";
+    case RemoteBufferEncoding::ScalarLuma8: return "scalar_luma8";
+    default: return "unknown";
+    }
+}
+
+const char* ToString(DDGIResetReason reason)
+{
+    switch (reason)
+    {
+    case DDGIResetReason::None: return "none";
+    case DDGIResetReason::InitialScene: return "initial_scene";
+    case DDGIResetReason::SceneGeneration: return "scene_generation";
+    case DDGIResetReason::LightingChanged: return "lighting_changed";
+    case DDGIResetReason::GridChanged: return "grid_changed";
     default: return "unknown";
     }
 }

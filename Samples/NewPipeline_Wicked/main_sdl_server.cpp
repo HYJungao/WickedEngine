@@ -6,6 +6,14 @@ wicked_newpipeline::NewPipelineServerApp application;
 
 int main(int argc, char* argv[])
 {
+    for (int i = 1; i < argc; ++i)
+    {
+        if (std::string{argv[i]} == "--transport_selftest")
+        {
+            std::string error;
+            return wicked_newpipeline::ValidateRemoteVideoV2RoundTrip(&error) ? 0 : 1;
+        }
+    }
     wi::arguments::Parse(argc, argv);
     application.ConfigureFromCommandLine(argc, argv);
 

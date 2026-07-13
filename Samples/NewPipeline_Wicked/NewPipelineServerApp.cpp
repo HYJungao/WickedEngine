@@ -15,7 +15,7 @@ void NewPipelineServerApp::CreateDebugUI()
     debug_window.Create("NewPipeline Server Debug",
         wi::gui::Window::WindowControls::MOVE | wi::gui::Window::WindowControls::COLLAPSE);
     debug_window.SetPos(XMFLOAT2(20.0f, 80.0f));
-    debug_window.SetSize(XMFLOAT2(360.0f, 155.0f));
+    debug_window.SetSize(XMFLOAT2(360.0f, 185.0f));
 
     preview_buffer_combo.Create("Preview Buffer: ");
     preview_buffer_combo.SetPos(XMFLOAT2(165.0f, 10.0f));
@@ -25,6 +25,10 @@ void NewPipelineServerApp::CreateDebugUI()
     preview_buffer_combo.AddItem("Local AO", static_cast<uint64_t>(DebugPreviewMode::LocalAO));
     preview_buffer_combo.AddItem("Local Specular Indirect", static_cast<uint64_t>(DebugPreviewMode::LocalSpecularIndirect));
     preview_buffer_combo.AddItem("Local Shadow Visibility", static_cast<uint64_t>(DebugPreviewMode::LocalShadowVisibility));
+    preview_buffer_combo.AddItem("Transport Indirect Diffuse", static_cast<uint64_t>(DebugPreviewMode::TransportIndirectDiffuse));
+    preview_buffer_combo.AddItem("Transport AO", static_cast<uint64_t>(DebugPreviewMode::TransportAO));
+    preview_buffer_combo.AddItem("Transport Specular Indirect", static_cast<uint64_t>(DebugPreviewMode::TransportSpecularIndirect));
+    preview_buffer_combo.AddItem("Transport Shadow Visibility", static_cast<uint64_t>(DebugPreviewMode::TransportShadowVisibility));
     preview_buffer_combo.SetSelectedByUserdataWithoutCallback(static_cast<uint64_t>(render_path.GetDebugPreviewMode()));
     preview_buffer_combo.OnSelect([this](const wi::gui::EventArgs& args) {
         render_path.SetDebugPreviewMode(static_cast<DebugPreviewMode>(args.userdata));
@@ -32,9 +36,9 @@ void NewPipelineServerApp::CreateDebugUI()
     debug_window.AddWidget(&preview_buffer_combo);
 
     algorithm_label.Create("Effective algorithms");
-    algorithm_label.SetText(render_path.GetEffectiveAlgorithmSummary());
+    algorithm_label.SetText(render_path.GetDebugStatusSummary());
     algorithm_label.SetPos(XMFLOAT2(10.0f, 48.0f));
-    algorithm_label.SetSize(XMFLOAT2(325.0f, 55.0f));
+    algorithm_label.SetSize(XMFLOAT2(325.0f, 85.0f));
     debug_window.AddWidget(&algorithm_label);
 
     render_path.GetGUI().AddWidget(&debug_window);
@@ -189,6 +193,8 @@ void NewPipelineServerApp::Update(float dt)
     // completed. Otherwise the first glyph-atlas update can observe an empty
     // font-style table and fail during startup.
     CreateDebugUI();
+    if (debug_ui_created)
+        algorithm_label.SetText(render_path.GetDebugStatusSummary());
     wi::Application::Update(dt);
 }
 

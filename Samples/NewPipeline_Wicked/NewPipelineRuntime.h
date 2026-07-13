@@ -45,6 +45,22 @@ enum class RemoteDynamicRange : uint8_t
     HDR
 };
 
+enum class RemoteBufferEncoding : uint8_t
+{
+    LinearRGBA8,
+    LogHDR16F,
+    ScalarLuma8,
+};
+
+enum class DDGIResetReason : uint8_t
+{
+    None,
+    InitialScene,
+    SceneGeneration,
+    LightingChanged,
+    GridChanged,
+};
+
 enum class RemoteDebugMode : uint8_t
 {
     Local,
@@ -68,6 +84,10 @@ enum class DebugPreviewMode : uint8_t
     RemoteSpecularIndirect,
     RemoteShadowVisibility,
     RemoteOverview,
+    TransportIndirectDiffuse,
+    TransportAO,
+    TransportSpecularIndirect,
+    TransportShadowVisibility,
 };
 
 struct RemoteFrameMetadata
@@ -101,6 +121,8 @@ struct RemoteFrameMetadata
     bool               camera_cut        = false;
     float              confidence        = 1.0f;
     bool               valid             = false;
+    uint32_t           ddgi_frame_index  = 0;
+    DDGIResetReason    ddgi_reset_reason = DDGIResetReason::None;
 };
 
 struct RemoteStreamConfig
@@ -134,6 +156,8 @@ const char* ToString(RemoteSourceMode mode);
 const char* ToString(RemoteDynamicRange range);
 const char* ToString(RemoteDebugMode mode);
 const char* ToString(DebugPreviewMode mode);
+const char* ToString(RemoteBufferEncoding encoding);
+const char* ToString(DDGIResetReason reason);
 
 RemoteSourceMode ParseRemoteSourceMode(const std::string& value, RemoteSourceMode fallback);
 RemoteDebugMode ParseRemoteDebugMode(const std::string& value, RemoteDebugMode fallback);

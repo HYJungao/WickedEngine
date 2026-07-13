@@ -171,6 +171,14 @@ namespace wi::image
 		{
 			image.flags |= IMAGE_FLAG_DEBUG_TONEMAP;
 		}
+		if (params.isHDRTransportEncodeEnabled())
+		{
+			image.flags |= IMAGE_FLAG_HDR_TRANSPORT_ENCODE;
+		}
+		if (params.isHDRTransportDecodeEnabled())
+		{
+			image.flags |= IMAGE_FLAG_HDR_TRANSPORT_DECODE;
+		}
 		if (texture != nullptr && has_flag(texture->GetDesc().misc_flags, ResourceMiscFlag::TEXTURECUBE))
 		{
 			image.flags |= IMAGE_FLAG_CUBEMAP_BASE;

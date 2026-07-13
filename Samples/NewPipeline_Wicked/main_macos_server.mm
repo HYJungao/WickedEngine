@@ -1,4 +1,5 @@
 #include "NewPipelineServerApp.h"
+#include "NewPipelineTransport.h"
 
 #import <AppKit/AppKit.h>
 #include <Carbon/Carbon.h>
@@ -11,6 +12,16 @@ bool running = true;
 
 int main(int argc, char* argv[])
 {
+    for (int i = 1; i < argc; ++i)
+    {
+        if (std::string{argv[i]} == "--transport_selftest")
+        {
+            std::string error;
+            const bool passed = wicked_newpipeline::ValidateRemoteVideoV2RoundTrip(&error);
+            fprintf(stderr, "%s\n", passed ? "Remote video V2 self-test passed" : error.c_str());
+            return passed ? 0 : 1;
+        }
+    }
     @autoreleasepool
     {
         wi::arguments::Parse(argc, argv);
