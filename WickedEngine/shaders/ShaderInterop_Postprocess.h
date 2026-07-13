@@ -53,8 +53,10 @@ static const uint SSR_TILESIZE = 32;
 
 #define rtao_range ssao_range
 #define rtao_power ssao_power
+#define rtao_downscalefactor postprocess.params1.z
 
 #define rtshadow_denoise_lightindex postprocess.params0.y
+#define rtshadow_downscalefactor postprocess.params1.z
 
 #define rtdiffuse_range ssao_range
 #define rtdiffuse_frame ssr_frame

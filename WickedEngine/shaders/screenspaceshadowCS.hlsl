@@ -7,7 +7,6 @@
 PUSHCONSTANT(postprocess, PostProcess);
 
 static const uint MAX_RTSHADOWS = 16;
-static const uint DOWNSAMPLE = 2;
 
 static const float thickness = 0.5;
 
@@ -23,13 +22,18 @@ RWStructuredBuffer<uint4> output_tiles : register(u2);
 
 void main(uint3 DTid : SV_DispatchThreadID, uint3 Gid : SV_GroupID, uint3 GTid : SV_GroupThreadID, uint groupIndex : SV_GroupIndex)
 {
+#ifdef RTSHADOW
+	const uint downsample = max(1u, (uint)round(rtshadow_downscalefactor));
+#else
+	const uint downsample = 2;
+#endif // RTSHADOW
 	const float2 uv = ((float2)DTid.xy + 0.5) * postprocess.resolution_rcp;
 	const float depth = texture_depth.SampleLevel(sampler_linear_clamp, uv, 0);
 	if (depth == 0)
 		return;
 
 	float3 P = reconstruct_position(uv, depth);
-	float3 N = decode_normal(texture_normal_roughness[DTid.xy * DOWNSAMPLE].rg);
+	float3 N = decode_normal(texture_normal_roughness[DTid.xy * downsample].rg);
 
 	Surface surface;
 	surface.init();
@@ -39,7 +43,7 @@ void main(uint3 DTid : SV_DispatchThreadID, uint3 Gid : SV_GroupID, uint3 GTid :
 	const float4 bluenoise = blue_noise(DTid.xy);
 
 	ShaderCamera camera = GetCamera();
-	const uint2 tileIndex = uint2(floor(DTid.xy * DOWNSAMPLE / TILED_CULLING_BLOCKSIZE));
+	const uint2 tileIndex = uint2(floor(DTid.xy * downsample / TILED_CULLING_BLOCKSIZE));
 	const uint flatTileIndex = flatten2D(tileIndex, camera.entity_culling_tilecount.xy) * SHADER_ENTITY_TILE_BUCKET_COUNT;
 
 	uint4 shadow_mask = 0;

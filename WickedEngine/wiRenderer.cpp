@@ -13943,6 +13943,7 @@ void Postprocess_RTAO(
 	rtao_range = range;
 	rtao_power = power;
 	postprocess.params0.w = (float)res.frame;
+	rtao_downscalefactor = float(output.desc.width) / float(res.normals.desc.width);
 	uint8_t instanceInclusionMask = 0xFF;
 	std::memcpy(&postprocess.params1.x, &instanceInclusionMask, sizeof(instanceInclusionMask));
 	device->PushConstants(&postprocess, sizeof(postprocess), cmd);
@@ -15819,6 +15820,7 @@ void Postprocess_RTShadow(
 	postprocess.resolution_rcp.x = 1.0f / postprocess.resolution.x;
 	postprocess.resolution_rcp.y = 1.0f / postprocess.resolution.y;
 	postprocess.params0.w = (float)res.frame;
+	rtshadow_downscalefactor = float(output.desc.width) / float(res.raytraced.desc.width);
 	uint8_t instanceInclusionMask = raytracing_inclusion_mask_shadow;
 	std::memcpy(&postprocess.params1.x, &instanceInclusionMask, sizeof(instanceInclusionMask));
 	device->PushConstants(&postprocess, sizeof(postprocess), cmd);
