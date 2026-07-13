@@ -648,7 +648,7 @@ namespace wi::renderer
 		wi::graphics::Texture scratch[2];
 		wi::graphics::Texture moments[2];
 	};
-	void CreateRTAOResources(RTAOResources& res, XMUINT2 resolution);
+	void CreateRTAOResources(RTAOResources& res, XMUINT2 resolution, bool full_resolution = false);
 	void Postprocess_RTAO(
 		const RTAOResources& res,
 		const wi::scene::Scene& scene,
@@ -758,7 +758,7 @@ namespace wi::renderer
 		wi::graphics::Texture moments[4][2];
 		wi::graphics::Texture denoised;
 	};
-	void CreateRTShadowResources(RTShadowResources& res, XMUINT2 resolution);
+	void CreateRTShadowResources(RTShadowResources& res, XMUINT2 resolution, bool full_resolution = false);
 	void Postprocess_RTShadow(
 		const RTShadowResources& res,
 		const wi::scene::Scene& scene,

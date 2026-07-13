@@ -67,6 +67,12 @@ namespace
 constexpr size_t kMaxControlBytes = 64u * 1024u;
 constexpr size_t kMaxDataChannelBufferedBytes = 1u * 1024u * 1024u;
 constexpr uint32_t kMaxVideoDimension = 8192;
+// The V2 video frame is a data atlas rather than a camera image. Let congestion
+// control drop frames, but never silently downscale it because that destroys the
+// one-to-one mapping between decoded pixels and buffer samples.
+constexpr int kBufferVideoMinBitrateBps = 20'000'000;
+constexpr int kBufferVideoMaxBitrateBps = 120'000'000;
+constexpr double kBufferVideoMaxFramerate = 30.0;
 
 std::vector<std::string> SplitTokens(const std::string& value, char delimiter)
 {
@@ -1056,11 +1062,36 @@ private:
         webrtc::RtpTransceiverInit init = {};
         init.direction = webrtc::RtpTransceiverDirection::kSendOnly;
         init.stream_ids.push_back("np.stream");
+        webrtc::RtpEncodingParameters encoding = {};
+        encoding.min_bitrate_bps = kBufferVideoMinBitrateBps;
+        encoding.max_bitrate_bps = kBufferVideoMaxBitrateBps;
+        encoding.max_framerate = kBufferVideoMaxFramerate;
+        encoding.scale_resolution_down_by = 1.0;
+        encoding.bitrate_priority = 4.0;
+        encoding.network_priority = webrtc::Priority::kHigh;
+        init.send_encodings.push_back(std::move(encoding));
         auto transceiver_or_error = peer_connection_->AddTransceiver(local_video_track_, init);
         if (!transceiver_or_error.ok())
             return Fail(std::string{"Could not add video transceiver: "} + transceiver_or_error.error().message());
         local_video_transceiver_ = transceiver_or_error.MoveValue();
         local_video_sender_ = local_video_transceiver_->sender();
+        if (local_video_sender_)
+        {
+            webrtc::RtpParameters parameters = local_video_sender_->GetParameters();
+            parameters.degradation_preference = webrtc::DegradationPreference::MAINTAIN_RESOLUTION;
+            if (!parameters.encodings.empty())
+            {
+                parameters.encodings[0].min_bitrate_bps = kBufferVideoMinBitrateBps;
+                parameters.encodings[0].max_bitrate_bps = kBufferVideoMaxBitrateBps;
+                parameters.encodings[0].max_framerate = kBufferVideoMaxFramerate;
+                parameters.encodings[0].scale_resolution_down_by = 1.0;
+                parameters.encodings[0].bitrate_priority = 4.0;
+                parameters.encodings[0].network_priority = webrtc::Priority::kHigh;
+            }
+            const webrtc::RTCError result = local_video_sender_->SetParameters(parameters);
+            if (!result.ok())
+                SetStatus(std::string{"Could not configure loss-sensitive video sender: "} + result.message());
+        }
     }
 
     void AttachControlChannel(webrtc::scoped_refptr<webrtc::DataChannelInterface> channel)

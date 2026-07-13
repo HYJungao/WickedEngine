@@ -70,6 +70,8 @@ namespace wi
 		uint32_t planarReflectionMSAASampleCount = 4;
 		float planarReflectionResolutionScale = 0.25f;
 		DDGIOutputDebugPreview ddgiOutputDebugPreview = DDGIOutputDebugPreview::Disabled;
+		bool rtaoFullResolution = false;
+		bool rtShadowFullResolution = false;
 
 		AO ao = AO_DISABLED;
 		bool fxaaEnabled = false;
@@ -277,6 +279,8 @@ namespace wi
 		constexpr uint32_t getPlanarReflectionMSAASampleCount() const { return planarReflectionMSAASampleCount; }
 		constexpr float getPlanarReflectionResolutionScale() const { return planarReflectionResolutionScale; }
 		constexpr DDGIOutputDebugPreview getDDGIOutputDebugPreview() const { return ddgiOutputDebugPreview; }
+		constexpr bool getRTAOFullResolution() const { return rtaoFullResolution; }
+		constexpr bool getRTShadowFullResolution() const { return rtShadowFullResolution; }
 
 		constexpr bool getAOEnabled() const { return ao != AO_DISABLED; }
 		constexpr AO getAO() const { return ao; }
@@ -342,6 +346,8 @@ namespace wi
 		constexpr void setRaytracedDiffuseQuality(wi::renderer::PostProcessQuality value) { raytracedDiffuseQuality = value; }
 		constexpr void setRaytracedReflectionsQuality(wi::renderer::PostProcessQuality value) { raytracedReflectionsQuality = value; }
 		constexpr void setSSRQuality(wi::renderer::PostProcessQuality value) { ssrQuality = value; }
+		constexpr void setRTAOFullResolution(bool value) { rtaoFullResolution = value; }
+		constexpr void setRTShadowFullResolution(bool value) { rtShadowFullResolution = value; }
 		void setDDGIOutputDebugPreview(DDGIOutputDebugPreview value);
 
 		void setAO(AO value);

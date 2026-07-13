@@ -31,7 +31,7 @@
 
 - Wicked 的四宫格 composite 只是 transport/debug preview，不是 UE 目标公式的最终生产 composite。
 - CPU readback、CPU I420 pack 和约 5120×2900 视频编码成本很高，尚未生产化。
-- `RemoteSpecularIndirect` 在硬件光追环境来自 RT Reflection、fallback 为 SSR；`RemoteShadowVisibility` 在硬件光追环境来自 RT Shadow、fallback 为 Screen Space Shadow，并依赖唯一 authoritative directional light 占 slice 0；都需要跨平台画质/场景矩阵验证。
+- `RemoteAO`、`RemoteSpecularIndirect`、`RemoteShadowVisibility` 严格来自 RTAO、RT Reflection、RT Shadow，不再替换为屏幕空间算法；无硬件光追时明确 unavailable。阴影仍依赖唯一 authoritative directional light 的实际 slice；需要在 Windows DXR 环境完成画质/性能验证。
 - 通用 CMake 现在会在 macOS 明确要求使用 Xcode 工程，并在 Linux 明确报告 Phase 7/WebRTC 平台库尚未实现，避免之前把 macOS 错当成 UNIX/SDL 并复制 `libdxcompiler.so`。
 - Linux 尚未实现；Windows VS2022 x64 target/CMake 已完成，但仍需放入对应 MSVC WebRTC 库后在 Windows 主机执行编译和运行回归。
 

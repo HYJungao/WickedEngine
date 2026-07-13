@@ -51,8 +51,9 @@ void NewPipelineServerRenderPath::SetDebugPreviewMode(DebugPreviewMode mode)
 
 std::string NewPipelineServerRenderPath::GetEffectiveAlgorithmSummary() const
 {
-    return std::string{"DDGI | "} + (hardware_raytracing ? "RTAO | RT Reflection High | RT Shadow" :
-        "MSAO full-res | SSR High | Screen Space Shadow");
+    return std::string{"DDGI | "} + (hardware_raytracing
+        ? "RTAO full-res | RT Reflection High full-res | RT Shadow full-res"
+        : "RTAO unavailable | RT Reflection unavailable | RT Shadow unavailable");
 }
 
 std::string NewPipelineServerRenderPath::GetDebugStatusSummary() const
@@ -151,7 +152,7 @@ void NewPipelineServerRenderPath::RenderAO(wi::graphics::CommandList cmd) const
 void NewPipelineServerRenderPath::RenderPostprocessChain(wi::graphics::CommandList cmd) const
 {
     wi::RenderPath3D::RenderPostprocessChain(cmd);
-    if (!rtShadow.IsValid())
+    if (!hardware_raytracing || !rtShadow.IsValid())
     {
         shadow_snapshot_valid = false;
         return;
@@ -237,7 +238,9 @@ void NewPipelineServerRenderPath::Compose(wi::graphics::CommandList cmd) const
     {
         wi::image::Params fx;
         fx.blendFlag = wi::enums::BLENDMODE_OPAQUE;
-        fx.quality = wi::image::QUALITY_LINEAR;
+        // Buffer inspection must not add a presentation-time blur. The
+        // production texture is sampled one texel at a time in this view.
+        fx.quality = wi::image::QUALITY_NEAREST;
         fx.sampleFlag = wi::image::SAMPLEMODE_CLAMP;
         fx.enableFullScreen();
         if (debug_preview_mode == DebugPreviewMode::LocalSpecularIndirect)
@@ -430,7 +433,7 @@ void NewPipelineServerRenderPath::PublishRemotePayload(float dt)
         settings.ddgi_enabled ? &GetDDGIRemoteIndirectDiffuseFormal() : nullptr,
         local_ao_snapshot.IsValid() ? &local_ao_snapshot : nullptr,
         rtSSR.IsValid() ? &rtSSR : nullptr,
-        shadow_slice_texture.IsValid() ? &shadow_slice_texture : nullptr,
+        shadow_snapshot_valid && shadow_slice_texture.IsValid() ? &shadow_slice_texture : nullptr,
     };
     ReadbackSlot& slot = readback_ring[readback_write_index];
     if (slot.pending)
@@ -678,19 +681,20 @@ void NewPipelineServerRenderPath::ConfigureDDGI()
     wi::renderer::SetDDGIBlendSpeed(0.1f);
     wi::renderer::SetDDGIDebugEnabled(false);
     setRaytracedReflectionsQuality(wi::renderer::PostProcessQuality::High);
-    setSSRQuality(wi::renderer::PostProcessQuality::High);
-    setAO(hardware_raytracing ? wi::RenderPath3D::AO_RTAO : wi::RenderPath3D::AO_MSAO);
+    setRTAOFullResolution(true);
+    setRTShadowFullResolution(true);
+    setAO(hardware_raytracing ? wi::RenderPath3D::AO_RTAO : wi::RenderPath3D::AO_DISABLED);
     setRaytracedReflectionsEnabled(hardware_raytracing);
-    setSSREnabled(!hardware_raytracing);
+    setSSREnabled(false);
     setShadowsEnabled(true);
     wi::renderer::SetShadowsEnabled(true);
     wi::renderer::SetRaytracedShadowsEnabled(hardware_raytracing);
-    wi::renderer::SetScreenSpaceShadowsEnabled(!hardware_raytracing);
+    wi::renderer::SetScreenSpaceShadowsEnabled(false);
 
     wi::backlog::post(std::string{"Server remote algorithms: IndirectDiffuse=DDGI AO="} +
-        (hardware_raytracing ? "RTAO" : "MSAO(full-res fallback)") +
-        " SpecularIndirect=" + (hardware_raytracing ? "RTReflection(High)" : "SSR(High fallback)") +
-        " ShadowVisibility=" + (hardware_raytracing ? "RTShadow" : "ScreenSpaceShadow(fallback)") +
+        (hardware_raytracing ? "RTAO(full-res)" : "RTAO(unavailable)") +
+        " SpecularIndirect=" + (hardware_raytracing ? "RTReflection(High, full-res)" : "RTReflection(unavailable)") +
+        " ShadowVisibility=" + (hardware_raytracing ? "RTShadow(full-res)" : "RTShadow(unavailable)") +
         " hardware_raytracing=" + (hardware_raytracing ? "1" : "0"));
 
     setDDGIOutputDebugPreview(

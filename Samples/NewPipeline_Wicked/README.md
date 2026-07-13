@@ -79,12 +79,14 @@ required.
 
 ## Remote algorithms
 
-The server always uses DDGI for `RemoteIndirectDiffuse`. Hardware ray-tracing
-devices use RTAO, RT Reflection, and RT Shadow for the other three buffers.
-Devices without ray tracing use full-resolution MSAO, high-quality SSR, and
-Screen Space Shadow; Client local previews use the same selection. RT and SSR
-reflection resources use the High (full-resolution) quality preset. The effective algorithms
-are printed at startup and displayed in both debug panels.
+The server always uses DDGI for `RemoteIndirectDiffuse`. The other three
+buffers are strictly RTAO, RT Reflection, and RT Shadow; there is no raster or
+screen-space algorithm substitution. RTAO and RT Shadow use full-resolution
+raytrace and denoise resources, while RT Reflection uses the High
+(full-resolution) quality preset. On devices without hardware ray tracing these
+buffers are reported as unavailable. Client local previews use the same rules.
+The effective algorithms are printed at startup and displayed in both debug
+panels.
 
 ## Remote video V2
 

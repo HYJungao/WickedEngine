@@ -13836,13 +13836,13 @@ void Postprocess_MSAO(
 	wi::profiler::EndRange(prof_range);
 	device->EventEnd(cmd);
 }
-void CreateRTAOResources(RTAOResources& res, XMUINT2 resolution)
+void CreateRTAOResources(RTAOResources& res, XMUINT2 resolution, bool full_resolution)
 {
 	res.frame = 0;
 
 	TextureDesc desc;
-	desc.width = resolution.x / 2;
-	desc.height = resolution.y / 2;
+	desc.width = full_resolution ? resolution.x : resolution.x / 2;
+	desc.height = full_resolution ? resolution.y : resolution.y / 2;
 	desc.bind_flags = BindFlag::SHADER_RESOURCE | BindFlag::UNORDERED_ACCESS;
 	desc.layout = ResourceState::SHADER_RESOURCE_COMPUTE;
 
@@ -13936,8 +13936,8 @@ void Postprocess_RTAO(
 	device->BindUAVs(uavs, 0, arraysize(uavs), cmd);
 
 	PostProcess postprocess = {};
-	postprocess.resolution.x = output.desc.width / 2;
-	postprocess.resolution.y = output.desc.height / 2;
+	postprocess.resolution.x = res.normals.desc.width;
+	postprocess.resolution.y = res.normals.desc.height;
 	postprocess.resolution_rcp.x = 1.0f / postprocess.resolution.x;
 	postprocess.resolution_rcp.y = 1.0f / postprocess.resolution.y;
 	rtao_range = range;
@@ -15682,13 +15682,13 @@ void Postprocess_SSR(
 	wi::profiler::EndRange(range);
 	device->EventEnd(cmd);
 }
-void CreateRTShadowResources(RTShadowResources& res, XMUINT2 resolution)
+void CreateRTShadowResources(RTShadowResources& res, XMUINT2 resolution, bool full_resolution)
 {
 	res.frame = 0;
 
 	TextureDesc desc;
-	desc.width = resolution.x / 2;
-	desc.height = resolution.y / 2;
+	desc.width = full_resolution ? resolution.x : resolution.x / 2;
+	desc.height = full_resolution ? resolution.y : resolution.y / 2;
 	desc.bind_flags = BindFlag::SHADER_RESOURCE | BindFlag::UNORDERED_ACCESS;
 	desc.layout = ResourceState::SHADER_RESOURCE_COMPUTE;
 

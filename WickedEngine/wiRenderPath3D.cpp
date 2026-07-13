@@ -445,7 +445,7 @@ namespace wi
 		{
 			if (!rtshadowResources.denoised.IsValid())
 			{
-				wi::renderer::CreateRTShadowResources(rtshadowResources, internalResolution);
+				wi::renderer::CreateRTShadowResources(rtshadowResources, internalResolution, rtShadowFullResolution);
 			}
 		}
 		else
@@ -2847,7 +2847,7 @@ namespace wi
 			wi::renderer::CreateMSAOResources(msaoResources, internalResolution);
 			break;
 		case RenderPath3D::AO_RTAO:
-			wi::renderer::CreateRTAOResources(rtaoResources, internalResolution);
+			wi::renderer::CreateRTAOResources(rtaoResources, internalResolution, rtaoFullResolution);
 			break;
 		default:
 			break;

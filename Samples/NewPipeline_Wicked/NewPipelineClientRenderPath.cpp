@@ -121,8 +121,9 @@ void NewPipelineClientRenderPath::SetDebugPreviewMode(DebugPreviewMode mode)
 
 std::string NewPipelineClientRenderPath::GetEffectiveAlgorithmSummary() const
 {
-    return std::string{"DDGI | "} + (hardware_raytracing ? "RTAO | RT Reflection High | RT Shadow" :
-        "MSAO full-res | SSR High | Screen Space Shadow");
+    return std::string{"DDGI | "} + (hardware_raytracing
+        ? "RTAO full-res | RT Reflection High full-res | RT Shadow full-res"
+        : "RTAO unavailable | RT Reflection unavailable | RT Shadow unavailable");
 }
 
 std::string NewPipelineClientRenderPath::GetDebugStatusSummary() const
@@ -247,7 +248,7 @@ void NewPipelineClientRenderPath::RenderAO(wi::graphics::CommandList cmd) const
 void NewPipelineClientRenderPath::RenderPostprocessChain(wi::graphics::CommandList cmd) const
 {
     wi::RenderPath3D::RenderPostprocessChain(cmd);
-    if (!rtShadow.IsValid())
+    if (!hardware_raytracing || !rtShadow.IsValid())
     {
         local_shadow_snapshot_valid = false;
         return;
@@ -398,9 +399,10 @@ void NewPipelineClientRenderPath::ConfigureComparableLocalBuffers()
     wi::renderer::SetDDGIBlendSpeed(0.1f);
     wi::renderer::SetDDGIDebugEnabled(false);
     setRaytracedReflectionsQuality(wi::renderer::PostProcessQuality::High);
-    setSSRQuality(wi::renderer::PostProcessQuality::High);
+    setRTAOFullResolution(true);
+    setRTShadowFullResolution(true);
     setRaytracedReflectionsEnabled(hardware_raytracing);
-    setSSREnabled(!hardware_raytracing);
+    setSSREnabled(false);
     wi::backlog::post("Client local preview algorithms: " + GetEffectiveAlgorithmSummary());
 }
 
@@ -411,11 +413,11 @@ void NewPipelineClientRenderPath::ApplyShadowSettings(bool log_changes)
     wi::renderer::SetShadowProps2D(render_settings.shadow_maps_enabled ? kMobileShadow2DResolution : 0);
     wi::renderer::SetShadowPropsCube(render_settings.shadow_maps_enabled ? kMobileShadowCubeResolution : 0);
     wi::renderer::SetRaytracedShadowsEnabled(render_settings.shadow_maps_enabled && hardware_raytracing);
-    wi::renderer::SetScreenSpaceShadowsEnabled(render_settings.shadow_maps_enabled && !hardware_raytracing);
+    wi::renderer::SetScreenSpaceShadowsEnabled(false);
     if (log_changes)
     {
         wi::backlog::post(std::string{"Client local shadows ("} +
-            (hardware_raytracing ? "RT Shadow" : "Screen Space Shadow") + "): " +
+            (hardware_raytracing ? "RT Shadow full-res" : "RT Shadow unavailable") + "): " +
             EnabledString(render_settings.shadow_maps_enabled));
     }
 }
@@ -423,15 +425,14 @@ void NewPipelineClientRenderPath::ApplyShadowSettings(bool log_changes)
 void NewPipelineClientRenderPath::ApplySSAOSettings(bool log_changes)
 {
     setAORange(1.0f);
-    setAOSampleCount(16);
     setAOPower(1.0f);
     setAO(render_settings.ssao_enabled
-        ? (hardware_raytracing ? wi::RenderPath3D::AO_RTAO : wi::RenderPath3D::AO_MSAO)
+        ? (hardware_raytracing ? wi::RenderPath3D::AO_RTAO : wi::RenderPath3D::AO_DISABLED)
         : wi::RenderPath3D::AO_DISABLED);
     if (log_changes)
     {
         wi::backlog::post(std::string{"Client local AO ("} +
-            (hardware_raytracing ? "RTAO" : "MSAO full-res") + "): " + EnabledString(render_settings.ssao_enabled));
+            (hardware_raytracing ? "RTAO full-res" : "RTAO unavailable") + "): " + EnabledString(render_settings.ssao_enabled));
     }
 }
 
@@ -1163,7 +1164,10 @@ void NewPipelineClientRenderPath::Compose(wi::graphics::CommandList cmd) const
     {
         wi::image::Params fx;
         fx.blendFlag = wi::enums::BLENDMODE_OPAQUE;
-        fx.quality = wi::image::QUALITY_LINEAR;
+        // Keep the explicit single-buffer view pixel-exact. The 2x2 overview
+        // remains a deliberately scaled overview and is not used for judging
+        // source resolution.
+        fx.quality = wi::image::QUALITY_NEAREST;
         fx.sampleFlag = wi::image::SAMPLEMODE_CLAMP;
         fx.enableFullScreen();
         if (debug_preview_mode == DebugPreviewMode::GBufferNormalXY)
