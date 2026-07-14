@@ -308,6 +308,16 @@ ClientLightmapPackageResult ClientLightmapPackage::Load(const std::string& scene
         ++result.loaded_count;
     }
 
+    if (result.loaded_count != entry_count)
+    {
+        result.diagnostic = "Client Lightmap package object ID mismatch: loaded " +
+            std::to_string(result.loaded_count) + "/" + std::to_string(entry_count) +
+            "; regenerate lightmaps";
+        ClearSceneLightmaps(scene);
+        result.loaded_count = 0;
+        return result;
+    }
+
     result.success = true;
     result.diagnostic = "Client Lightmap package loaded: " + std::to_string(result.loaded_count) +
         "/" + std::to_string(entry_count) + " objects, samples=" + std::to_string(sample_count) +

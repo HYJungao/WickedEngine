@@ -118,7 +118,7 @@ lightmap contribution black. CPU package bytes are released after upload.
 The Client debug window's `Generate Lightmap` button is the only authoring
 entry point. It generates missing atlas UVs with xatlas, assigns stable object
 IDs, serializes a lightmap-free scene to a temporary file, and then bakes static
-opaque objects sequentially at 256-pixel target resolution, 128 samples, and
+opaque objects sequentially at 256-pixel target resolution, 512 samples, and
 three bounces. Completion writes BC6H data to a temporary package and commits
 the scene/package pair with rollback backups. `Cancel` or any failure preserves
 the original files and reloads the original scene/package.

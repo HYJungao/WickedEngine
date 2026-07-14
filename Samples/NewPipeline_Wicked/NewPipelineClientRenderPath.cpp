@@ -189,6 +189,7 @@ void NewPipelineClientRenderPath::ResizeBuffers()
     wi::RenderPath3D::ResizeBuffers();
     local_ao_snapshot = {};
     local_lightmap_irradiance = {};
+    visibilityResources.texture_lightmap_irradiance = nullptr;
     if (rtAO.IsValid())
     {
         wi::graphics::TextureDesc desc = rtAO.GetDesc();
@@ -197,9 +198,12 @@ void NewPipelineClientRenderPath::ResizeBuffers()
         wi::graphics::GetDevice()->CreateTexture(&desc, nullptr, &local_ao_snapshot);
         wi::graphics::GetDevice()->SetName(&local_ao_snapshot, "newpipeline.client.local_ao_snapshot");
     }
-    if (visibilityResources.texture_normal_roughness.IsValid())
+    const XMUINT2 internal_resolution = GetInternalResolution();
+    if (internal_resolution.x > 0 && internal_resolution.y > 0)
     {
-        wi::graphics::TextureDesc desc = visibilityResources.texture_normal_roughness.GetDesc();
+        wi::graphics::TextureDesc desc;
+        desc.width = internal_resolution.x;
+        desc.height = internal_resolution.y;
         desc.format = wi::graphics::Format::R16G16B16A16_FLOAT;
         desc.bind_flags = wi::graphics::BindFlag::SHADER_RESOURCE | wi::graphics::BindFlag::UNORDERED_ACCESS;
         desc.layout = wi::graphics::ResourceState::SHADER_RESOURCE_COMPUTE;
@@ -207,6 +211,11 @@ void NewPipelineClientRenderPath::ResizeBuffers()
         {
             wi::graphics::GetDevice()->SetName(&local_lightmap_irradiance, "newpipeline.client.local_lightmap_irradiance");
             visibilityResources.texture_lightmap_irradiance = &local_lightmap_irradiance;
+        }
+        else
+        {
+            wi::backlog::post("Client Local Lightmap Irradiance texture creation failed: " +
+                std::to_string(internal_resolution.x) + "x" + std::to_string(internal_resolution.y));
         }
     }
 }
@@ -304,6 +313,9 @@ void NewPipelineClientRenderPath::InitializeSceneIfNeeded()
     {
         const ClientLightmapPackageResult package_result = client_lightmap_package.Load(scene_asset_path, local_scene);
         wi::backlog::post(package_result.diagnostic);
+        lightmap_bake_status = package_result.success
+            ? "Lightmap: " + package_result.diagnostic
+            : "Lightmap: unavailable - " + package_result.diagnostic;
     }
     else
     {
@@ -880,16 +892,27 @@ void NewPipelineClientRenderPath::FinishLightmapBake()
         return;
     }
 
-    for (wi::ecs::Entity entity : lightmap_bake_completed)
+    // Exercise the exact cold-start load path before reporting success.  This
+    // replaces the transient accumulation textures with the committed BC6H
+    // package and catches hash, object-ID, CRC and GPU upload failures now
+    // instead of only after the next process launch.
+    const ClientLightmapPackageResult load_result = client_lightmap_package.Load(scene_asset_path, local_scene);
+    if (!load_result.success || load_result.loaded_count != lightmap_bake_completed.size())
     {
-        if (wi::scene::ObjectComponent* object = local_scene.objects.GetComponent(entity))
-            object->lightmapTextureData.clear();
+        wi::renderer::SetRaytraceBounceCount(previous_raytrace_bounce_count);
+        render_settings.lightmap_bake_requested = false;
+        active_lightmap_bake_entity = wi::ecs::INVALID_ENTITY;
+        lightmap_bake_state = LightmapBakeState::Failed;
+        lightmap_bake_status = "Lightmap: committed but reload verification failed - " + load_result.diagnostic;
+        wi::backlog::post(lightmap_bake_status);
+        return;
     }
     wi::renderer::SetRaytraceBounceCount(previous_raytrace_bounce_count);
     render_settings.lightmap_bake_requested = false;
     lightmap_bake_state = LightmapBakeState::Completed;
-    lightmap_bake_status = "Lightmap: complete " + std::to_string(lightmap_bake_completed.size()) +
-        " objects -> " + ClientLightmapPackage::PackagePathForScene(scene_asset_path);
+    lightmap_bake_status = "Lightmap: complete and reload-verified " +
+        std::to_string(load_result.loaded_count) + " objects -> " +
+        ClientLightmapPackage::PackagePathForScene(scene_asset_path);
     prepared_scene_temp_path.clear();
     prepared_package_temp_path.clear();
     wi::backlog::post(lightmap_bake_status);
@@ -1459,7 +1482,8 @@ void NewPipelineClientRenderPath::Compose(wi::graphics::CommandList cmd) const
             fx.color = XMFLOAT4(1.0f, 1.0f, 0.0f, 1.0f);
         else if (debug_preview_mode == DebugPreviewMode::GBufferRoughness)
             fx.color = XMFLOAT4(0.0f, 0.0f, 4.0f, 1.0f);
-        else if (debug_preview_mode == DebugPreviewMode::LocalSpecularIndirect ||
+        else if (debug_preview_mode == DebugPreviewMode::LocalIndirectDiffuse ||
+            debug_preview_mode == DebugPreviewMode::LocalSpecularIndirect ||
             debug_preview_mode == DebugPreviewMode::RemoteIndirectDiffuse ||
             debug_preview_mode == DebugPreviewMode::RemoteSpecularIndirect)
             fx.enableDebugTonemap();

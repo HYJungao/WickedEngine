@@ -10,7 +10,10 @@ namespace wicked_newpipeline
 struct ClientLightmapBakeSettings
 {
     uint32_t resolution = 256;
-    uint32_t sample_count = 128;
+    // SaveLightmap() only runs OpenImageDenoise when the optional OIDN SDK is
+    // present.  Keep the dependency-free default high enough that the BC6H
+    // result is not dominated by Monte Carlo speckles.
+    uint32_t sample_count = 512;
     uint32_t bounce_count = 3;
 };
 

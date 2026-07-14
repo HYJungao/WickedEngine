@@ -33,6 +33,13 @@ std::vector<std::string> MakeSceneCandidates(const char* relative_path)
 
     std::vector<std::string> candidates;
     const fs::path relative(relative_path);
+#ifdef NEWPIPELINE_WICKED_SOURCE_ROOT_DIR
+    // Authoring builds must bake into the canonical source Content tree.  The
+    // Windows CMake Content target copies that tree into the build directory
+    // on every launch, so baking into the runtime copy would be overwritten on
+    // the next run and invalidate the sibling .clientlightmap package hash.
+    candidates.push_back((fs::path(NEWPIPELINE_WICKED_SOURCE_ROOT_DIR) / relative).generic_string());
+#endif
     const fs::path resource_root(wi::helper::GetCurrentPath());
     const fs::path process_root = fs::current_path();
 

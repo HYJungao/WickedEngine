@@ -84,6 +84,10 @@ function(newpipeline_wicked_add_windows_target TARGET_NAME ENTRY APP_SOURCE APP_
         _SILENCE_CXX20_IS_POD_DEPRECATION_WARNING=1
         $<$<CONFIG:Debug>:NDEBUG>
     )
+    if(TARGET_NAME STREQUAL "NewPipeline_Wicked_Client")
+        target_compile_definitions(${TARGET_NAME} PRIVATE
+            NEWPIPELINE_WICKED_SOURCE_ROOT_DIR="${WICKED_ROOT_DIR}")
+    endif()
     target_compile_options(${TARGET_NAME} PRIVATE
         /URTC_DISABLE_CHECK_MSG
         /utf-8
