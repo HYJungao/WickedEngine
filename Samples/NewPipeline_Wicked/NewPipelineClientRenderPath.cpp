@@ -587,7 +587,12 @@ bool NewPipelineClientRenderPath::SavePreparedScene(const std::string& path, std
             return false;
         }
         local_scene.Serialize(archive);
-        archive.Close();
+        // Archive owns the output path and saves it from its destructor.
+        // Calling Close() here is unsafe because Close() keeps fileName and
+        // pos after clearing DATA; the destructor would then call Close() a
+        // second time and try to write a non-zero byte count from nullptr.
+        // MSVC's ostream invalid-parameter handler terminates the process in
+        // that case (FAST_FAIL_INVALID_ARG).
     }
 
     if (recreate_client_probe)
