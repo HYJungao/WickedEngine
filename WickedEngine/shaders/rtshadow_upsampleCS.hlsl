@@ -29,8 +29,12 @@ void main(uint3 DTid : SV_DispatchThreadID, uint3 GTid : SV_GroupThreadID, uint3
 	const uint2 tileIndex = uint2(floor(pixel / TILED_CULLING_BLOCKSIZE));
 	const uint flatTileIndex = flatten2D(tileIndex, camera.entity_culling_tilecount.xy) * SHADER_ENTITY_TILE_BUCKET_COUNT;
 	
-	const float2 lowres_size = postprocess.params1.xy;
-	const float2 lowres_texel_size = postprocess.params1.zw;
+	// Postprocess_RTShadow() and Postprocess_ScreenSpaceShadow() publish the
+	// packed shadow input dimensions through params0 before this pass. params1
+	// still contains denoiser/filter state here, so treating it as a resolution
+	// can collapse the whole output onto a handful of input texels.
+	const float2 lowres_size = postprocess.params0.xy;
+	const float2 lowres_texel_size = postprocess.params0.zw;
 	
 	float2 sam_pixel = uv * lowres_size + (-0.5 + 1.0 / 512.0); // (1.0 / 512.0) correction is described here: https://www.reedbeta.com/blog/texture-gathers-and-coordinate-precision/
 	float2 sam_pixel_frac = frac(sam_pixel);
