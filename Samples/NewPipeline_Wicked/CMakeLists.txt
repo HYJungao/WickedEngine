@@ -92,7 +92,7 @@ function(newpipeline_wicked_add_windows_target TARGET_NAME ENTRY APP_SOURCE APP_
     set_property(TARGET ${TARGET_NAME} PROPERTY
         MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     set_target_properties(${TARGET_NAME} PROPERTIES
-        VS_DEBUGGER_WORKING_DIRECTORY "${WICKED_ROOT_DIR}"
+        VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/WickedEngine"
         FOLDER "Samples/NewPipeline_Wicked"
     )
     target_link_libraries(${TARGET_NAME} PRIVATE

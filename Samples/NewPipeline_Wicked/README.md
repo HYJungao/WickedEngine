@@ -73,8 +73,11 @@ cmake -S . -B build -G "Visual Studio 17 2022" -A x64 ^
 
 Open `build/WickedEngine.sln`. Configure
 `NewPipeline_Wicked_Server` and `NewPipeline_Wicked_Client` as multiple startup
-projects, with Server ordered first. Their debugger working directory and
-runtime `dxcompiler.dll` deployment are configured by CMake; no arguments are
+projects, with Server ordered first. Their debugger working directory is
+`build/WickedEngine`, matching WickedEngine's standard external-shader layout:
+the engine uses `shaders/hlsl6` directly and recompiles outdated shaders from
+metadata. Scene content resolves from the sibling `build/Content` directory.
+Runtime `dxcompiler.dll` deployment is configured by CMake; no arguments are
 required.
 
 ## Remote algorithms

@@ -39,6 +39,7 @@ std::vector<std::string> MakeSceneCandidates(const char* relative_path)
     candidates.push_back((resource_root / relative).generic_string());
     candidates.push_back((process_root / relative).generic_string());
     candidates.push_back(relative.generic_string());
+    candidates.push_back((fs::path("../") / relative).generic_string());
     candidates.push_back((fs::path("../../") / relative).generic_string());
     return candidates;
 }
