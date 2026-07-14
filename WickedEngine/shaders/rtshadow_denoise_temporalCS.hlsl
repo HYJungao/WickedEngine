@@ -88,8 +88,11 @@ void main(uint3 DTid : SV_DispatchThreadID, uint3 GTid : SV_GroupThreadID, uint3
 		return;
 	}
 
-	// Disocclusion fallback:
-	const float depth = texture_depth.SampleLevel(sampler_point_clamp, uv, 1);
+	// Disocclusion fallback: match the depth mip to the RT shadow resolution.
+	// Full-resolution shadows must compare mip 0 against the history; forcing
+	// mip 1 creates false history matches along silhouettes during camera turns.
+	const uint depth_mip = firstbithigh(downscale);
+	const float depth = texture_depth.SampleLevel(sampler_point_clamp, uv, depth_mip);
 	float depth_current = compute_lineardepth(depth);
 	float depth_history = compute_lineardepth(texture_depth_history.SampleLevel(sampler_point_clamp, prevUV, 0));
 	if (abs(depth_current - depth_history) > 1)

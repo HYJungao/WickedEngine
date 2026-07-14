@@ -25,6 +25,9 @@ void main(uint3 DTid : SV_DispatchThreadID, uint3 GTid : SV_GroupThreadID, uint3
 	uint2 dim;
 	uint MAX_RTSHADOWS;
 	output.GetDimensions(dim.x, dim.y, MAX_RTSHADOWS);
+	if (any(pixel >= dim))
+		return;
+	const bool has_surface = texture_depth[pixel] != 0;
 	
 	const uint2 tileIndex = uint2(floor(pixel / TILED_CULLING_BLOCKSIZE));
 	const uint flatTileIndex = flatten2D(tileIndex, camera.entity_culling_tilecount.xy) * SHADER_ENTITY_TILE_BUCKET_COUNT;
@@ -107,8 +110,15 @@ void main(uint3 DTid : SV_DispatchThreadID, uint3 GTid : SV_GroupThreadID, uint3
 				float shadow2 = load_shadow(shadow_index, shadow_mask2);
 				float shadow3 = load_shadow(shadow_index, shadow_mask3);
 
-				float shadow = bilinear(float4(shadow0,shadow1,shadow2,shadow3) * weights, sam_pixel_frac);
-				shadow *= weights_norm;
+				// A shadow visibility mask is only defined on pixels backed by a
+				// GBuffer surface. Keep sky/background at the neutral visibility
+				// value instead of exposing the internal zero-cleared history.
+				float shadow = 1.0f;
+				if (has_surface)
+				{
+					shadow = bilinear(float4(shadow0,shadow1,shadow2,shadow3) * weights, sam_pixel_frac);
+					shadow *= weights_norm;
+				}
 		
 				output[uint3(pixel, shadow_index)] = shadow;
 			}
