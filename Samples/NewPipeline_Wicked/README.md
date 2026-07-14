@@ -31,7 +31,8 @@ windows are unfocused. Client camera input is disabled while unfocused and no
 automatic camera orbit is applied.
 
 The Client starts on `Final`; receiving a remote frame never changes the
-selection. Its **Preview Buffer** menu contains local DDGI/AO/reflection/shadow,
+selection. Its **Preview Buffer** menu contains the local low-end buffers,
+including material-independent `Local Lightmap Irradiance`,
 the four accepted remote buffers, and an explicit `Remote 2x2 Overview`. The
 Server debug panel contains `Final`, its four local producer buffers, and four
 pre-I420 `Transport` previews. Missing buffers render an explicit black/red
@@ -87,9 +88,40 @@ buffers are strictly RTAO, RT Reflection, and RT Shadow; there is no raster or
 screen-space algorithm substitution. RTAO and RT Shadow use full-resolution
 raytrace and denoise resources, while RT Reflection uses the High
 (full-resolution) quality preset. On devices without hardware ray tracing these
-buffers are reported as unavailable. Client local previews use the same rules.
-The effective algorithms are printed at startup and displayed in both debug
-panels.
+buffers are reported as unavailable. The Server producer path is unchanged.
+
+The Client local renderer is deliberately independent and low-end oriented:
+raster shadow maps (1024 for 2D lights, 512 for cube lights), SSAO, baked
+lightmaps, and a non-realtime 128-pixel environment probe. Local DDGI, RTAO,
+ray-traced diffuse/reflections/shadows, SSGI, SSR, screen-space shadows, and
+planar reflections are disabled. Lightmaps contribute to both Final and the
+full-resolution `Local Lightmap Irradiance` preview. That preview stores
+material-independent irradiance in RGB (`sampledLightmap * PI`) and validity in
+alpha; missing lightmaps and sky remain black. Static probes contribute to Final,
+and raster shadows remain in the light shadow-map atlas. Remote Server buffers are still
+received and available in the Client debug views. The effective algorithms are
+printed at startup and displayed in both debug panels.
+
+## Client lightmap assets
+
+The Client uses one canonical `.wiscene`; it does not create a second baked
+scene. Persistent atlas UVs, per-object dimensions, and the
+`newpipeline.client_lightmap_id` metadata value stay in the canonical scene.
+BC6H texels are stored in a sibling package: `Sponza.wiscene` uses
+`Sponza.clientlightmap`.
+
+Normal startup is read-only. It validates the package version, source-scene
+FNV-1a hash, entry bounds, and per-entry CRC before assigning GPU textures. A
+missing, stale, truncated, or corrupt package is logged once and leaves the
+lightmap contribution black. CPU package bytes are released after upload.
+
+The Client debug window's `Generate Lightmap` button is the only authoring
+entry point. It generates missing atlas UVs with xatlas, assigns stable object
+IDs, serializes a lightmap-free scene to a temporary file, and then bakes static
+opaque objects sequentially at 256-pixel target resolution, 128 samples, and
+three bounces. Completion writes BC6H data to a temporary package and commits
+the scene/package pair with rollback backups. `Cancel` or any failure preserves
+the original files and reloads the original scene/package.
 
 ## Remote video V2
 
@@ -100,7 +132,7 @@ full-resolution I420 Y only with neutral chroma. Every tile has 16 pixels of
 padding to isolate chroma and codec block filtering. The Server uses a three-slot
 asynchronous GPU readback ring and a latest-frame encoding worker.
 
-Both panels report DDGI frame/convergence state. Scene-generation and significant
-authoritative-sun changes clear DDGI history and publish the reset reason in the
-video metadata. `--transport_selftest` runs the CPU V2 LogHDR/luma/padding round-trip
-test without opening a window.
+The Server panel and Client remote status report DDGI frame/convergence state.
+Scene-generation and significant authoritative-sun changes clear Server DDGI
+history and publish the reset reason in the video metadata. `--transport_selftest`
+runs the CPU V2 LogHDR/luma/padding round-trip test without opening a window.

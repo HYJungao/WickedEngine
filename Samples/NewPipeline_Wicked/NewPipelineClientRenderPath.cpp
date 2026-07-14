@@ -1,5 +1,6 @@
 #include "NewPipelineClientRenderPath.h"
 
+#include "wiArchive.h"
 #include "wiHelper.h"
 #include "wiImage.h"
 #include "wiFont.h"
@@ -7,6 +8,8 @@
 
 #include <chrono>
 #include <cmath>
+#include <filesystem>
+#include <unordered_set>
 #include <utility>
 
 namespace wicked_newpipeline
@@ -95,43 +98,29 @@ void NewPipelineClientRenderPath::SetSunState(const NewPipelineSunState& value)
     sun_state = value;
     sun_state.direction = NormalizeDirectionOrDefault(sun_state.direction);
     if (scene_initialized)
-    {
         ApplySunStateToScene(local_scene, sun_state);
-        const float direction_dot = XMVectorGetX(XMVector3Dot(
-            XMVector3Normalize(XMLoadFloat3(&local_ddgi_reset_reference_sun.direction)),
-            XMVector3Normalize(XMLoadFloat3(&sun_state.direction))));
-        if (local_ddgi_reset_reference_sun.enabled != sun_state.enabled || direction_dot < 0.999f ||
-            std::abs(local_ddgi_reset_reference_sun.intensity - sun_state.intensity) > 0.05f)
-        {
-            ResetLocalDDGI(DDGIResetReason::LightingChanged);
-            local_ddgi_reset_reference_sun = sun_state;
-        }
-    }
 }
 
 void NewPipelineClientRenderPath::SetDebugPreviewMode(DebugPreviewMode mode)
 {
     debug_preview_mode = mode;
-    setDDGIOutputDebugPreview(mode == DebugPreviewMode::LocalIndirectDiffuse
-        ? wi::RenderPath3D::DDGIOutputDebugPreview::RemoteIndirectDiffuseFormal
-        : wi::RenderPath3D::DDGIOutputDebugPreview::Disabled);
+    setDDGIOutputDebugPreview(wi::RenderPath3D::DDGIOutputDebugPreview::Disabled);
     debug_preview_invalid_logged = false;
     wi::backlog::post(std::string{"Client debug preview mode: "} + ToString(debug_preview_mode));
 }
 
 std::string NewPipelineClientRenderPath::GetEffectiveAlgorithmSummary() const
 {
-    return std::string{"DDGI | "} + (hardware_raytracing
-        ? "RTAO full-res | RT Reflection High full-res | RT Shadow full-res"
-        : "RTAO unavailable | RT Reflection unavailable | RT Shadow unavailable");
+    return std::string{render_settings.shadow_maps_enabled ? "Shadow Map 1024/512" : "Shadow Map off"} +
+        " | " + (render_settings.ssao_enabled ? "SSAO" : "SSAO off") +
+        " | " + (render_settings.baked_lightmaps_enabled ? "Baked Lightmap" : "Baked Lightmap off") +
+        " | " + (render_settings.environment_probe_enabled ? "Static Probe 128" : "Static Probe off") +
+        " | local DDGI/RT/SSR off";
 }
 
 std::string NewPipelineClientRenderPath::GetDebugStatusSummary() const
 {
-    return GetEffectiveAlgorithmSummary() + "\nLocal DDGI: frame " +
-        std::to_string(local_scene.ddgi.frame_index) +
-        (local_scene.ddgi.frame_index >= 64 ? " converged" : " warming") +
-        " reset=" + ToString(local_ddgi_reset_reason) + "\nRemote decoded: " +
+    return GetEffectiveAlgorithmSummary() + "\n" + lightmap_bake_status + "\nRemote decoded: " +
         (remote_consume.accepted_valid ? std::string{"available"} : std::string{"unavailable"}) +
         "\nRemote DDGI: frame " + std::to_string(remote_ddgi_frame_index) +
         (remote_consume.history_valid ? " converged" : " warming") +
@@ -157,15 +146,11 @@ void NewPipelineClientRenderPath::SetRenderSettings(const NewPipelineClientRende
 
     if (scene_initialized)
     {
-        if (previous.lightmap_bake_requested && !render_settings.lightmap_bake_requested)
-        {
-            ApplyLightmapBakeRequest(previous.lightmap_bake_requested, true);
-        }
         ApplyBakedLightmapSettings(previous.baked_lightmaps_enabled, true);
-        if (!previous.lightmap_bake_requested || render_settings.lightmap_bake_requested)
-        {
-            ApplyLightmapBakeRequest(previous.lightmap_bake_requested, true);
-        }
+        if (!previous.lightmap_bake_requested && render_settings.lightmap_bake_requested)
+            RequestLightmapBake();
+        else if (previous.lightmap_bake_requested && !render_settings.lightmap_bake_requested)
+            CancelLightmapBake();
     }
 
     ApplyShadowSettings(shadows_changed);
@@ -177,7 +162,7 @@ void NewPipelineClientRenderPath::SetRenderSettings(const NewPipelineClientRende
 void NewPipelineClientRenderPath::Start()
 {
     InitializeSceneIfNeeded();
-    ConfigureComparableLocalBuffers();
+    ConfigureLowEndLocalRendering();
     setVisibilitySurfaceResourcesForced(true);
     ApplyRenderSettings(true);
     wi::RenderPath3D::Start();
@@ -203,6 +188,7 @@ void NewPipelineClientRenderPath::ResizeBuffers()
 {
     wi::RenderPath3D::ResizeBuffers();
     local_ao_snapshot = {};
+    local_lightmap_irradiance = {};
     if (rtAO.IsValid())
     {
         wi::graphics::TextureDesc desc = rtAO.GetDesc();
@@ -211,31 +197,18 @@ void NewPipelineClientRenderPath::ResizeBuffers()
         wi::graphics::GetDevice()->CreateTexture(&desc, nullptr, &local_ao_snapshot);
         wi::graphics::GetDevice()->SetName(&local_ao_snapshot, "newpipeline.client.local_ao_snapshot");
     }
-    if (rtShadow.IsValid())
+    if (visibilityResources.texture_normal_roughness.IsValid())
     {
-        EnsureLocalShadowSnapshot(rtShadow.GetDesc().width, rtShadow.GetDesc().height);
+        wi::graphics::TextureDesc desc = visibilityResources.texture_normal_roughness.GetDesc();
+        desc.format = wi::graphics::Format::R16G16B16A16_FLOAT;
+        desc.bind_flags = wi::graphics::BindFlag::SHADER_RESOURCE | wi::graphics::BindFlag::UNORDERED_ACCESS;
+        desc.layout = wi::graphics::ResourceState::SHADER_RESOURCE_COMPUTE;
+        if (wi::graphics::GetDevice()->CreateTexture(&desc, nullptr, &local_lightmap_irradiance))
+        {
+            wi::graphics::GetDevice()->SetName(&local_lightmap_irradiance, "newpipeline.client.local_lightmap_irradiance");
+            visibilityResources.texture_lightmap_irradiance = &local_lightmap_irradiance;
+        }
     }
-}
-
-bool NewPipelineClientRenderPath::EnsureLocalShadowSnapshot(uint32_t width, uint32_t height) const
-{
-    if (local_shadow_snapshot.IsValid())
-    {
-        const auto& current = local_shadow_snapshot.GetDesc();
-        if (current.width == width && current.height == height)
-            return true;
-    }
-    wi::graphics::TextureDesc desc;
-    desc.type = wi::graphics::TextureDesc::Type::TEXTURE_2D;
-    desc.width = width;
-    desc.height = height;
-    desc.format = wi::graphics::Format::R8_UNORM;
-    desc.bind_flags = wi::graphics::BindFlag::SHADER_RESOURCE;
-    desc.layout = wi::graphics::ResourceState::SHADER_RESOURCE;
-    const bool created = wi::graphics::GetDevice()->CreateTexture(&desc, nullptr, &local_shadow_snapshot);
-    if (created)
-        wi::graphics::GetDevice()->SetName(&local_shadow_snapshot, "newpipeline.client.local_shadow_snapshot");
-    return created;
 }
 
 void NewPipelineClientRenderPath::RenderAO(wi::graphics::CommandList cmd) const
@@ -245,50 +218,10 @@ void NewPipelineClientRenderPath::RenderAO(wi::graphics::CommandList cmd) const
         wi::renderer::CopyTexture2D(local_ao_snapshot, rtAO, cmd);
 }
 
-void NewPipelineClientRenderPath::RenderPostprocessChain(wi::graphics::CommandList cmd) const
-{
-    wi::RenderPath3D::RenderPostprocessChain(cmd);
-    if (!hardware_raytracing || !rtShadow.IsValid())
-    {
-        local_shadow_snapshot_valid = false;
-        return;
-    }
-    if (!EnsureLocalShadowSnapshot(rtShadow.GetDesc().width, rtShadow.GetDesc().height))
-    {
-        local_shadow_snapshot_valid = false;
-        return;
-    }
-    local_shadow_index = GetNewPipelineSunShadowIndex(local_scene);
-    if (local_shadow_index >= rtShadow.GetDesc().array_size)
-    {
-        local_shadow_snapshot_valid = false;
-        return;
-    }
-
-    wi::graphics::GraphicsDevice* device = wi::graphics::GetDevice();
-    const wi::graphics::GPUBarrier before[] = {
-        wi::graphics::GPUBarrier::Image(
-            &rtShadow, rtShadow.GetDesc().layout, wi::graphics::ResourceState::COPY_SRC, -1,
-            static_cast<int>(local_shadow_index)),
-        wi::graphics::GPUBarrier::Image(
-            &local_shadow_snapshot, local_shadow_snapshot.GetDesc().layout, wi::graphics::ResourceState::COPY_DST),
-    };
-    device->Barrier(before, static_cast<uint32_t>(std::size(before)), cmd);
-    device->CopyTexture(&local_shadow_snapshot, 0, 0, 0, 0, 0, &rtShadow, 0, local_shadow_index, cmd);
-    local_shadow_snapshot_valid = true;
-    const wi::graphics::GPUBarrier after[] = {
-        wi::graphics::GPUBarrier::Image(
-            &rtShadow, wi::graphics::ResourceState::COPY_SRC, rtShadow.GetDesc().layout, -1,
-            static_cast<int>(local_shadow_index)),
-        wi::graphics::GPUBarrier::Image(
-            &local_shadow_snapshot, wi::graphics::ResourceState::COPY_DST, local_shadow_snapshot.GetDesc().layout),
-    };
-    device->Barrier(after, static_cast<uint32_t>(std::size(after)), cmd);
-}
-
 void NewPipelineClientRenderPath::Update(float dt)
 {
     InitializeSceneIfNeeded();
+    UpdateLightmapBake();
     UpdateLocalCamera(dt);
     MaintainWebRTC(dt);
     PublishControlPacket(dt);
@@ -365,17 +298,21 @@ void NewPipelineClientRenderPath::InitializeSceneIfNeeded()
     if (!result.diagnostic.empty())
         wi::backlog::post("Client scene diagnostic: " + result.diagnostic);
 
-    scene_initialized = true;
-    local_ddgi_reset_reference_sun = sun_state;
-    ResetLocalDDGI(DDGIResetReason::InitialScene);
-    ApplyEnvironmentProbeSettings(false);
-}
+    scene_asset_path = result.loaded_asset_path;
+    scene_source_root_entity = result.loaded_root_entity;
+    if (!scene_asset_path.empty())
+    {
+        const ClientLightmapPackageResult package_result = client_lightmap_package.Load(scene_asset_path, local_scene);
+        wi::backlog::post(package_result.diagnostic);
+    }
+    else
+    {
+        ClientLightmapPackage::ClearSceneLightmaps(local_scene);
+        wi::backlog::post("Client Lightmap package unavailable: procedural scene has no persistent source asset");
+    }
 
-void NewPipelineClientRenderPath::ResetLocalDDGI(DDGIResetReason reason)
-{
-    local_scene.ddgi.frame_index = std::numeric_limits<uint32_t>::max();
-    local_ddgi_reset_reason = reason;
-    wi::backlog::post(std::string{"Client local DDGI reset: "} + ToString(reason));
+    scene_initialized = true;
+    ApplyEnvironmentProbeSettings(false);
 }
 
 void NewPipelineClientRenderPath::ApplyRenderSettings(bool log_changes)
@@ -386,24 +323,20 @@ void NewPipelineClientRenderPath::ApplyRenderSettings(bool log_changes)
     {
         ApplyEnvironmentProbeSettings(log_changes);
         ApplyBakedLightmapSettings(render_settings.baked_lightmaps_enabled, log_changes, true);
-        ApplyLightmapBakeRequest(render_settings.lightmap_bake_requested, log_changes, true);
     }
 }
 
-void NewPipelineClientRenderPath::ConfigureComparableLocalBuffers()
+void NewPipelineClientRenderPath::ConfigureLowEndLocalRendering()
 {
-    hardware_raytracing = wi::graphics::GetDevice()->CheckCapability(
-        wi::graphics::GraphicsDeviceCapability::RAYTRACING);
-    wi::renderer::SetDDGIEnabled(true);
-    wi::renderer::SetDDGIRayCount(256);
-    wi::renderer::SetDDGIBlendSpeed(0.1f);
+    wi::renderer::SetDDGIEnabled(false);
+    wi::renderer::SetDDGIRayCount(0);
     wi::renderer::SetDDGIDebugEnabled(false);
-    setRaytracedReflectionsQuality(wi::renderer::PostProcessQuality::High);
-    setRTAOFullResolution(true);
-    setRTShadowFullResolution(true);
-    setRaytracedReflectionsEnabled(hardware_raytracing);
+    setRaytracedDiffuseEnabled(false);
+    setSSGIEnabled(false);
+    setRaytracedReflectionsEnabled(false);
     setSSREnabled(false);
-    wi::backlog::post("Client local preview algorithms: " + GetEffectiveAlgorithmSummary());
+    setReflectionsEnabled(false);
+    wi::backlog::post("Client local rendering profile: " + GetEffectiveAlgorithmSummary());
 }
 
 void NewPipelineClientRenderPath::ApplyShadowSettings(bool log_changes)
@@ -412,12 +345,11 @@ void NewPipelineClientRenderPath::ApplyShadowSettings(bool log_changes)
     wi::renderer::SetShadowsEnabled(render_settings.shadow_maps_enabled);
     wi::renderer::SetShadowProps2D(render_settings.shadow_maps_enabled ? kMobileShadow2DResolution : 0);
     wi::renderer::SetShadowPropsCube(render_settings.shadow_maps_enabled ? kMobileShadowCubeResolution : 0);
-    wi::renderer::SetRaytracedShadowsEnabled(render_settings.shadow_maps_enabled && hardware_raytracing);
+    wi::renderer::SetRaytracedShadowsEnabled(false);
     wi::renderer::SetScreenSpaceShadowsEnabled(false);
     if (log_changes)
     {
-        wi::backlog::post(std::string{"Client local shadows ("} +
-            (hardware_raytracing ? "RT Shadow full-res" : "RT Shadow unavailable") + "): " +
+        wi::backlog::post(std::string{"Client local shadows (raster Shadow Map 2D 1024 / Cube 512): "} +
             EnabledString(render_settings.shadow_maps_enabled));
     }
 }
@@ -426,13 +358,10 @@ void NewPipelineClientRenderPath::ApplySSAOSettings(bool log_changes)
 {
     setAORange(1.0f);
     setAOPower(1.0f);
-    setAO(render_settings.ssao_enabled
-        ? (hardware_raytracing ? wi::RenderPath3D::AO_RTAO : wi::RenderPath3D::AO_DISABLED)
-        : wi::RenderPath3D::AO_DISABLED);
+    setAO(render_settings.ssao_enabled ? wi::RenderPath3D::AO_SSAO : wi::RenderPath3D::AO_DISABLED);
     if (log_changes)
     {
-        wi::backlog::post(std::string{"Client local AO ("} +
-            (hardware_raytracing ? "RTAO full-res" : "RTAO unavailable") + "): " + EnabledString(render_settings.ssao_enabled));
+        wi::backlog::post(std::string{"Client local AO (SSAO): "} + EnabledString(render_settings.ssao_enabled));
     }
 }
 
@@ -445,7 +374,10 @@ void NewPipelineClientRenderPath::ApplyEnvironmentProbeSettings(bool log_changes
     {
         const wi::ecs::Entity existing = local_scene.Entity_FindByName(kClientEnvironmentProbeName);
         if (existing != wi::ecs::INVALID_ENTITY && local_scene.probes.Contains(existing))
+        {
             environment_probe_entity = existing;
+            environment_probe_created_by_client = false;
+        }
     }
 
     if (!render_settings.environment_probe_enabled)
@@ -454,6 +386,7 @@ void NewPipelineClientRenderPath::ApplyEnvironmentProbeSettings(bool log_changes
         {
             local_scene.Entity_Remove(environment_probe_entity);
             environment_probe_entity = wi::ecs::INVALID_ENTITY;
+            environment_probe_created_by_client = false;
         }
         if (log_changes)
         {
@@ -465,6 +398,7 @@ void NewPipelineClientRenderPath::ApplyEnvironmentProbeSettings(bool log_changes
     if (environment_probe_entity == wi::ecs::INVALID_ENTITY)
     {
         environment_probe_entity = local_scene.Entity_CreateEnvironmentProbe(kClientEnvironmentProbeName, XMFLOAT3(0.0f, 3.0f, 0.0f));
+        environment_probe_created_by_client = true;
     }
 
     if (wi::scene::EnvironmentProbeComponent* probe = local_scene.probes.GetComponent(environment_probe_entity))
@@ -509,102 +443,19 @@ void NewPipelineClientRenderPath::ApplyBakedLightmapSettings(bool previous_enabl
     }
 }
 
-void NewPipelineClientRenderPath::ApplyLightmapBakeRequest(bool previous_requested, bool log_changes, bool force_log)
-{
-    if (!scene_initialized)
-        return;
-
-    const bool changed = previous_requested != render_settings.lightmap_bake_requested;
-    if (!changed && !force_log)
-        return;
-
-    uint32_t requested = 0;
-    uint32_t skipped = 0;
-    uint32_t saved = 0;
-    uint32_t skipped_logged = 0;
-
-    if (render_settings.lightmap_bake_requested && !render_settings.baked_lightmaps_enabled)
-    {
-        wi::backlog::post("Client lightmap bake ignored: baked lightmaps are disabled.");
-        render_settings.lightmap_bake_requested = false;
-        return;
-    }
-
-    for (size_t i = 0; i < local_scene.objects.GetCount(); ++i)
-    {
-        wi::scene::ObjectComponent& object = local_scene.objects[i];
-        if (render_settings.lightmap_bake_requested)
-        {
-            if (!ObjectSupportsLightmapBake(object))
-            {
-                ++skipped;
-                if (log_changes && skipped_logged < 8)
-                {
-                    const wi::ecs::Entity entity = local_scene.objects.GetEntity(i);
-                    const wi::scene::NameComponent* name = local_scene.names.GetComponent(entity);
-                    wi::backlog::post("Client lightmap bake skipped: " +
-                        (name != nullptr && !name->name.empty() ? name->name : std::to_string(entity)) +
-                        " has no usable lightmap atlas.");
-                    ++skipped_logged;
-                }
-                continue;
-            }
-            if (object.lightmapWidth == 0 || object.lightmapHeight == 0)
-            {
-                object.lightmapWidth = kMobileLightmapResolution;
-                object.lightmapHeight = kMobileLightmapResolution;
-            }
-            object.SetLightmapRenderRequest(true);
-            ++requested;
-        }
-        else if (object.IsLightmapRenderRequested())
-        {
-            object.SetLightmapRenderRequest(false);
-            if (object.lightmap.IsValid())
-            {
-                object.SaveLightmap();
-                ++saved;
-            }
-        }
-    }
-
-    if (render_settings.lightmap_bake_requested && requested > 0)
-    {
-        local_scene.SetAccelerationStructureUpdateRequested(true);
-    }
-
-    if (log_changes)
-    {
-        if (render_settings.lightmap_bake_requested)
-        {
-            wi::backlog::post("Client lightmap bake: enabled requested=" + std::to_string(requested) +
-                " skipped=" + std::to_string(skipped));
-        }
-        else
-        {
-            wi::backlog::post("Client lightmap bake: disabled saved=" + std::to_string(saved));
-        }
-    }
-}
-
 void NewPipelineClientRenderPath::DisableBakedLightmaps()
 {
     saved_lightmaps.clear();
     for (size_t i = 0; i < local_scene.objects.GetCount(); ++i)
     {
         wi::scene::ObjectComponent& object = local_scene.objects[i];
-        if (object.lightmapTextureData.empty() && object.lightmap.IsValid())
-        {
-            wi::helper::saveTextureToMemory(object.lightmap, object.lightmapTextureData);
-        }
-
-        if (!object.lightmapTextureData.empty() || object.lightmap.IsValid())
+        if (object.lightmap.IsValid())
         {
             SavedLightmap saved;
             saved.entity = local_scene.objects.GetEntity(i);
             saved.width = object.lightmapWidth;
             saved.height = object.lightmapHeight;
-            saved.texture_data = object.lightmapTextureData;
+            saved.texture = object.lightmap;
             saved_lightmaps.push_back(std::move(saved));
         }
 
@@ -625,8 +476,8 @@ void NewPipelineClientRenderPath::RestoreBakedLightmaps()
 
         object->lightmapWidth = saved.width;
         object->lightmapHeight = saved.height;
-        object->lightmapTextureData = saved.texture_data;
-        object->lightmap = {};
+        object->lightmapTextureData.clear();
+        object->lightmap = saved.texture;
         object->lightmap_render = {};
     }
     saved_lightmaps.clear();
@@ -634,11 +485,449 @@ void NewPipelineClientRenderPath::RestoreBakedLightmaps()
 
 bool NewPipelineClientRenderPath::ObjectSupportsLightmapBake(const wi::scene::ObjectComponent& object) const
 {
-    if (!object.IsRenderable() || object.meshID == wi::ecs::INVALID_ENTITY)
+    if (!object.IsRenderable() || object.IsDynamic() || object.meshID == wi::ecs::INVALID_ENTITY ||
+        (object.GetFilterMask() & wi::enums::FILTER_TRANSPARENT) != 0)
         return false;
 
     const wi::scene::MeshComponent* mesh = local_scene.meshes.GetComponent(object.meshID);
-    return mesh != nullptr && mesh->IsRenderable() && !mesh->vertex_atlas.empty();
+    if (mesh == nullptr || !mesh->IsRenderable() || mesh->IsDynamic() || mesh->IsSkinned())
+        return false;
+    for (const wi::scene::MeshComponent::MeshSubset& subset : mesh->subsets)
+    {
+        const wi::scene::MaterialComponent* material = local_scene.materials.GetComponent(subset.materialID);
+        if (material != nullptr && (material->GetFilterMask() & wi::enums::FILTER_TRANSPARENT) != 0)
+            return false;
+    }
+    return true;
+}
+
+void NewPipelineClientRenderPath::RequestLightmapBake()
+{
+    if (IsLightmapBakeActive())
+    {
+        wi::backlog::post("Client lightmap bake request ignored: a bake is already active");
+        return;
+    }
+    if (!scene_initialized || scene_asset_path.empty())
+    {
+        render_settings.lightmap_bake_requested = false;
+        lightmap_bake_state = LightmapBakeState::Failed;
+        lightmap_bake_status = "Lightmap: unavailable (no persistent .wiscene)";
+        wi::backlog::post(lightmap_bake_status);
+        return;
+    }
+    render_settings.baked_lightmaps_enabled = true;
+    render_settings.lightmap_bake_requested = true;
+    previous_raytrace_bounce_count = wi::renderer::GetRaytraceBounceCount();
+    lightmap_cancel_requested = false;
+    lightmap_bake_state = LightmapBakeState::Preparing;
+    lightmap_bake_status = "Lightmap: preparing atlas and scene metadata";
+    wi::backlog::post("Client lightmap bake requested: " + scene_asset_path);
+}
+
+void NewPipelineClientRenderPath::CancelLightmapBake()
+{
+    render_settings.lightmap_bake_requested = false;
+    if (IsLightmapBakeActive())
+    {
+        lightmap_cancel_requested = true;
+        lightmap_bake_status = "Lightmap: cancelling";
+    }
+}
+
+bool NewPipelineClientRenderPath::IsLightmapBakeActive() const
+{
+    return lightmap_bake_state == LightmapBakeState::Preparing ||
+        lightmap_bake_state == LightmapBakeState::Baking ||
+        lightmap_bake_state == LightmapBakeState::Saving;
+}
+
+std::string NewPipelineClientRenderPath::GetLightmapBakeStatus() const
+{
+    return lightmap_bake_status;
+}
+
+bool NewPipelineClientRenderPath::SavePreparedScene(const std::string& path, std::string& error)
+{
+    for (size_t i = 0; i < local_scene.objects.GetCount(); ++i)
+    {
+        wi::scene::ObjectComponent& object = local_scene.objects[i];
+        object.SetLightmapRenderRequest(false);
+        object.lightmap_render = {};
+        object.lightmapTextureData.clear();
+    }
+
+    // LoadModel(attached=true) creates an identity grouping root that is not
+    // part of the source asset. Remove it before persisting, otherwise every
+    // bake/load/save cycle would add another hierarchy level.
+    if (scene_source_root_entity != wi::ecs::INVALID_ENTITY &&
+        local_scene.transforms.Contains(scene_source_root_entity))
+    {
+        local_scene.Component_DetachChildren(scene_source_root_entity);
+        local_scene.Entity_Remove(scene_source_root_entity);
+        scene_source_root_entity = wi::ecs::INVALID_ENTITY;
+    }
+
+    const bool recreate_client_probe = environment_probe_created_by_client &&
+        environment_probe_entity != wi::ecs::INVALID_ENTITY;
+    if (recreate_client_probe)
+    {
+        local_scene.Entity_Remove(environment_probe_entity);
+        environment_probe_entity = wi::ecs::INVALID_ENTITY;
+        environment_probe_created_by_client = false;
+    }
+
+    {
+        wi::Archive archive(path, false);
+        if (!archive.IsOpen())
+        {
+            error = "cannot create prepared scene archive: " + path;
+            if (recreate_client_probe)
+                ApplyEnvironmentProbeSettings(false);
+            return false;
+        }
+        local_scene.Serialize(archive);
+        archive.Close();
+    }
+
+    if (recreate_client_probe)
+        ApplyEnvironmentProbeSettings(false);
+    if (!wi::helper::FileExists(path))
+    {
+        error = "prepared scene archive was not written: " + path;
+        return false;
+    }
+    return true;
+}
+
+bool NewPipelineClientRenderPath::PrepareLightmapBake()
+{
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    if (!fs::is_regular_file(scene_asset_path, ec) || ec)
+    {
+        FailLightmapBake("source scene is missing or unreadable: " + scene_asset_path);
+        return false;
+    }
+
+    lightmap_bake_queue.clear();
+    lightmap_bake_completed.clear();
+    lightmap_bake_dimensions.clear();
+    lightmap_bake_next_index = 0;
+    lightmap_bake_skipped = 0;
+    active_lightmap_bake_entity = wi::ecs::INVALID_ENTITY;
+    prepared_scene_hash = 0;
+
+    std::unordered_map<wi::ecs::Entity, XMUINT2> mesh_dimensions;
+    std::unordered_set<std::string> object_ids;
+    uint32_t skipped_logged = 0;
+    for (size_t i = 0; i < local_scene.objects.GetCount(); ++i)
+    {
+        wi::scene::ObjectComponent& object = local_scene.objects[i];
+        const wi::ecs::Entity entity = local_scene.objects.GetEntity(i);
+        if (!ObjectSupportsLightmapBake(object))
+        {
+            ++lightmap_bake_skipped;
+            continue;
+        }
+
+        wi::scene::MeshComponent* mesh = local_scene.meshes.GetComponent(object.meshID);
+        XMUINT2 dimensions = {kMobileLightmapResolution, kMobileLightmapResolution};
+        const auto known_dimensions = mesh_dimensions.find(object.meshID);
+        if (known_dimensions != mesh_dimensions.end())
+        {
+            dimensions = known_dimensions->second;
+        }
+        else if (mesh != nullptr && mesh->vertex_atlas.empty())
+        {
+            std::string atlas_error;
+            if (!GenerateClientLightmapAtlas(
+                local_scene,
+                object.meshID,
+                lightmap_bake_settings.resolution,
+                dimensions.x,
+                dimensions.y,
+                atlas_error))
+            {
+                ++lightmap_bake_skipped;
+                if (skipped_logged++ < 8)
+                    wi::backlog::post("Client lightmap atlas skipped object " + std::to_string(entity) + ": " + atlas_error);
+                continue;
+            }
+            mesh_dimensions[object.meshID] = dimensions;
+        }
+        else
+        {
+            if (object.lightmapWidth > 0 && object.lightmapHeight > 0)
+                dimensions = {object.lightmapWidth, object.lightmapHeight};
+            mesh_dimensions[object.meshID] = dimensions;
+        }
+
+        std::string id = ClientLightmapPackage::EnsureObjectId(local_scene, entity);
+        if (!object_ids.insert(id).second)
+        {
+            wi::scene::MetadataComponent* metadata = local_scene.metadatas.GetComponent(entity);
+            id += "-" + std::to_string(entity);
+            metadata->string_values.set(ClientLightmapPackage::kObjectIdMetadataKey, id);
+            object_ids.insert(id);
+        }
+
+        object.ClearLightmap();
+        object.lightmapWidth = dimensions.x;
+        object.lightmapHeight = dimensions.y;
+        object.SetLightmapDisableBlockCompression(false);
+        lightmap_bake_dimensions[entity] = dimensions;
+        lightmap_bake_queue.push_back(entity);
+    }
+
+    if (lightmap_bake_queue.empty())
+    {
+        FailLightmapBake("no eligible static opaque objects were found");
+        return false;
+    }
+
+    prepared_scene_temp_path = scene_asset_path + ".clientlightmap.scene.tmp";
+    prepared_package_temp_path = ClientLightmapPackage::PackagePathForScene(scene_asset_path) + ".tmp";
+    CleanupLightmapBakeTemps();
+    std::string save_error;
+    if (!SavePreparedScene(prepared_scene_temp_path, save_error))
+    {
+        FailLightmapBake(save_error);
+        return false;
+    }
+    prepared_scene_hash = ClientLightmapPackage::HashFile(prepared_scene_temp_path);
+    if (prepared_scene_hash == 0)
+    {
+        FailLightmapBake("failed to hash prepared scene");
+        return false;
+    }
+
+    previous_raytrace_bounce_count = wi::renderer::GetRaytraceBounceCount();
+    wi::renderer::SetRaytraceBounceCount(lightmap_bake_settings.bounce_count);
+    local_scene.SetAccelerationStructureUpdateRequested(true);
+    lightmap_bake_state = LightmapBakeState::Baking;
+    wi::backlog::post("Client lightmap bake prepared: objects=" + std::to_string(lightmap_bake_queue.size()) +
+        " skipped=" + std::to_string(lightmap_bake_skipped) +
+        " samples=" + std::to_string(lightmap_bake_settings.sample_count) +
+        " bounces=" + std::to_string(lightmap_bake_settings.bounce_count));
+    return StartNextLightmapBake();
+}
+
+bool NewPipelineClientRenderPath::StartNextLightmapBake()
+{
+    while (lightmap_bake_next_index < lightmap_bake_queue.size())
+    {
+        const wi::ecs::Entity entity = lightmap_bake_queue[lightmap_bake_next_index++];
+        wi::scene::ObjectComponent* object = local_scene.objects.GetComponent(entity);
+        const auto dimensions = lightmap_bake_dimensions.find(entity);
+        if (object == nullptr || dimensions == lightmap_bake_dimensions.end())
+            continue;
+
+        object->ClearLightmap();
+        object->lightmapWidth = dimensions->second.x;
+        object->lightmapHeight = dimensions->second.y;
+        object->SetLightmapDisableBlockCompression(false);
+        object->SetLightmapRenderRequest(true);
+        active_lightmap_bake_entity = entity;
+
+        const wi::scene::NameComponent* name = local_scene.names.GetComponent(entity);
+        const std::string object_name = name != nullptr && !name->name.empty() ? name->name : std::to_string(entity);
+        lightmap_bake_status = "Lightmap: " + std::to_string(lightmap_bake_completed.size()) + "/" +
+            std::to_string(lightmap_bake_queue.size()) + " baking " + object_name + " (0/" +
+            std::to_string(lightmap_bake_settings.sample_count) + ")";
+        return true;
+    }
+
+    FinishLightmapBake();
+    return lightmap_bake_state == LightmapBakeState::Completed;
+}
+
+void NewPipelineClientRenderPath::UpdateLightmapBake()
+{
+    if (!IsLightmapBakeActive())
+        return;
+    if (lightmap_cancel_requested)
+    {
+        if (wi::scene::ObjectComponent* object = local_scene.objects.GetComponent(active_lightmap_bake_entity))
+            object->ClearLightmap();
+        wi::renderer::SetRaytraceBounceCount(previous_raytrace_bounce_count);
+        CleanupLightmapBakeTemps();
+        ReloadSceneAfterLightmapBakeAbort();
+        active_lightmap_bake_entity = wi::ecs::INVALID_ENTITY;
+        lightmap_bake_state = LightmapBakeState::Cancelled;
+        lightmap_bake_status = "Lightmap: cancelled; original scene/package preserved";
+        lightmap_cancel_requested = false;
+        wi::backlog::post(lightmap_bake_status);
+        return;
+    }
+    if (lightmap_bake_state == LightmapBakeState::Preparing)
+    {
+        PrepareLightmapBake();
+        return;
+    }
+    if (lightmap_bake_state != LightmapBakeState::Baking)
+        return;
+
+    wi::scene::ObjectComponent* object = local_scene.objects.GetComponent(active_lightmap_bake_entity);
+    if (object == nullptr)
+    {
+        FailLightmapBake("active lightmap object disappeared");
+        return;
+    }
+    const uint32_t samples = object->lightmapIterationCount;
+    const wi::scene::NameComponent* name = local_scene.names.GetComponent(active_lightmap_bake_entity);
+    const std::string object_name = name != nullptr && !name->name.empty() ? name->name : std::to_string(active_lightmap_bake_entity);
+    lightmap_bake_status = "Lightmap: " + std::to_string(lightmap_bake_completed.size()) + "/" +
+        std::to_string(lightmap_bake_queue.size()) + " baking " + object_name + " (" +
+        std::to_string(std::min(samples, lightmap_bake_settings.sample_count)) + "/" +
+        std::to_string(lightmap_bake_settings.sample_count) + ")";
+    if (samples < lightmap_bake_settings.sample_count)
+        return;
+
+    object->SetLightmapRenderRequest(false);
+    object->SaveLightmap();
+    if (!object->lightmap.IsValid() || object->lightmapTextureData.empty() ||
+        object->lightmap.GetDesc().format != wi::graphics::Format::BC6H_UF16)
+    {
+        FailLightmapBake("BC6H compression failed for object " + object_name);
+        return;
+    }
+    lightmap_bake_completed.push_back(active_lightmap_bake_entity);
+    active_lightmap_bake_entity = wi::ecs::INVALID_ENTITY;
+    StartNextLightmapBake();
+}
+
+bool NewPipelineClientRenderPath::CommitLightmapBakeFiles(std::string& error)
+{
+    namespace fs = std::filesystem;
+    const fs::path scene_final(scene_asset_path);
+    const fs::path package_final(ClientLightmapPackage::PackagePathForScene(scene_asset_path));
+    const fs::path scene_temp(prepared_scene_temp_path);
+    const fs::path package_temp(prepared_package_temp_path);
+    const fs::path scene_backup(scene_asset_path + ".clientlightmap.backup");
+    const fs::path package_backup(package_final.string() + ".backup");
+    std::error_code ec;
+
+    fs::remove(scene_backup, ec);
+    ec.clear();
+    fs::remove(package_backup, ec);
+    ec.clear();
+    fs::rename(scene_final, scene_backup, ec);
+    if (ec)
+    {
+        error = "failed to back up source scene: " + ec.message();
+        return false;
+    }
+    const bool had_package = fs::exists(package_final, ec) && !ec;
+    ec.clear();
+    if (had_package)
+    {
+        fs::rename(package_final, package_backup, ec);
+        if (ec)
+        {
+            fs::rename(scene_backup, scene_final, ec);
+            error = "failed to back up previous lightmap package";
+            return false;
+        }
+    }
+
+    fs::rename(scene_temp, scene_final, ec);
+    if (!ec)
+        fs::rename(package_temp, package_final, ec);
+    if (ec)
+    {
+        std::error_code rollback_ec;
+        fs::remove(scene_final, rollback_ec);
+        fs::remove(package_final, rollback_ec);
+        fs::rename(scene_backup, scene_final, rollback_ec);
+        if (had_package)
+            fs::rename(package_backup, package_final, rollback_ec);
+        error = "failed to commit prepared scene/lightmap package: " + ec.message();
+        return false;
+    }
+
+    fs::remove(scene_backup, ec);
+    ec.clear();
+    if (had_package)
+        fs::remove(package_backup, ec);
+    return true;
+}
+
+void NewPipelineClientRenderPath::FinishLightmapBake()
+{
+    lightmap_bake_state = LightmapBakeState::Saving;
+    lightmap_bake_status = "Lightmap: saving external package";
+    std::string error;
+    if (!client_lightmap_package.Save(
+        prepared_package_temp_path,
+        prepared_scene_hash,
+        local_scene,
+        lightmap_bake_completed,
+        lightmap_bake_settings,
+        error))
+    {
+        FailLightmapBake(error);
+        return;
+    }
+    if (!CommitLightmapBakeFiles(error))
+    {
+        FailLightmapBake(error);
+        return;
+    }
+
+    for (wi::ecs::Entity entity : lightmap_bake_completed)
+    {
+        if (wi::scene::ObjectComponent* object = local_scene.objects.GetComponent(entity))
+            object->lightmapTextureData.clear();
+    }
+    wi::renderer::SetRaytraceBounceCount(previous_raytrace_bounce_count);
+    render_settings.lightmap_bake_requested = false;
+    lightmap_bake_state = LightmapBakeState::Completed;
+    lightmap_bake_status = "Lightmap: complete " + std::to_string(lightmap_bake_completed.size()) +
+        " objects -> " + ClientLightmapPackage::PackagePathForScene(scene_asset_path);
+    prepared_scene_temp_path.clear();
+    prepared_package_temp_path.clear();
+    wi::backlog::post(lightmap_bake_status);
+}
+
+void NewPipelineClientRenderPath::FailLightmapBake(const std::string& reason)
+{
+    if (wi::scene::ObjectComponent* object = local_scene.objects.GetComponent(active_lightmap_bake_entity))
+        object->SetLightmapRenderRequest(false);
+    wi::renderer::SetRaytraceBounceCount(previous_raytrace_bounce_count);
+    CleanupLightmapBakeTemps();
+    ReloadSceneAfterLightmapBakeAbort();
+    render_settings.lightmap_bake_requested = false;
+    active_lightmap_bake_entity = wi::ecs::INVALID_ENTITY;
+    lightmap_bake_state = LightmapBakeState::Failed;
+    lightmap_bake_status = "Lightmap: failed - " + reason;
+    wi::backlog::post(lightmap_bake_status);
+}
+
+void NewPipelineClientRenderPath::CleanupLightmapBakeTemps()
+{
+    std::error_code ec;
+    if (!prepared_scene_temp_path.empty())
+        std::filesystem::remove(prepared_scene_temp_path, ec);
+    ec.clear();
+    if (!prepared_package_temp_path.empty())
+        std::filesystem::remove(prepared_package_temp_path, ec);
+}
+
+void NewPipelineClientRenderPath::ReloadSceneAfterLightmapBakeAbort()
+{
+    if (scene_asset_path.empty())
+        return;
+    environment_probe_entity = wi::ecs::INVALID_ENTITY;
+    environment_probe_created_by_client = false;
+    const SceneInitializationResult result = InitializeDefaultScene(local_scene);
+    if (!result.loaded_asset_path.empty())
+        scene_asset_path = result.loaded_asset_path;
+    scene_source_root_entity = result.loaded_root_entity;
+    ApplySunStateToScene(local_scene, sun_state);
+    const ClientLightmapPackageResult package_result = client_lightmap_package.Load(scene_asset_path, local_scene);
+    wi::backlog::post(package_result.diagnostic);
+    ApplyEnvironmentProbeSettings(false);
 }
 
 void NewPipelineClientRenderPath::UpdateLocalCamera(float dt)
@@ -1076,13 +1365,13 @@ const wi::graphics::Texture* NewPipelineClientRenderPath::GetDebugPreviewTexture
     case DebugPreviewMode::GBufferRoughness:
         return visibilityResources.texture_normal_roughness.IsValid() ? &visibilityResources.texture_normal_roughness : nullptr;
     case DebugPreviewMode::LocalIndirectDiffuse:
-        return GetDDGIRemoteIndirectDiffuseFormal().IsValid() ? &GetDDGIRemoteIndirectDiffuseFormal() : nullptr;
+        return local_lightmap_irradiance.IsValid() ? &local_lightmap_irradiance : nullptr;
     case DebugPreviewMode::LocalAO:
         return local_ao_snapshot.IsValid() ? &local_ao_snapshot : nullptr;
     case DebugPreviewMode::LocalSpecularIndirect:
-        return rtSSR.IsValid() ? &rtSSR : nullptr;
+        return nullptr; // Static environment probes are part of Final.
     case DebugPreviewMode::LocalShadowVisibility:
-        return local_shadow_snapshot_valid && local_shadow_snapshot.IsValid() ? &local_shadow_snapshot : nullptr;
+        return nullptr; // Raster shadows live in the light shadow-map atlas.
     case DebugPreviewMode::RemoteIndirectDiffuse:
         return remote_consume.accepted_valid && (accepted_remote_buffer_mask & RemoteBufferKindMask(RemoteBufferSemantic::RemoteIndirectDiffuse)) && accepted_remote_textures[0].IsValid() ? &accepted_remote_textures[0] : nullptr;
     case DebugPreviewMode::RemoteAO:
@@ -1105,15 +1394,6 @@ void NewPipelineClientRenderPath::Compose(wi::graphics::CommandList cmd) const
         wi::RenderPath3D::Compose(cmd);
         return;
     }
-    if (debug_preview_mode == DebugPreviewMode::LocalIndirectDiffuse)
-    {
-        if (GetDDGIRemoteIndirectDiffuseFormal().IsValid())
-            wi::RenderPath3D::Compose(cmd);
-        else
-            DrawUnavailablePreview(cmd);
-        return;
-    }
-
     if (debug_preview_mode == DebugPreviewMode::RemoteOverview)
     {
         if (remote_consume.accepted_valid && accepted_remote_buffer_mask != 0)

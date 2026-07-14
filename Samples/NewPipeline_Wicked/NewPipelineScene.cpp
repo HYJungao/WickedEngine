@@ -69,7 +69,7 @@ bool TryLoadPrimaryScene(
         }
 
         wi::scene::Scene loaded_scene;
-        wi::scene::LoadModel(loaded_scene, path, XMMatrixIdentity(), true);
+        const wi::ecs::Entity loaded_root = wi::scene::LoadModel(loaded_scene, path, XMMatrixIdentity(), true);
         const uint32_t object_count = static_cast<uint32_t>(loaded_scene.objects.GetCount());
         const uint32_t mesh_count = static_cast<uint32_t>(loaded_scene.meshes.GetCount());
         const uint32_t material_count = static_cast<uint32_t>(loaded_scene.materials.GetCount());
@@ -77,6 +77,7 @@ bool TryLoadPrimaryScene(
         if (object_count > 0 && mesh_count > 0)
         {
             result.loaded_asset_path = path;
+            result.loaded_root_entity = loaded_root;
             result.object_count = object_count;
             result.mesh_count = mesh_count;
             result.material_count = material_count;

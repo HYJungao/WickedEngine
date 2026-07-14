@@ -34,7 +34,9 @@ private:
     wi::gui::CheckBox            ssao_checkbox;
     wi::gui::CheckBox            environment_probe_checkbox;
     wi::gui::CheckBox            baked_lightmaps_checkbox;
-    wi::gui::CheckBox            bake_lightmaps_checkbox;
+    wi::gui::Button              generate_lightmaps_button;
+    wi::gui::Button              cancel_lightmaps_button;
+    wi::gui::Label               lightmap_progress_label;
     bool                         configured = false;
     bool                         debug_ui_created = false;
 };

@@ -13,7 +13,7 @@ void NewPipelineClientApp::CreateDebugUI()
         "NewPipeline Debug",
         wi::gui::Window::WindowControls::MOVE | wi::gui::Window::WindowControls::COLLAPSE);
     debug_window.SetPos(XMFLOAT2(20.0f, 80.0f));
-    debug_window.SetSize(XMFLOAT2(340.0f, 410.0f));
+    debug_window.SetSize(XMFLOAT2(340.0f, 455.0f));
 
     sun_enabled_checkbox.Create("Sun Enabled: ");
     sun_enabled_checkbox.SetPos(XMFLOAT2(150.0f, 8.0f));
@@ -54,10 +54,10 @@ void NewPipelineClientApp::CreateDebugUI()
     preview_buffer_combo.AddItem("Normal/Roughness", static_cast<uint64_t>(DebugPreviewMode::GBufferNormalRoughness));
     preview_buffer_combo.AddItem("Normal XY", static_cast<uint64_t>(DebugPreviewMode::GBufferNormalXY));
     preview_buffer_combo.AddItem("Roughness", static_cast<uint64_t>(DebugPreviewMode::GBufferRoughness));
-    preview_buffer_combo.AddItem("Local Indirect Diffuse", static_cast<uint64_t>(DebugPreviewMode::LocalIndirectDiffuse));
+    preview_buffer_combo.AddItem("Local Lightmap Irradiance", static_cast<uint64_t>(DebugPreviewMode::LocalIndirectDiffuse));
     preview_buffer_combo.AddItem("Local AO", static_cast<uint64_t>(DebugPreviewMode::LocalAO));
-    preview_buffer_combo.AddItem("Local Specular Indirect", static_cast<uint64_t>(DebugPreviewMode::LocalSpecularIndirect));
-    preview_buffer_combo.AddItem("Local Shadow Visibility", static_cast<uint64_t>(DebugPreviewMode::LocalShadowVisibility));
+    preview_buffer_combo.AddItem("Local Static Probe (Final only)", static_cast<uint64_t>(DebugPreviewMode::LocalSpecularIndirect));
+    preview_buffer_combo.AddItem("Local Shadow Map (atlas only)", static_cast<uint64_t>(DebugPreviewMode::LocalShadowVisibility));
     preview_buffer_combo.AddItem("Remote Indirect Diffuse", static_cast<uint64_t>(DebugPreviewMode::RemoteIndirectDiffuse));
     preview_buffer_combo.AddItem("Remote AO", static_cast<uint64_t>(DebugPreviewMode::RemoteAO));
     preview_buffer_combo.AddItem("Remote Specular Indirect", static_cast<uint64_t>(DebugPreviewMode::RemoteSpecularIndirect));
@@ -118,25 +118,38 @@ void NewPipelineClientApp::CreateDebugUI()
         NewPipelineClientRenderSettings settings = render_path.GetRenderSettings();
         settings.baked_lightmaps_enabled = args.bValue;
         if (!settings.baked_lightmaps_enabled)
+        {
             settings.lightmap_bake_requested = false;
+            render_path.CancelLightmapBake();
+        }
         render_path.SetRenderSettings(settings);
-        bake_lightmaps_checkbox.SetCheck(settings.lightmap_bake_requested);
     });
     debug_window.AddWidget(&baked_lightmaps_checkbox);
 
-    bake_lightmaps_checkbox.Create("Bake Lightmaps: ");
-    bake_lightmaps_checkbox.SetPos(XMFLOAT2(150.0f, 317.0f));
-    bake_lightmaps_checkbox.SetSize(XMFLOAT2(18.0f, 18.0f));
-    bake_lightmaps_checkbox.SetCheck(initial_render_settings.lightmap_bake_requested);
-    bake_lightmaps_checkbox.OnClick([this](const wi::gui::EventArgs& args) {
-        NewPipelineClientRenderSettings settings = render_path.GetRenderSettings();
-        settings.lightmap_bake_requested = args.bValue;
-        if (settings.lightmap_bake_requested)
-            settings.baked_lightmaps_enabled = true;
-        render_path.SetRenderSettings(settings);
-        baked_lightmaps_checkbox.SetCheck(settings.baked_lightmaps_enabled);
+    generate_lightmaps_button.Create("Generate Lightmap");
+    generate_lightmaps_button.SetTooltip("Generate missing atlas UVs, update the single source .wiscene, and bake a sibling .clientlightmap package.");
+    generate_lightmaps_button.SetPos(XMFLOAT2(10.0f, 321.0f));
+    generate_lightmaps_button.SetSize(XMFLOAT2(195.0f, 24.0f));
+    generate_lightmaps_button.OnClick([this](const wi::gui::EventArgs&) {
+        render_path.RequestLightmapBake();
+        baked_lightmaps_checkbox.SetCheck(true);
     });
-    debug_window.AddWidget(&bake_lightmaps_checkbox);
+    debug_window.AddWidget(&generate_lightmaps_button);
+
+    cancel_lightmaps_button.Create("Cancel");
+    cancel_lightmaps_button.SetTooltip("Cancel the current bake without replacing the source scene or previous package.");
+    cancel_lightmaps_button.SetPos(XMFLOAT2(215.0f, 321.0f));
+    cancel_lightmaps_button.SetSize(XMFLOAT2(105.0f, 24.0f));
+    cancel_lightmaps_button.OnClick([this](const wi::gui::EventArgs&) {
+        render_path.CancelLightmapBake();
+    });
+    debug_window.AddWidget(&cancel_lightmaps_button);
+
+    lightmap_progress_label.Create("Lightmap Progress");
+    lightmap_progress_label.SetText(render_path.GetLightmapBakeStatus());
+    lightmap_progress_label.SetPos(XMFLOAT2(10.0f, 352.0f));
+    lightmap_progress_label.SetSize(XMFLOAT2(310.0f, 70.0f));
+    debug_window.AddWidget(&lightmap_progress_label);
 
     render_path.GetGUI().AddWidget(&debug_window);
     debug_ui_created = true;
@@ -180,7 +193,12 @@ void NewPipelineClientApp::Update(float dt)
     // glyphs before the default font style exists and race UpdateAtlas().
     CreateDebugUI();
     if (debug_ui_created)
+    {
         algorithm_label.SetText(render_path.GetDebugStatusSummary());
+        lightmap_progress_label.SetText(render_path.GetLightmapBakeStatus());
+        generate_lightmaps_button.SetEnabled(!render_path.IsLightmapBakeActive());
+        cancel_lightmaps_button.SetEnabled(render_path.IsLightmapBakeActive());
+    }
     render_path.SetInputActive(is_window_active);
     wi::Application::Update(dt);
 }

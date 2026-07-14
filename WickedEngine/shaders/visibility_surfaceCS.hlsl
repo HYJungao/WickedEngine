@@ -14,6 +14,7 @@
 struct VisibilityPushConstants
 {
 	uint global_tile_offset;
+	int lightmap_irradiance_uav;
 };
 PUSHCONSTANT(push, VisibilityPushConstants);
 
@@ -62,6 +63,20 @@ void main(uint Gid : SV_GroupID, uint groupIndex : SV_GroupIndex)
 	if (!surface.load(prim, ray.Origin, ray.Direction, rayDirection_quad_x, rayDirection_quad_y, entity_flat_tile_index))
 	{
 		return;
+	}
+
+	// Surface::load() marks GI as applied only when this primitive has a valid
+	// object lightmap and atlas. Wicked stores the diffuse lightmap term with
+	// the Lambert PI divide included, so multiply by PI for a material-independent
+	// irradiance buffer matching RemoteIndirectDiffuseFormal semantics.
+	[branch]
+	if (push.lightmap_irradiance_uav >= 0)
+	{
+		RWTexture2D<float4> output_lightmap_irradiance =
+			bindless_rwtextures[descriptor_index(push.lightmap_irradiance_uav)];
+		output_lightmap_irradiance[pixel] = surface.IsGIApplied()
+			? float4(surface.gi * PI, 1)
+			: 0;
 	}
 
 	// Write out sampleable attributes for post processing into textures:

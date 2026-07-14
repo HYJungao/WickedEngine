@@ -27,6 +27,8 @@
 		4A000001000000000000001B /* NewPipelineScene.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 4A0000010000000000000111 /* NewPipelineScene.cpp */; };
 		4A0000010000000000000021 /* NewPipelineWebRTCBridge.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 4A0000010000000000000113 /* NewPipelineWebRTCBridge.cpp */; settings = {COMPILER_FLAGS = "-fno-rtti -DNDEBUG -DWEBRTC_POSIX=1 -DWEBRTC_MAC=1 -URTC_DISABLE_CHECK_MSG -Wno-nullability-completeness -Wno-macro-redefined -I\"$(SRCROOT)/WebRTC/7827/libcxx-config\" -I\"$(SRCROOT)/WebRTC/7827/include\" -I\"$(SRCROOT)/WebRTC/7827/include/third_party/libyuv/include\""; }; };
 		4A0000010000000000000022 /* NewPipelineWebRTCBridge.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 4A0000010000000000000113 /* NewPipelineWebRTCBridge.cpp */; settings = {COMPILER_FLAGS = "-fno-rtti -DNDEBUG -DWEBRTC_POSIX=1 -DWEBRTC_MAC=1 -URTC_DISABLE_CHECK_MSG -Wno-nullability-completeness -Wno-macro-redefined -I\"$(SRCROOT)/WebRTC/7827/libcxx-config\" -I\"$(SRCROOT)/WebRTC/7827/include\" -I\"$(SRCROOT)/WebRTC/7827/include/third_party/libyuv/include\""; }; };
+		4A0000010000000000000023 /* NewPipelineClientLightmap.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 4A0000010000000000000115 /* NewPipelineClientLightmap.cpp */; };
+		4A0000010000000000000024 /* xatlas.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 4A0000010000000000000117 /* xatlas.cpp */; };
 		4A0000010000000000000017 /* AppKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 4A0000010000000000000201 /* AppKit.framework */; };
 		4A0000010000000000000018 /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 4A0000010000000000000202 /* Metal.framework */; };
 		4A0000010000000000000019 /* GameController.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 4A0000010000000000000203 /* GameController.framework */; };
@@ -64,6 +66,9 @@
 		4A0000010000000000000112 /* NewPipelineScene.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = NewPipelineScene.h; sourceTree = "<group>"; };
 		4A0000010000000000000113 /* NewPipelineWebRTCBridge.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = NewPipelineWebRTCBridge.cpp; sourceTree = "<group>"; };
 		4A0000010000000000000114 /* NewPipelineWebRTCBridge.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = NewPipelineWebRTCBridge.h; sourceTree = "<group>"; };
+		4A0000010000000000000115 /* NewPipelineClientLightmap.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = NewPipelineClientLightmap.cpp; sourceTree = "<group>"; };
+		4A0000010000000000000116 /* NewPipelineClientLightmap.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = NewPipelineClientLightmap.h; sourceTree = "<group>"; };
+		4A0000010000000000000117 /* xatlas.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = ../../Editor/xatlas.cpp; sourceTree = SOURCE_ROOT; };
 		4A0000010000000000000201 /* AppKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AppKit.framework; path = System/Library/Frameworks/AppKit.framework; sourceTree = SDKROOT; };
 		4A0000010000000000000202 /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
 		4A0000010000000000000203 /* GameController.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = GameController.framework; path = System/Library/Frameworks/GameController.framework; sourceTree = SDKROOT; };
@@ -116,6 +121,9 @@
 				4A0000010000000000000104 /* NewPipelineClientApp.h */,
 				4A0000010000000000000105 /* NewPipelineClientRenderPath.cpp */,
 				4A0000010000000000000106 /* NewPipelineClientRenderPath.h */,
+				4A0000010000000000000115 /* NewPipelineClientLightmap.cpp */,
+				4A0000010000000000000116 /* NewPipelineClientLightmap.h */,
+				4A0000010000000000000117 /* xatlas.cpp */,
 				4A0000010000000000000107 /* NewPipelineServerApp.cpp */,
 				4A0000010000000000000108 /* NewPipelineServerApp.h */,
 				4A000001000000000000010F /* NewPipelineServerRenderPath.cpp */,
@@ -349,6 +357,8 @@
 				4A0000010000000000000001 /* main_macos_client.mm in Sources */,
 				4A0000010000000000000002 /* NewPipelineClientApp.cpp in Sources */,
 				4A0000010000000000000003 /* NewPipelineClientRenderPath.cpp in Sources */,
+				4A0000010000000000000023 /* NewPipelineClientLightmap.cpp in Sources */,
+				4A0000010000000000000024 /* xatlas.cpp in Sources */,
 				4A0000010000000000000004 /* NewPipelineRuntime.cpp in Sources */,
 				4A0000010000000000000005 /* NewPipelineProtocol.cpp in Sources */,
 				4A0000010000000000000006 /* NewPipelineTransport.cpp in Sources */,

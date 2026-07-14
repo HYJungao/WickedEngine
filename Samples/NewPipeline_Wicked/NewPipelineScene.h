@@ -16,6 +16,7 @@ struct SceneInitializationResult
     SceneInitializationKind kind = SceneInitializationKind::Empty;
     bool                    loaded_primary_asset = false;
     std::string             loaded_asset_path;
+    wi::ecs::Entity         loaded_root_entity = wi::ecs::INVALID_ENTITY;
     std::string             diagnostic;
     uint32_t                object_count = 0;
     uint32_t                mesh_count = 0;

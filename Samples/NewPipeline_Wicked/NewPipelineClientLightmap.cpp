@@ -1,0 +1,536 @@
+#include "NewPipelineClientLightmap.h"
+
+#include "wiBacklog.h"
+#include "wiHelper.h"
+#include "wiTextureHelper.h"
+
+#include "../../Editor/xatlas.h"
+
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstring>
+#include <filesystem>
+#include <iomanip>
+#include <limits>
+#include <random>
+#include <sstream>
+#include <type_traits>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+
+namespace wicked_newpipeline
+{
+namespace
+{
+constexpr std::array<uint8_t, 4> kMagic = {'N', 'P', 'L', 'M'};
+constexpr uint32_t kVersion = 1;
+constexpr uint32_t kFormatBC6H = static_cast<uint32_t>(wi::graphics::Format::BC6H_UF16);
+constexpr size_t kHeaderSize = 4 + 4 + 8 + 4 + 4 + 4 + 4;
+
+template<typename T>
+void Append(wi::vector<uint8_t>& bytes, T value)
+{
+    static_assert(std::is_integral_v<T>);
+    using U = std::make_unsigned_t<T>;
+    U bits = static_cast<U>(value);
+    for (size_t i = 0; i < sizeof(T); ++i)
+        bytes.push_back(static_cast<uint8_t>((bits >> (i * 8)) & 0xFFu));
+}
+
+template<typename T>
+bool Read(const wi::vector<uint8_t>& bytes, size_t& cursor, T& value)
+{
+    static_assert(std::is_integral_v<T>);
+    if (cursor > bytes.size() || sizeof(T) > bytes.size() - cursor)
+        return false;
+    using U = std::make_unsigned_t<T>;
+    U bits = 0;
+    for (size_t i = 0; i < sizeof(T); ++i)
+        bits |= static_cast<U>(bytes[cursor++]) << (i * 8);
+    value = static_cast<T>(bits);
+    return true;
+}
+
+uint32_t CRC32(const uint8_t* data, size_t size)
+{
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < size; ++i)
+    {
+        crc ^= data[i];
+        for (uint32_t bit = 0; bit < 8; ++bit)
+            crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
+    }
+    return ~crc;
+}
+
+uint64_t FNV1a64(const uint8_t* data, size_t size)
+{
+    uint64_t hash = 14695981039346656037ull;
+    for (size_t i = 0; i < size; ++i)
+    {
+        hash ^= data[i];
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+std::string MakeObjectId(wi::ecs::Entity entity)
+{
+    const uint64_t now = static_cast<uint64_t>(std::chrono::high_resolution_clock::now().time_since_epoch().count());
+    std::random_device random;
+    std::mt19937_64 generator(now ^ (static_cast<uint64_t>(entity) << 1u) ^ random());
+    std::ostringstream stream;
+    stream << std::hex << std::setfill('0')
+           << std::setw(16) << generator()
+           << std::setw(16) << generator();
+    return stream.str();
+}
+
+size_t ExpectedBC6HSize(uint32_t width, uint32_t height)
+{
+    const uint32_t block = wi::graphics::GetFormatBlockSize(wi::graphics::Format::BC6H_UF16);
+    return static_cast<size_t>(width / block) * static_cast<size_t>(height / block) *
+        wi::graphics::GetFormatStride(wi::graphics::Format::BC6H_UF16);
+}
+
+struct PackageEntry
+{
+    std::string id;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t format = kFormatBC6H;
+    uint64_t offset = 0;
+    uint64_t size = 0;
+    uint32_t crc = 0;
+    const wi::vector<uint8_t>* payload = nullptr;
+};
+} // namespace
+
+std::string ClientLightmapPackage::PackagePathForScene(const std::string& scene_path)
+{
+    std::filesystem::path path(scene_path);
+    path.replace_extension(".clientlightmap");
+    return path.generic_string();
+}
+
+uint64_t ClientLightmapPackage::HashFile(const std::string& path)
+{
+    wi::vector<uint8_t> bytes;
+    if (!wi::helper::FileRead(path, bytes) || bytes.empty())
+        return 0;
+    return FNV1a64(bytes.data(), bytes.size());
+}
+
+std::string ClientLightmapPackage::GetObjectId(const wi::scene::Scene& scene, wi::ecs::Entity entity)
+{
+    const wi::scene::MetadataComponent* metadata = scene.metadatas.GetComponent(entity);
+    return metadata == nullptr ? std::string{} : metadata->string_values.get(kObjectIdMetadataKey);
+}
+
+std::string ClientLightmapPackage::EnsureObjectId(wi::scene::Scene& scene, wi::ecs::Entity entity)
+{
+    wi::scene::MetadataComponent* metadata = scene.metadatas.GetComponent(entity);
+    if (metadata == nullptr)
+        metadata = &scene.metadatas.Create(entity);
+    std::string id = metadata->string_values.get(kObjectIdMetadataKey);
+    if (id.empty())
+    {
+        id = MakeObjectId(entity);
+        metadata->string_values.set(kObjectIdMetadataKey, id);
+    }
+    return id;
+}
+
+void ClientLightmapPackage::ClearSceneLightmaps(wi::scene::Scene& scene, bool preserve_dimensions)
+{
+    for (size_t i = 0; i < scene.objects.GetCount(); ++i)
+    {
+        wi::scene::ObjectComponent& object = scene.objects[i];
+        const uint32_t width = object.lightmapWidth;
+        const uint32_t height = object.lightmapHeight;
+        object.ClearLightmap();
+        if (preserve_dimensions)
+        {
+            object.lightmapWidth = width;
+            object.lightmapHeight = height;
+        }
+    }
+}
+
+ClientLightmapPackageResult ClientLightmapPackage::Load(const std::string& scene_path, wi::scene::Scene& scene)
+{
+    ClientLightmapPackageResult result;
+    ClearSceneLightmaps(scene);
+
+    if (scene_path.empty())
+    {
+        result.diagnostic = "Client Lightmap package unavailable: scene has no source path";
+        return result;
+    }
+
+    const std::string package_path = PackagePathForScene(scene_path);
+    wi::vector<uint8_t> bytes;
+    if (!wi::helper::FileRead(package_path, bytes))
+    {
+        result.diagnostic = "Client Lightmap package missing: " + package_path;
+        return result;
+    }
+    if (bytes.size() < kHeaderSize || !std::equal(kMagic.begin(), kMagic.end(), bytes.begin()))
+    {
+        result.diagnostic = "Client Lightmap package invalid header: " + package_path;
+        return result;
+    }
+
+    size_t cursor = kMagic.size();
+    uint32_t version = 0;
+    uint64_t scene_hash = 0;
+    uint32_t sample_count = 0;
+    uint32_t bounce_count = 0;
+    uint32_t entry_count = 0;
+    uint32_t reserved = 0;
+    if (!Read(bytes, cursor, version) || !Read(bytes, cursor, scene_hash) ||
+        !Read(bytes, cursor, sample_count) || !Read(bytes, cursor, bounce_count) ||
+        !Read(bytes, cursor, entry_count) || !Read(bytes, cursor, reserved))
+    {
+        result.diagnostic = "Client Lightmap package truncated header: " + package_path;
+        return result;
+    }
+    if (version != kVersion)
+    {
+        result.diagnostic = "Client Lightmap package version mismatch: " + std::to_string(version);
+        return result;
+    }
+    const uint64_t current_scene_hash = HashFile(scene_path);
+    if (current_scene_hash == 0 || current_scene_hash != scene_hash)
+    {
+        result.diagnostic = "Client Lightmap package scene hash mismatch; regenerate lightmaps";
+        return result;
+    }
+    if (entry_count > scene.objects.GetCount() || entry_count > 1'000'000u)
+    {
+        result.diagnostic = "Client Lightmap package unreasonable entry count";
+        return result;
+    }
+
+    std::unordered_map<std::string, wi::scene::ObjectComponent*> objects_by_id;
+    objects_by_id.reserve(scene.objects.GetCount());
+    for (size_t i = 0; i < scene.objects.GetCount(); ++i)
+    {
+        const wi::ecs::Entity entity = scene.objects.GetEntity(i);
+        const std::string id = GetObjectId(scene, entity);
+        if (!id.empty())
+            objects_by_id[id] = &scene.objects[i];
+    }
+
+    std::vector<PackageEntry> entries;
+    entries.reserve(entry_count);
+    std::unordered_set<std::string> package_ids;
+    for (uint32_t i = 0; i < entry_count; ++i)
+    {
+        uint32_t id_size = 0;
+        PackageEntry entry;
+        if (!Read(bytes, cursor, id_size) || id_size == 0 || id_size > 1024 || cursor > bytes.size() || id_size > bytes.size() - cursor)
+        {
+            result.diagnostic = "Client Lightmap package truncated object id table";
+            return result;
+        }
+        entry.id.assign(reinterpret_cast<const char*>(bytes.data() + cursor), id_size);
+        cursor += id_size;
+        if (!package_ids.insert(entry.id).second)
+        {
+            result.diagnostic = "Client Lightmap package duplicate object id: " + entry.id;
+            return result;
+        }
+        if (!Read(bytes, cursor, entry.width) || !Read(bytes, cursor, entry.height) ||
+            !Read(bytes, cursor, entry.format) || !Read(bytes, cursor, entry.offset) ||
+            !Read(bytes, cursor, entry.size) || !Read(bytes, cursor, entry.crc))
+        {
+            result.diagnostic = "Client Lightmap package truncated entry table";
+            return result;
+        }
+        if (entry.format != kFormatBC6H || entry.width == 0 || entry.height == 0 ||
+            entry.width % 4 != 0 || entry.height % 4 != 0 ||
+            entry.size != ExpectedBC6HSize(entry.width, entry.height) ||
+            entry.offset > bytes.size() || entry.size > bytes.size() - entry.offset)
+        {
+            result.diagnostic = "Client Lightmap package invalid BC6H entry: " + entry.id;
+            return result;
+        }
+        if (CRC32(bytes.data() + entry.offset, static_cast<size_t>(entry.size)) != entry.crc)
+        {
+            result.diagnostic = "Client Lightmap package CRC mismatch: " + entry.id;
+            return result;
+        }
+        entries.push_back(std::move(entry));
+    }
+
+    uint64_t expected_payload_offset = cursor;
+    for (const PackageEntry& entry : entries)
+    {
+        if (entry.offset != expected_payload_offset)
+        {
+            result.diagnostic = "Client Lightmap package contains overlapping or non-canonical payload offsets";
+            return result;
+        }
+        expected_payload_offset += entry.size;
+    }
+    if (expected_payload_offset != bytes.size())
+    {
+        result.diagnostic = "Client Lightmap package payload length mismatch";
+        return result;
+    }
+
+    for (const PackageEntry& entry : entries)
+    {
+        const auto object_it = objects_by_id.find(entry.id);
+        if (object_it == objects_by_id.end())
+            continue;
+        wi::scene::ObjectComponent& object = *object_it->second;
+        wi::graphics::Texture texture;
+        if (!wi::texturehelper::CreateTexture(
+            texture,
+            bytes.data() + entry.offset,
+            entry.width,
+            entry.height,
+            wi::graphics::Format::BC6H_UF16))
+        {
+            result.diagnostic = "Client Lightmap package GPU texture creation failed: " + entry.id;
+            ClearSceneLightmaps(scene);
+            return result;
+        }
+        wi::graphics::GetDevice()->SetName(&texture, "newpipeline.client.lightmap");
+        object.lightmapWidth = entry.width;
+        object.lightmapHeight = entry.height;
+        object.lightmap = std::move(texture);
+        object.lightmapTextureData.clear();
+        ++result.loaded_count;
+    }
+
+    result.success = true;
+    result.diagnostic = "Client Lightmap package loaded: " + std::to_string(result.loaded_count) +
+        "/" + std::to_string(entry_count) + " objects, samples=" + std::to_string(sample_count) +
+        " bounces=" + std::to_string(bounce_count);
+    return result;
+}
+
+bool ClientLightmapPackage::Save(
+    const std::string& package_path,
+    uint64_t scene_hash,
+    const wi::scene::Scene& scene,
+    const std::vector<wi::ecs::Entity>& entities,
+    const ClientLightmapBakeSettings& settings,
+    std::string& error) const
+{
+    if (scene_hash == 0)
+    {
+        error = "prepared scene hash is zero";
+        return false;
+    }
+
+    std::vector<PackageEntry> entries;
+    entries.reserve(entities.size());
+    std::unordered_set<std::string> ids;
+    size_t table_size = kHeaderSize;
+    for (wi::ecs::Entity entity : entities)
+    {
+        const wi::scene::ObjectComponent* object = scene.objects.GetComponent(entity);
+        if (object == nullptr || !object->lightmap.IsValid() || object->lightmapTextureData.empty())
+            continue;
+        PackageEntry entry;
+        entry.id = GetObjectId(scene, entity);
+        entry.width = object->lightmapWidth;
+        entry.height = object->lightmapHeight;
+        entry.size = object->lightmapTextureData.size();
+        entry.payload = &object->lightmapTextureData;
+        if (entry.id.empty() || !ids.insert(entry.id).second)
+        {
+            error = "missing or duplicate client lightmap object id";
+            return false;
+        }
+        if (entry.size != ExpectedBC6HSize(entry.width, entry.height))
+        {
+            error = "object " + entry.id + " does not contain BC6H data";
+            return false;
+        }
+        entry.crc = CRC32(entry.payload->data(), entry.payload->size());
+        table_size += 4 + entry.id.size() + 4 + 4 + 4 + 8 + 8 + 4;
+        entries.push_back(std::move(entry));
+    }
+    if (entries.empty())
+    {
+        error = "no completed lightmaps to save";
+        return false;
+    }
+
+    uint64_t payload_offset = table_size;
+    for (PackageEntry& entry : entries)
+    {
+        entry.offset = payload_offset;
+        payload_offset += entry.size;
+    }
+    if (payload_offset > std::numeric_limits<size_t>::max())
+    {
+        error = "client lightmap package is too large";
+        return false;
+    }
+
+    wi::vector<uint8_t> bytes;
+    bytes.reserve(static_cast<size_t>(payload_offset));
+    bytes.insert(bytes.end(), kMagic.begin(), kMagic.end());
+    Append(bytes, kVersion);
+    Append(bytes, scene_hash);
+    Append(bytes, settings.sample_count);
+    Append(bytes, settings.bounce_count);
+    Append(bytes, static_cast<uint32_t>(entries.size()));
+    Append(bytes, uint32_t{0});
+    for (const PackageEntry& entry : entries)
+    {
+        Append(bytes, static_cast<uint32_t>(entry.id.size()));
+        bytes.insert(bytes.end(), entry.id.begin(), entry.id.end());
+        Append(bytes, entry.width);
+        Append(bytes, entry.height);
+        Append(bytes, entry.format);
+        Append(bytes, entry.offset);
+        Append(bytes, entry.size);
+        Append(bytes, entry.crc);
+    }
+    for (const PackageEntry& entry : entries)
+        bytes.insert(bytes.end(), entry.payload->begin(), entry.payload->end());
+
+    if (!wi::helper::FileWrite(package_path, bytes.data(), bytes.size()))
+    {
+        error = "failed to write " + package_path;
+        return false;
+    }
+    return true;
+}
+
+bool GenerateClientLightmapAtlas(
+    wi::scene::Scene& scene,
+    wi::ecs::Entity mesh_entity,
+    uint32_t resolution,
+    uint32_t& width,
+    uint32_t& height,
+    std::string& error)
+{
+    wi::scene::MeshComponent* meshcomponent = scene.meshes.GetComponent(mesh_entity);
+    if (meshcomponent == nullptr || meshcomponent->vertex_positions.empty() || meshcomponent->indices.empty())
+    {
+        error = "mesh has no geometry";
+        return false;
+    }
+    if (meshcomponent->IsSkinned() || scene.softbodies.GetComponent(mesh_entity) != nullptr)
+    {
+        error = "skinned and soft-body meshes are not eligible for static lightmaps";
+        return false;
+    }
+
+    xatlas::Atlas* atlas_handle = xatlas::Create();
+    if (atlas_handle == nullptr)
+    {
+        error = "xatlas allocation failed";
+        return false;
+    }
+    struct AtlasGuard
+    {
+        xatlas::Atlas* atlas = nullptr;
+        ~AtlasGuard() { if (atlas != nullptr) xatlas::Destroy(atlas); }
+    } guard{atlas_handle};
+
+    xatlas::MeshDecl declaration;
+    declaration.vertexCount = static_cast<uint32_t>(meshcomponent->vertex_positions.size());
+    declaration.vertexPositionData = meshcomponent->vertex_positions.data();
+    declaration.vertexPositionStride = sizeof(XMFLOAT3);
+    if (!meshcomponent->vertex_normals.empty())
+    {
+        declaration.vertexNormalData = meshcomponent->vertex_normals.data();
+        declaration.vertexNormalStride = sizeof(XMFLOAT3);
+    }
+    if (!meshcomponent->vertex_uvset_0.empty())
+    {
+        declaration.vertexUvData = meshcomponent->vertex_uvset_0.data();
+        declaration.vertexUvStride = sizeof(XMFLOAT2);
+    }
+    declaration.indexCount = static_cast<uint32_t>(meshcomponent->indices.size());
+    declaration.indexData = meshcomponent->indices.data();
+    declaration.indexFormat = xatlas::IndexFormat::UInt32;
+    const xatlas::AddMeshError add_error = xatlas::AddMesh(atlas_handle, declaration);
+    if (add_error != xatlas::AddMeshError::Success)
+    {
+        error = std::string{"xatlas AddMesh failed: "} + xatlas::StringForEnum(add_error);
+        return false;
+    }
+
+    xatlas::ChartOptions chart_options;
+    chart_options.useInputMeshUvs = true;
+    chart_options.fixWinding = true;
+    xatlas::PackOptions pack_options;
+    pack_options.resolution = std::clamp(resolution, 64u, 1024u);
+    pack_options.blockAlign = true;
+    pack_options.padding = 2;
+    xatlas::Generate(atlas_handle, chart_options, pack_options);
+    if (atlas_handle->meshCount == 0 || atlas_handle->width == 0 || atlas_handle->height == 0)
+    {
+        error = "xatlas produced an empty atlas";
+        return false;
+    }
+
+    width = atlas_handle->width;
+    height = atlas_handle->height;
+    const xatlas::Mesh& atlas_mesh = atlas_handle->meshes[0];
+    const auto old_positions = meshcomponent->vertex_positions;
+    const auto old_normals = meshcomponent->vertex_normals;
+    const auto old_winds = meshcomponent->vertex_windweights;
+    const auto old_tangents = meshcomponent->vertex_tangents;
+    const auto old_uv0 = meshcomponent->vertex_uvset_0;
+    const auto old_uv1 = meshcomponent->vertex_uvset_1;
+    const auto old_colors = meshcomponent->vertex_colors;
+    const auto old_boneindices = meshcomponent->vertex_boneindices;
+    const auto old_boneweights = meshcomponent->vertex_boneweights;
+    const auto old_boneindices2 = meshcomponent->vertex_boneindices2;
+    const auto old_boneweights2 = meshcomponent->vertex_boneweights2;
+
+    meshcomponent->indices.resize(atlas_mesh.indexCount);
+    meshcomponent->vertex_positions.resize(atlas_mesh.vertexCount);
+    meshcomponent->vertex_atlas.resize(atlas_mesh.vertexCount);
+    if (!old_normals.empty()) meshcomponent->vertex_normals.resize(atlas_mesh.vertexCount);
+    if (!old_winds.empty()) meshcomponent->vertex_windweights.resize(atlas_mesh.vertexCount);
+    if (!old_tangents.empty()) meshcomponent->vertex_tangents.resize(atlas_mesh.vertexCount);
+    if (!old_uv0.empty()) meshcomponent->vertex_uvset_0.resize(atlas_mesh.vertexCount);
+    if (!old_uv1.empty()) meshcomponent->vertex_uvset_1.resize(atlas_mesh.vertexCount);
+    if (!old_colors.empty()) meshcomponent->vertex_colors.resize(atlas_mesh.vertexCount);
+    if (!old_boneindices.empty()) meshcomponent->vertex_boneindices.resize(atlas_mesh.vertexCount);
+    if (!old_boneweights.empty()) meshcomponent->vertex_boneweights.resize(atlas_mesh.vertexCount);
+    if (!old_boneindices2.empty()) meshcomponent->vertex_boneindices2.resize(atlas_mesh.vertexCount);
+    if (!old_boneweights2.empty()) meshcomponent->vertex_boneweights2.resize(atlas_mesh.vertexCount);
+
+    for (uint32_t j = 0; j < atlas_mesh.indexCount; ++j)
+    {
+        const uint32_t index = atlas_mesh.indexArray[j];
+        const xatlas::Vertex& vertex = atlas_mesh.vertexArray[index];
+        if (vertex.xref >= old_positions.size())
+        {
+            error = "xatlas returned an invalid source vertex";
+            return false;
+        }
+        meshcomponent->indices[j] = index;
+        meshcomponent->vertex_positions[index] = old_positions[vertex.xref];
+        meshcomponent->vertex_atlas[index] = XMFLOAT2(vertex.uv[0] / float(width), vertex.uv[1] / float(height));
+        if (!old_normals.empty()) meshcomponent->vertex_normals[index] = old_normals[vertex.xref];
+        if (!old_winds.empty()) meshcomponent->vertex_windweights[index] = old_winds[vertex.xref];
+        if (!old_tangents.empty()) meshcomponent->vertex_tangents[index] = old_tangents[vertex.xref];
+        if (!old_uv0.empty()) meshcomponent->vertex_uvset_0[index] = old_uv0[vertex.xref];
+        if (!old_uv1.empty()) meshcomponent->vertex_uvset_1[index] = old_uv1[vertex.xref];
+        if (!old_colors.empty()) meshcomponent->vertex_colors[index] = old_colors[vertex.xref];
+        if (!old_boneindices.empty()) meshcomponent->vertex_boneindices[index] = old_boneindices[vertex.xref];
+        if (!old_boneweights.empty()) meshcomponent->vertex_boneweights[index] = old_boneweights[vertex.xref];
+        if (!old_boneindices2.empty()) meshcomponent->vertex_boneindices2[index] = old_boneindices2[vertex.xref];
+        if (!old_boneweights2.empty()) meshcomponent->vertex_boneweights2[index] = old_boneweights2[vertex.xref];
+    }
+
+    meshcomponent->CreateRenderData();
+    return true;
+}
+} // namespace wicked_newpipeline

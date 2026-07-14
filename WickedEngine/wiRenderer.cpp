@@ -11995,11 +11995,29 @@ void Visibility_Surface(
 	device->ClearUAV(&res.texture_normal_roughness, 0, cmd);
 	device->Barrier(GPUBarrier::Memory(&res.texture_normal_roughness), cmd);
 
+	int lightmap_irradiance_uav = -1;
+	if (res.texture_lightmap_irradiance != nullptr && res.texture_lightmap_irradiance->IsValid())
+	{
+		device->Barrier(GPUBarrier::Image(
+			res.texture_lightmap_irradiance,
+			res.texture_lightmap_irradiance->desc.layout,
+			ResourceState::UNORDERED_ACCESS), cmd);
+		device->ClearUAV(res.texture_lightmap_irradiance, 0, cmd);
+		device->Barrier(GPUBarrier::Memory(res.texture_lightmap_irradiance), cmd);
+		lightmap_irradiance_uav = device->GetDescriptorIndex(res.texture_lightmap_irradiance, SubresourceType::UAV);
+	}
+
 	device->BindResource(&res.binned_tiles, 0, cmd);
 	device->BindUAV(&res.texture_normal_roughness, 0, cmd);
 
 	const uint visibility_tilecount_flat = res.tile_count.x * res.tile_count.y;
-	uint visibility_tile_offset = 0;
+	struct VisibilitySurfacePushConstants
+	{
+		uint32_t global_tile_offset;
+		int32_t lightmap_irradiance_uav;
+	};
+	VisibilitySurfacePushConstants push = {};
+	push.lightmap_irradiance_uav = lightmap_irradiance_uav;
 	uint64_t bins_offset = 0;
 
 	// surface dispatches per material type:
@@ -12009,10 +12027,10 @@ void Visibility_Surface(
 		if (i != MaterialComponent::SHADERTYPE_UNLIT && i != MaterialComponent::SHADERTYPE_INTERIORMAPPING) // these shaders are special, they don't use normals or roughness based post processing
 		{
 			device->BindComputeShader(&shaders[CSTYPE_VISIBILITY_SURFACE_UNIFORM_PERMUTATION_BEGIN + i], cmd);
-			device->PushConstants(&visibility_tile_offset, sizeof(visibility_tile_offset), cmd);
+			device->PushConstants(&push, sizeof(push), cmd);
 			device->DispatchIndirect(&res.bins, bins_offset, cmd);
 		}
-		visibility_tile_offset += visibility_tilecount_flat;
+		push.global_tile_offset += visibility_tilecount_flat;
 		bins_offset += sizeof(IndirectDispatchArgs);
 	}
 	device->EventEnd(cmd);
@@ -12023,10 +12041,10 @@ void Visibility_Surface(
 		if (i != MaterialComponent::SHADERTYPE_UNLIT && i != MaterialComponent::SHADERTYPE_INTERIORMAPPING) // these shaders are special, they don't use normals or roughness based post processing
 		{
 			device->BindComputeShader(&shaders[CSTYPE_VISIBILITY_SURFACE_DIVERGENT_PERMUTATION_BEGIN + i], cmd);
-			device->PushConstants(&visibility_tile_offset, sizeof(visibility_tile_offset), cmd);
+			device->PushConstants(&push, sizeof(push), cmd);
 			device->DispatchIndirect(&res.bins, bins_offset, cmd);
 		}
-		visibility_tile_offset += visibility_tilecount_flat;
+		push.global_tile_offset += visibility_tilecount_flat;
 		bins_offset += sizeof(IndirectDispatchArgs);
 	}
 	device->EventEnd(cmd);
@@ -12034,6 +12052,13 @@ void Visibility_Surface(
 	// Ending barriers:
 	//	These resources will be used by other post processing effects
 	device->Barrier(GPUBarrier::Image(&res.texture_normal_roughness, ResourceState::UNORDERED_ACCESS, res.texture_normal_roughness.desc.layout), cmd);
+	if (res.texture_lightmap_irradiance != nullptr && res.texture_lightmap_irradiance->IsValid())
+	{
+		device->Barrier(GPUBarrier::Image(
+			res.texture_lightmap_irradiance,
+			ResourceState::UNORDERED_ACCESS,
+			res.texture_lightmap_irradiance->desc.layout), cmd);
+	}
 
 	wi::profiler::EndRange(range);
 	device->EventEnd(cmd);
