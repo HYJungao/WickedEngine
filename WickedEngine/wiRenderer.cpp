@@ -12080,8 +12080,26 @@ void Visibility_Shade(
 	device->BindResource(&res.binned_tiles, 0, cmd);
 	device->BindUAV(&output, 0, cmd);
 
+	int specular_indirect_uav = -1;
+	if (res.texture_specular_indirect != nullptr && res.texture_specular_indirect->IsValid())
+	{
+		device->Barrier(GPUBarrier::Image(
+			res.texture_specular_indirect,
+			res.texture_specular_indirect->desc.layout,
+			ResourceState::UNORDERED_ACCESS), cmd);
+		device->ClearUAV(res.texture_specular_indirect, 0, cmd);
+		device->Barrier(GPUBarrier::Memory(res.texture_specular_indirect), cmd);
+		specular_indirect_uav = device->GetDescriptorIndex(res.texture_specular_indirect, SubresourceType::UAV);
+	}
+
 	const uint visibility_tilecount_flat = res.tile_count.x * res.tile_count.y;
-	uint visibility_tile_offset = 0;
+	struct VisibilityShadePushConstants
+	{
+		uint32_t global_tile_offset;
+		int32_t specular_indirect_uav;
+	};
+	VisibilityShadePushConstants push = {};
+	push.specular_indirect_uav = specular_indirect_uav;
 	uint64_t bins_offset = 0;
 
 	// shading dispatches per material type:
@@ -12089,9 +12107,9 @@ void Visibility_Shade(
 	for (uint i = 0; i < MaterialComponent::SHADERTYPE_COUNT; ++i)
 	{
 		device->BindComputeShader(&shaders[CSTYPE_VISIBILITY_SHADE_UNIFORM_PERMUTATION_BEGIN + i], cmd);
-		device->PushConstants(&visibility_tile_offset, sizeof(visibility_tile_offset), cmd);
+		device->PushConstants(&push, sizeof(push), cmd);
 		device->DispatchIndirect(&res.bins, bins_offset, cmd);
-		visibility_tile_offset += visibility_tilecount_flat;
+		push.global_tile_offset += visibility_tilecount_flat;
 		bins_offset += sizeof(IndirectDispatchArgs);
 	}
 	device->EventEnd(cmd);
@@ -12100,14 +12118,21 @@ void Visibility_Shade(
 	for (uint i = 0; i < MaterialComponent::SHADERTYPE_COUNT; ++i)
 	{
 		device->BindComputeShader(&shaders[CSTYPE_VISIBILITY_SHADE_DIVERGENT_PERMUTATION_BEGIN + i], cmd);
-		device->PushConstants(&visibility_tile_offset, sizeof(visibility_tile_offset), cmd);
+		device->PushConstants(&push, sizeof(push), cmd);
 		device->DispatchIndirect(&res.bins, bins_offset, cmd);
-		visibility_tile_offset += visibility_tilecount_flat;
+		push.global_tile_offset += visibility_tilecount_flat;
 		bins_offset += sizeof(IndirectDispatchArgs);
 	}
 	device->EventEnd(cmd);
 
 	PushBarrier(GPUBarrier::Image(&output, ResourceState::UNORDERED_ACCESS, output.desc.layout));
+	if (res.texture_specular_indirect != nullptr && res.texture_specular_indirect->IsValid())
+	{
+		PushBarrier(GPUBarrier::Image(
+			res.texture_specular_indirect,
+			ResourceState::UNORDERED_ACCESS,
+			res.texture_specular_indirect->desc.layout));
+	}
 	FlushBarriers(cmd);
 
 	wi::profiler::EndRange(range);

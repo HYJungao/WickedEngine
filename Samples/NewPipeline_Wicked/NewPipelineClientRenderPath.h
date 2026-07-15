@@ -55,6 +55,12 @@ public:
     void CancelLightmapBake();
     bool IsLightmapBakeActive() const;
     std::string GetLightmapBakeStatus() const;
+    void RequestReflectionProbeBake();
+    bool IsReflectionProbeBakeActive() const;
+    std::string GetReflectionProbeBakeStatus() const { return reflection_probe_status; }
+    void SetReflectionProbeDebugMip(uint32_t mip);
+    uint32_t GetReflectionProbeDebugMip() const { return reflection_probe_debug_mip; }
+    uint32_t GetReflectionProbeDebugMipCount() const;
     const wi::graphics::Texture& GetLocalLightmapIrradiance() const { return local_lightmap_irradiance; }
 
     void Start() override;
@@ -81,6 +87,11 @@ private:
     void ApplyShadowSettings(bool log_changes);
     void ApplySSAOSettings(bool log_changes);
     void ApplyEnvironmentProbeSettings(bool log_changes);
+    void LoadEnvironmentProbeAsset();
+    void InitializeBlackEnvironmentProbe(wi::scene::EnvironmentProbeComponent& probe);
+    void CreateEnvironmentProbeMipViews();
+    void UpdateReflectionProbeBake();
+    void EnsureSpecularIndirectDebugTexture();
     void ApplyBakedLightmapSettings(bool previous_enabled, bool log_changes, bool force_log = false);
     void DisableBakedLightmaps();
     void RestoreBakedLightmaps();
@@ -115,6 +126,15 @@ private:
         Failed,
     };
 
+    enum class ReflectionProbeBakeState : uint8_t
+    {
+        Idle,
+        Capturing,
+        Saving,
+        Completed,
+        Failed,
+    };
+
     NewPipelineClientRenderSettings render_settings;
     NewPipelineSunState sun_state = MakeSunStateFromAngles(true, -35.0f, 50.0f);
     DebugPreviewMode debug_preview_mode = DebugPreviewMode::Final;
@@ -145,6 +165,12 @@ private:
     uint32_t accepted_remote_buffer_mask = 0;
     wi::ecs::Entity environment_probe_entity = wi::ecs::INVALID_ENTITY;
     bool environment_probe_created_by_client = false;
+    bool environment_probe_load_attempted = false;
+    ReflectionProbeBakeState reflection_probe_bake_state = ReflectionProbeBakeState::Idle;
+    std::string reflection_probe_status = "Reflection Probe: idle";
+    std::string reflection_probe_asset_path;
+    wi::vector<int> reflection_probe_mip_subresources;
+    uint32_t reflection_probe_debug_mip = 0;
     RemoteConsumeState remote_consume;
     XMFLOAT3 camera_position = XMFLOAT3(0, 2.5f, -8);
     XMFLOAT3 camera_rotation = XMFLOAT3(wi::math::DegreesToRadians(5), 0, 0);
@@ -160,6 +186,7 @@ private:
     bool input_active = true;
     mutable wi::graphics::Texture local_ao_snapshot;
     wi::graphics::Texture local_lightmap_irradiance;
+    wi::graphics::Texture local_specular_indirect;
     bool          status_logged = false;
     uint32_t remote_ddgi_frame_index = 0;
     DDGIResetReason remote_ddgi_reset_reason = DDGIResetReason::None;

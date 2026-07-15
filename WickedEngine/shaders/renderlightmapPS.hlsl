@@ -10,6 +10,14 @@
 // This value specifies after which bounce the anyhit will be disabled:
 static const uint ANYTHIT_CUTOFF_AFTER_BOUNCE_COUNT = 4;
 
+// Per-path radiance cap for offline lightmap accumulation.  Rare emissive or
+// near-specular paths can otherwise contribute an arbitrarily bright sample;
+// even hundreds of temporal samples will then retain isolated colored
+// fireflies which BC6H preserves and Bloom greatly amplifies.  The cap is
+// applied chroma-preservingly to individual samples, not to the converged
+// lightmap, so normal HDR indirect illumination remains representable.
+static const float LIGHTMAP_SAMPLE_RADIANCE_MAX = 16.0;
+
 struct Input
 {
 	float4 pos : SV_POSITION;
@@ -463,5 +471,16 @@ float4 main(Input input) : SV_TARGET
 	//if(bakerydebug > 0)
 	//	result = float3(1,0,0);
 	
+	result = max(0, result);
+	if (any(isnan(result)) || any(isinf(result)))
+	{
+		result = 0;
+	}
+	else
+	{
+		const float peak = max3(result);
+		result *= min(1.0, LIGHTMAP_SAMPLE_RADIANCE_MAX / max(peak, 1e-4));
+	}
+
 	return float4(result, xTraceAccumulationFactor);
 }

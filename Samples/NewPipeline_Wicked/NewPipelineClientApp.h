@@ -37,6 +37,9 @@ private:
     wi::gui::Button              generate_lightmaps_button;
     wi::gui::Button              cancel_lightmaps_button;
     wi::gui::Label               lightmap_progress_label;
+    wi::gui::Button              generate_reflection_probe_button;
+    wi::gui::Slider              reflection_probe_mip_slider;
+    wi::gui::Label               reflection_probe_progress_label;
     bool                         configured = false;
     bool                         debug_ui_created = false;
 };

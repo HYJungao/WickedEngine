@@ -26,6 +26,14 @@ constexpr const char* kClientEnvironmentProbeName = "NewPipelineEnvironmentProbe
 constexpr uint32_t kMobileShadow2DResolution = 1024;
 constexpr uint32_t kMobileShadowCubeResolution = 512;
 constexpr uint32_t kMobileLightmapResolution = 256;
+constexpr uint32_t kClientReflectionProbeResolution = 128;
+
+std::string ClientReflectionProbePath(const std::string& scene_path)
+{
+    std::filesystem::path path(scene_path);
+    path.replace_extension(".clientprobe.dds");
+    return path.string();
+}
 
 uint64_t NowUsec()
 {
@@ -104,6 +112,7 @@ void NewPipelineClientRenderPath::SetSunState(const NewPipelineSunState& value)
 void NewPipelineClientRenderPath::SetDebugPreviewMode(DebugPreviewMode mode)
 {
     debug_preview_mode = mode;
+    EnsureSpecularIndirectDebugTexture();
     setDDGIOutputDebugPreview(wi::RenderPath3D::DDGIOutputDebugPreview::Disabled);
     debug_preview_invalid_logged = false;
     wi::backlog::post(std::string{"Client debug preview mode: "} + ToString(debug_preview_mode));
@@ -114,13 +123,14 @@ std::string NewPipelineClientRenderPath::GetEffectiveAlgorithmSummary() const
     return std::string{render_settings.shadow_maps_enabled ? "Shadow Map 1024/512" : "Shadow Map off"} +
         " | " + (render_settings.ssao_enabled ? "SSAO" : "SSAO off") +
         " | " + (render_settings.baked_lightmaps_enabled ? "Baked Lightmap" : "Baked Lightmap off") +
-        " | " + (render_settings.environment_probe_enabled ? "Static Probe 128" : "Static Probe off") +
+        " | " + (render_settings.environment_probe_enabled ? "Baked Probe 128" : "Baked Probe off") +
         " | local DDGI/RT/SSR off";
 }
 
 std::string NewPipelineClientRenderPath::GetDebugStatusSummary() const
 {
-    return GetEffectiveAlgorithmSummary() + "\n" + lightmap_bake_status + "\nRemote decoded: " +
+    return GetEffectiveAlgorithmSummary() + "\n" + lightmap_bake_status + "\n" +
+        reflection_probe_status + "\nRemote decoded: " +
         (remote_consume.accepted_valid ? std::string{"available"} : std::string{"unavailable"}) +
         "\nRemote DDGI: frame " + std::to_string(remote_ddgi_frame_index) +
         (remote_consume.history_valid ? " converged" : " warming") +
@@ -189,7 +199,9 @@ void NewPipelineClientRenderPath::ResizeBuffers()
     wi::RenderPath3D::ResizeBuffers();
     local_ao_snapshot = {};
     local_lightmap_irradiance = {};
+    local_specular_indirect = {};
     visibilityResources.texture_lightmap_irradiance = nullptr;
+    visibilityResources.texture_specular_indirect = nullptr;
     if (rtAO.IsValid())
     {
         wi::graphics::TextureDesc desc = rtAO.GetDesc();
@@ -218,6 +230,41 @@ void NewPipelineClientRenderPath::ResizeBuffers()
                 std::to_string(internal_resolution.x) + "x" + std::to_string(internal_resolution.y));
         }
     }
+    EnsureSpecularIndirectDebugTexture();
+}
+
+void NewPipelineClientRenderPath::EnsureSpecularIndirectDebugTexture()
+{
+    visibilityResources.texture_specular_indirect = nullptr;
+    if (debug_preview_mode != DebugPreviewMode::LocalSpecularIndirect)
+    {
+        local_specular_indirect = {};
+        return;
+    }
+
+    const XMUINT2 resolution = GetInternalResolution();
+    if (resolution.x == 0 || resolution.y == 0)
+        return;
+    if (!local_specular_indirect.IsValid() ||
+        local_specular_indirect.GetDesc().width != resolution.x ||
+        local_specular_indirect.GetDesc().height != resolution.y)
+    {
+        wi::graphics::TextureDesc desc;
+        desc.width = resolution.x;
+        desc.height = resolution.y;
+        desc.format = wi::graphics::Format::R16G16B16A16_FLOAT;
+        desc.bind_flags = wi::graphics::BindFlag::SHADER_RESOURCE | wi::graphics::BindFlag::UNORDERED_ACCESS;
+        desc.layout = wi::graphics::ResourceState::SHADER_RESOURCE_COMPUTE;
+        local_specular_indirect = {};
+        if (!wi::graphics::GetDevice()->CreateTexture(&desc, nullptr, &local_specular_indirect))
+        {
+            wi::backlog::post("Client Local Specular Indirect debug texture creation failed: " +
+                std::to_string(resolution.x) + "x" + std::to_string(resolution.y));
+            return;
+        }
+        wi::graphics::GetDevice()->SetName(&local_specular_indirect, "newpipeline.client.local_specular_indirect");
+    }
+    visibilityResources.texture_specular_indirect = &local_specular_indirect;
 }
 
 void NewPipelineClientRenderPath::RenderAO(wi::graphics::CommandList cmd) const
@@ -230,12 +277,40 @@ void NewPipelineClientRenderPath::RenderAO(wi::graphics::CommandList cmd) const
 void NewPipelineClientRenderPath::Update(float dt)
 {
     InitializeSceneIfNeeded();
+    UpdateReflectionProbeBake();
     UpdateLightmapBake();
     UpdateLocalCamera(dt);
     MaintainWebRTC(dt);
     PublishControlPacket(dt);
 
+    // The authored Sponza dust emitter is useful in the Editor, but it is too
+    // expensive and visually ambiguous in the low-end Client: its bright
+    // particle sprites look like lightmap fireflies and its procedural
+    // geometry can enter the bake TLAS.  Mask emitters only for the duration
+    // of the Client scene update, then restore the serialized layer state so
+    // Generate Lightmap never modifies this authoring choice in the .wiscene.
+    wi::vector<std::pair<wi::ecs::Entity, uint32_t>> emitter_layer_masks;
+    emitter_layer_masks.reserve(local_scene.emitters.GetCount());
+    for (size_t i = 0; i < local_scene.emitters.GetCount(); ++i)
+    {
+        const wi::ecs::Entity entity = local_scene.emitters.GetEntity(i);
+        if (wi::scene::LayerComponent* layer = local_scene.layers.GetComponent(entity))
+        {
+            emitter_layer_masks.emplace_back(entity, layer->layerMask);
+            layer->layerMask = 0;
+        }
+        local_scene.emitters[i].layerMask = 0;
+    }
+
     wi::RenderPath3D::Update(dt);
+
+    for (const auto& saved : emitter_layer_masks)
+    {
+        if (wi::scene::LayerComponent* layer = local_scene.layers.GetComponent(saved.first))
+            layer->layerMask = saved.second;
+    }
+    for (size_t i = 0; i < local_scene.emitters.GetCount(); ++i)
+        local_scene.emitters[i].layerMask = 0;
     AcquireRemoteVideoFrame(dt);
 
     if (!status_logged)
@@ -400,6 +475,8 @@ void NewPipelineClientRenderPath::ApplyEnvironmentProbeSettings(bool log_changes
             environment_probe_entity = wi::ecs::INVALID_ENTITY;
             environment_probe_created_by_client = false;
         }
+        environment_probe_load_attempted = false;
+        reflection_probe_mip_subresources.clear();
         if (log_changes)
         {
             wi::backlog::post("Client environment probe: disabled");
@@ -411,15 +488,9 @@ void NewPipelineClientRenderPath::ApplyEnvironmentProbeSettings(bool log_changes
     {
         environment_probe_entity = local_scene.Entity_CreateEnvironmentProbe(kClientEnvironmentProbeName, XMFLOAT3(0.0f, 3.0f, 0.0f));
         environment_probe_created_by_client = true;
+        environment_probe_load_attempted = false;
     }
 
-    if (wi::scene::EnvironmentProbeComponent* probe = local_scene.probes.GetComponent(environment_probe_entity))
-    {
-        probe->resolution = 128;
-        probe->SetRealTime(false);
-        probe->SetMSAA(false);
-        probe->SetDirty(true);
-    }
     if (wi::scene::TransformComponent* transform = local_scene.transforms.GetComponent(environment_probe_entity))
     {
         transform->ClearTransform();
@@ -428,10 +499,119 @@ void NewPipelineClientRenderPath::ApplyEnvironmentProbeSettings(bool log_changes
         transform->UpdateTransform();
     }
 
+    if (!environment_probe_load_attempted && !IsReflectionProbeBakeActive())
+        LoadEnvironmentProbeAsset();
+
     if (log_changes)
     {
-        wi::backlog::post("Client environment probe: enabled");
+        wi::backlog::post("Client baked environment probe: enabled; " + reflection_probe_status);
     }
+}
+
+void NewPipelineClientRenderPath::InitializeBlackEnvironmentProbe(wi::scene::EnvironmentProbeComponent& probe)
+{
+    probe.resource = {};
+    probe.textureName.clear();
+    probe.texture = {};
+    probe.resolution = kClientReflectionProbeResolution;
+    probe.SetRealTime(false);
+    probe.SetMSAA(false);
+    probe.CreateRenderData();
+    // CreateRenderData allocates a zeroed BC6H cube and marks it dirty. This
+    // explicit reset is what makes a missing package stay black instead of
+    // silently triggering a runtime capture on the next frame.
+    probe.SetDirty(false);
+    probe.render_dirty = false;
+    probe.first_render = false;
+    probe.subresource = -1;
+}
+
+void NewPipelineClientRenderPath::LoadEnvironmentProbeAsset()
+{
+    environment_probe_load_attempted = true;
+    reflection_probe_mip_subresources.clear();
+    reflection_probe_asset_path = scene_asset_path.empty() ? std::string{} : ClientReflectionProbePath(scene_asset_path);
+
+    wi::scene::EnvironmentProbeComponent* probe = local_scene.probes.GetComponent(environment_probe_entity);
+    if (probe == nullptr)
+    {
+        reflection_probe_status = "Reflection Probe: unavailable (entity missing)";
+        return;
+    }
+
+    if (reflection_probe_asset_path.empty() || !wi::helper::FileExists(reflection_probe_asset_path))
+    {
+        InitializeBlackEnvironmentProbe(*probe);
+        reflection_probe_status = reflection_probe_asset_path.empty()
+            ? "Reflection Probe: unavailable (no persistent .wiscene)"
+            : "Reflection Probe: package missing; black fallback";
+        wi::backlog::post("Client Reflection Probe package missing: " + reflection_probe_asset_path);
+        CreateEnvironmentProbeMipViews();
+        return;
+    }
+
+    probe->resource = {};
+    probe->texture = {};
+    probe->textureName = reflection_probe_asset_path;
+    probe->resolution = kClientReflectionProbeResolution;
+    probe->SetRealTime(false);
+    probe->CreateRenderData();
+    const bool valid_cube = probe->resource.IsValid() && probe->texture.IsValid() &&
+        has_flag(probe->texture.GetDesc().misc_flags, wi::graphics::ResourceMiscFlag::TEXTURECUBE) &&
+        probe->texture.GetDesc().array_size >= 6;
+    if (!valid_cube)
+    {
+        InitializeBlackEnvironmentProbe(*probe);
+        reflection_probe_status = "Reflection Probe: invalid DDS; black fallback";
+        wi::backlog::post("Client Reflection Probe package invalid: " + reflection_probe_asset_path);
+        CreateEnvironmentProbeMipViews();
+        return;
+    }
+
+    probe->SetDirty(false);
+    probe->render_dirty = false;
+    probe->first_render = false;
+    CreateEnvironmentProbeMipViews();
+    reflection_probe_status = "Reflection Probe: loaded " +
+        std::to_string(probe->texture.GetDesc().width) + "px, " +
+        std::to_string(probe->texture.GetDesc().mip_levels) + " mips";
+    wi::backlog::post("Client Reflection Probe loaded: " + reflection_probe_asset_path);
+}
+
+void NewPipelineClientRenderPath::CreateEnvironmentProbeMipViews()
+{
+    reflection_probe_mip_subresources.clear();
+    wi::scene::EnvironmentProbeComponent* probe = local_scene.probes.GetComponent(environment_probe_entity);
+    if (probe == nullptr || !probe->texture.IsValid())
+        return;
+
+    const wi::graphics::TextureDesc& desc = probe->texture.GetDesc();
+    reflection_probe_mip_subresources.reserve(desc.mip_levels);
+    for (uint32_t mip = 0; mip < desc.mip_levels; ++mip)
+    {
+        reflection_probe_mip_subresources.push_back(wi::graphics::GetDevice()->CreateSubresource(
+            &probe->texture,
+            wi::graphics::SubresourceType::SRV,
+            0,
+            desc.array_size,
+            mip,
+            1));
+    }
+    reflection_probe_debug_mip = std::min<uint32_t>(
+        reflection_probe_debug_mip,
+        reflection_probe_mip_subresources.empty() ? 0u : uint32_t(reflection_probe_mip_subresources.size() - 1));
+}
+
+void NewPipelineClientRenderPath::SetReflectionProbeDebugMip(uint32_t mip)
+{
+    const uint32_t count = GetReflectionProbeDebugMipCount();
+    reflection_probe_debug_mip = count == 0 ? 0 : std::min(mip, count - 1);
+    debug_preview_invalid_logged = false;
+}
+
+uint32_t NewPipelineClientRenderPath::GetReflectionProbeDebugMipCount() const
+{
+    return static_cast<uint32_t>(reflection_probe_mip_subresources.size());
 }
 
 void NewPipelineClientRenderPath::ApplyBakedLightmapSettings(bool previous_enabled, bool log_changes, bool force_log)
@@ -520,6 +700,11 @@ void NewPipelineClientRenderPath::RequestLightmapBake()
         wi::backlog::post("Client lightmap bake request ignored: a bake is already active");
         return;
     }
+    if (IsReflectionProbeBakeActive())
+    {
+        wi::backlog::post("Client lightmap bake request ignored: reflection probe bake is active");
+        return;
+    }
     if (!scene_initialized || scene_asset_path.empty())
     {
         render_settings.lightmap_bake_requested = false;
@@ -535,6 +720,146 @@ void NewPipelineClientRenderPath::RequestLightmapBake()
     lightmap_bake_state = LightmapBakeState::Preparing;
     lightmap_bake_status = "Lightmap: preparing atlas and scene metadata";
     wi::backlog::post("Client lightmap bake requested: " + scene_asset_path);
+}
+
+void NewPipelineClientRenderPath::RequestReflectionProbeBake()
+{
+    if (IsReflectionProbeBakeActive())
+    {
+        wi::backlog::post("Client reflection probe bake request ignored: a bake is already active");
+        return;
+    }
+    if (IsLightmapBakeActive())
+    {
+        wi::backlog::post("Client reflection probe bake request ignored: lightmap bake is active");
+        return;
+    }
+    if (!scene_initialized || scene_asset_path.empty())
+    {
+        reflection_probe_bake_state = ReflectionProbeBakeState::Failed;
+        reflection_probe_status = "Reflection Probe: unavailable (no persistent .wiscene)";
+        wi::backlog::post(reflection_probe_status);
+        return;
+    }
+
+    render_settings.environment_probe_enabled = true;
+    if (environment_probe_entity == wi::ecs::INVALID_ENTITY)
+        ApplyEnvironmentProbeSettings(false);
+    wi::scene::EnvironmentProbeComponent* probe = local_scene.probes.GetComponent(environment_probe_entity);
+    if (probe == nullptr)
+    {
+        reflection_probe_bake_state = ReflectionProbeBakeState::Failed;
+        reflection_probe_status = "Reflection Probe: failed (entity unavailable)";
+        wi::backlog::post(reflection_probe_status);
+        return;
+    }
+
+    // Detach the previously loaded DDS before requesting a capture. Otherwise
+    // CreateRenderData would keep resolving the cached asset and clear DIRTY.
+    probe->resource = {};
+    probe->textureName.clear();
+    probe->texture = {};
+    probe->resolution = kClientReflectionProbeResolution;
+    probe->SetRealTime(false);
+    probe->SetMSAA(false);
+    probe->CreateRenderData();
+    probe->first_render = true;
+    probe->SetDirty(true);
+    probe->render_dirty = false;
+
+    environment_probe_load_attempted = true;
+    reflection_probe_mip_subresources.clear();
+    reflection_probe_asset_path = ClientReflectionProbePath(scene_asset_path);
+    reflection_probe_bake_state = ReflectionProbeBakeState::Capturing;
+    reflection_probe_status = "Reflection Probe: capturing 128px BC6H cubemap";
+    wi::backlog::post("Client Reflection Probe bake requested: " + reflection_probe_asset_path);
+}
+
+bool NewPipelineClientRenderPath::IsReflectionProbeBakeActive() const
+{
+    return reflection_probe_bake_state == ReflectionProbeBakeState::Capturing ||
+        reflection_probe_bake_state == ReflectionProbeBakeState::Saving;
+}
+
+void NewPipelineClientRenderPath::UpdateReflectionProbeBake()
+{
+    if (reflection_probe_bake_state != ReflectionProbeBakeState::Capturing)
+        return;
+
+    wi::scene::EnvironmentProbeComponent* probe = local_scene.probes.GetComponent(environment_probe_entity);
+    if (probe == nullptr)
+    {
+        reflection_probe_bake_state = ReflectionProbeBakeState::Failed;
+        reflection_probe_status = "Reflection Probe: failed (entity disappeared)";
+        wi::backlog::post(reflection_probe_status);
+        return;
+    }
+    if (probe->IsDirty() || probe->render_dirty || probe->first_render)
+        return;
+    if (!probe->texture.IsValid() ||
+        probe->texture.GetDesc().format != wi::graphics::Format::BC6H_UF16 ||
+        !has_flag(probe->texture.GetDesc().misc_flags, wi::graphics::ResourceMiscFlag::TEXTURECUBE))
+    {
+        reflection_probe_bake_state = ReflectionProbeBakeState::Failed;
+        reflection_probe_status = "Reflection Probe: failed (capture texture is not BC6H cubemap)";
+        wi::backlog::post(reflection_probe_status);
+        return;
+    }
+
+    reflection_probe_bake_state = ReflectionProbeBakeState::Saving;
+    reflection_probe_status = "Reflection Probe: saving external DDS";
+    namespace fs = std::filesystem;
+    const fs::path final_path(reflection_probe_asset_path);
+    const fs::path temp_path(final_path.parent_path() /
+        (final_path.stem().string() + ".tmp" + final_path.extension().string()));
+    const fs::path backup_path(final_path.string() + ".backup");
+    std::error_code ec;
+    fs::remove(temp_path, ec);
+    ec.clear();
+    if (!wi::helper::saveTextureToFile(probe->texture, temp_path.string()))
+    {
+        reflection_probe_bake_state = ReflectionProbeBakeState::Failed;
+        reflection_probe_status = "Reflection Probe: failed (DDS save failed)";
+        wi::backlog::post(reflection_probe_status);
+        return;
+    }
+
+    fs::remove(backup_path, ec);
+    ec.clear();
+    const bool had_previous = fs::exists(final_path, ec) && !ec;
+    ec.clear();
+    if (had_previous)
+    {
+        fs::rename(final_path, backup_path, ec);
+        if (ec)
+        {
+            fs::remove(temp_path, ec);
+            reflection_probe_bake_state = ReflectionProbeBakeState::Failed;
+            reflection_probe_status = "Reflection Probe: failed to preserve previous DDS";
+            wi::backlog::post(reflection_probe_status);
+            return;
+        }
+    }
+    fs::rename(temp_path, final_path, ec);
+    if (ec)
+    {
+        std::error_code rollback_ec;
+        if (had_previous)
+            fs::rename(backup_path, final_path, rollback_ec);
+        fs::remove(temp_path, rollback_ec);
+        reflection_probe_bake_state = ReflectionProbeBakeState::Failed;
+        reflection_probe_status = "Reflection Probe: failed to commit DDS - " + ec.message();
+        wi::backlog::post(reflection_probe_status);
+        return;
+    }
+    if (had_previous)
+        fs::remove(backup_path, ec);
+
+    CreateEnvironmentProbeMipViews();
+    reflection_probe_bake_state = ReflectionProbeBakeState::Completed;
+    reflection_probe_status = "Reflection Probe: complete 128px, " +
+        std::to_string(probe->texture.GetDesc().mip_levels) + " mips -> " + reflection_probe_asset_path;
+    wi::backlog::post(reflection_probe_status);
 }
 
 void NewPipelineClientRenderPath::CancelLightmapBake()
@@ -1397,7 +1722,11 @@ const wi::graphics::Texture* NewPipelineClientRenderPath::GetDebugPreviewTexture
     case DebugPreviewMode::LocalAO:
         return local_ao_snapshot.IsValid() ? &local_ao_snapshot : nullptr;
     case DebugPreviewMode::LocalSpecularIndirect:
-        return nullptr; // Static environment probes are part of Final.
+        return local_specular_indirect.IsValid() ? &local_specular_indirect : nullptr;
+    case DebugPreviewMode::LocalReflectionProbe:
+        if (const wi::scene::EnvironmentProbeComponent* probe = local_scene.probes.GetComponent(environment_probe_entity))
+            return probe->texture.IsValid() ? &probe->texture : nullptr;
+        return nullptr;
     case DebugPreviewMode::LocalShadowVisibility:
         return nullptr; // Raster shadows live in the light shadow-map atlas.
     case DebugPreviewMode::RemoteIndirectDiffuse:
@@ -1478,12 +1807,18 @@ void NewPipelineClientRenderPath::Compose(wi::graphics::CommandList cmd) const
         fx.quality = wi::image::QUALITY_NEAREST;
         fx.sampleFlag = wi::image::SAMPLEMODE_CLAMP;
         fx.enableFullScreen();
+        if (debug_preview_mode == DebugPreviewMode::LocalReflectionProbe &&
+            reflection_probe_debug_mip < reflection_probe_mip_subresources.size())
+        {
+            fx.image_subresource = reflection_probe_mip_subresources[reflection_probe_debug_mip];
+        }
         if (debug_preview_mode == DebugPreviewMode::GBufferNormalXY)
             fx.color = XMFLOAT4(1.0f, 1.0f, 0.0f, 1.0f);
         else if (debug_preview_mode == DebugPreviewMode::GBufferRoughness)
             fx.color = XMFLOAT4(0.0f, 0.0f, 4.0f, 1.0f);
         else if (debug_preview_mode == DebugPreviewMode::LocalIndirectDiffuse ||
             debug_preview_mode == DebugPreviewMode::LocalSpecularIndirect ||
+            debug_preview_mode == DebugPreviewMode::LocalReflectionProbe ||
             debug_preview_mode == DebugPreviewMode::RemoteIndirectDiffuse ||
             debug_preview_mode == DebugPreviewMode::RemoteSpecularIndirect)
             fx.enableDebugTonemap();

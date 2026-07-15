@@ -88,6 +88,7 @@ enum class DebugPreviewMode : uint8_t
     TransportAO,
     TransportSpecularIndirect,
     TransportShadowVisibility,
+    LocalReflectionProbe,
 };
 
 struct RemoteFrameMetadata

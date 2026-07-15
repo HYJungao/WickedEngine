@@ -148,6 +148,7 @@ const char* ToString(DebugPreviewMode mode)
     case DebugPreviewMode::TransportAO: return "transport_ao";
     case DebugPreviewMode::TransportSpecularIndirect: return "transport_specular_indirect";
     case DebugPreviewMode::TransportShadowVisibility: return "transport_shadow_visibility";
+    case DebugPreviewMode::LocalReflectionProbe: return "local_reflection_probe";
     default: return "unknown";
     }
 }

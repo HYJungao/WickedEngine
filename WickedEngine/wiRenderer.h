@@ -439,6 +439,7 @@ namespace wi::renderer
 		wi::graphics::GPUBuffer binned_tiles;			 // material type binning
 		wi::graphics::Texture texture_normal_roughness;
 		const wi::graphics::Texture* texture_lightmap_irradiance = nullptr; // optional material-independent lightmap irradiance output
+		const wi::graphics::Texture* texture_specular_indirect = nullptr; // optional final indirect-specular contribution for debugging
 
 		// You can request any of these extra outputs to be written by VisibilityResolve:
 		const wi::graphics::Texture* depthbuffer = nullptr; // depth buffer that matches with post projection
@@ -452,6 +453,7 @@ namespace wi::renderer
 			binned_tiles = {};
 			texture_normal_roughness = {};
 			texture_lightmap_irradiance = nullptr;
+			texture_specular_indirect = nullptr;
 		}
 	};
 	void CreateVisibilityResourcesSimple(VisibilityResources& res, XMUINT2 resolution);

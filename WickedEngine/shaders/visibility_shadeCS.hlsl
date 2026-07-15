@@ -25,6 +25,7 @@
 struct VisibilityPushConstants
 {
 	uint global_tile_offset;
+	int specular_indirect_uav;
 };
 PUSHCONSTANT(push, VisibilityPushConstants);
 
@@ -107,6 +108,18 @@ void main(uint Gid : SV_GroupID, uint groupIndex : SV_GroupIndex)
 		surface.occlusion *= bindless_textures_half4[descriptor_index(camera.texture_ao_index)].SampleLevel(sampler_linear_clamp, surface.screenUV, 0).r;
 	}
 #endif // CARTOON
+
+	// Debug output is the exact environment/SSR/RT indirect-specular term that
+	// ApplyLighting contributes to Final, including material Fresnel, roughness
+	// and surface occlusion. Client disables SSR/RT, so this isolates its baked
+	// local probe (plus the normal global fallback at probe-volume edges).
+	[branch]
+	if (push.specular_indirect_uav >= 0)
+	{
+		RWTexture2D<float4> output_specular_indirect =
+			bindless_rwtextures[descriptor_index(push.specular_indirect_uav)];
+		output_specular_indirect[pixel] = float4(max(0, lighting.indirect.specular * surface.occlusion), 1);
+	}
 
 	half4 color = 0;
 
