@@ -1,6 +1,6 @@
 #pragma once
 
-#include "NewPipelineClientLightmap.h"
+#include "NewPipelineClientStaticLighting.h"
 #include "NewPipelineScene.h"
 #include "NewPipelineTransport.h"
 
@@ -55,7 +55,12 @@ public:
     void CancelLightmapBake();
     bool IsLightmapBakeActive() const;
     std::string GetLightmapBakeStatus() const;
+    void RequestStaticLightingBake();
+    void CancelStaticLightingBake();
+    bool IsStaticLightingBakeActive() const;
+    std::string GetStaticLightingBakeStatus() const;
     void RequestReflectionProbeBake();
+    void CancelReflectionProbeBake();
     bool IsReflectionProbeBakeActive() const;
     std::string GetReflectionProbeBakeStatus() const { return reflection_probe_status; }
     void SetReflectionProbeDebugMip(uint32_t mip);
@@ -87,8 +92,10 @@ private:
     void ApplyShadowSettings(bool log_changes);
     void ApplySSAOSettings(bool log_changes);
     void ApplyEnvironmentProbeSettings(bool log_changes);
+    void LoadStaticLightingAssets();
     void LoadEnvironmentProbeAsset();
     void InitializeBlackEnvironmentProbe(wi::scene::EnvironmentProbeComponent& probe);
+    void PlaceNewEnvironmentProbe(wi::scene::TransformComponent& transform) const;
     void CreateEnvironmentProbeMipViews();
     void UpdateReflectionProbeBake();
     void EnsureSpecularIndirectDebugTexture();
@@ -107,14 +114,6 @@ private:
     void ReloadSceneAfterLightmapBakeAbort();
 
     RuntimeConfig config;
-    struct SavedLightmap
-    {
-        wi::ecs::Entity entity = wi::ecs::INVALID_ENTITY;
-        uint32_t width = 0;
-        uint32_t height = 0;
-        wi::graphics::Texture texture;
-    };
-
     enum class LightmapBakeState : uint8_t
     {
         Idle,
@@ -137,11 +136,11 @@ private:
 
     NewPipelineClientRenderSettings render_settings;
     NewPipelineSunState sun_state = MakeSunStateFromAngles(true, -35.0f, 50.0f);
+    NewPipelineSunState baked_sun_state = MakeSunStateFromAngles(true, -35.0f, 50.0f);
     DebugPreviewMode debug_preview_mode = DebugPreviewMode::Final;
     wi::scene::Scene local_scene;
     wi::scene::CameraComponent local_camera;
-    wi::vector<SavedLightmap> saved_lightmaps;
-    ClientLightmapPackage client_lightmap_package;
+    ClientStaticLighting client_static_lighting;
     ClientLightmapBakeSettings lightmap_bake_settings;
     std::string scene_asset_path;
     wi::ecs::Entity scene_source_root_entity = wi::ecs::INVALID_ENTITY;
@@ -182,6 +181,8 @@ private:
     float webrtc_retry_accumulator = 0.0f;
     bool has_published_control_packet = false;
     bool scene_initialized = false;
+    bool baked_sun_reference_valid = false;
+    bool static_lighting_bake_requested = false;
     bool camera_control_start = true;
     bool input_active = true;
     mutable wi::graphics::Texture local_ao_snapshot;

@@ -28,13 +28,6 @@ constexpr uint32_t kMobileShadowCubeResolution = 512;
 constexpr uint32_t kMobileLightmapResolution = 256;
 constexpr uint32_t kClientReflectionProbeResolution = 128;
 
-std::string ClientReflectionProbePath(const std::string& scene_path)
-{
-    std::filesystem::path path(scene_path);
-    path.replace_extension(".clientprobe.dds");
-    return path.string();
-}
-
 uint64_t NowUsec()
 {
     using clock = std::chrono::steady_clock;
@@ -75,6 +68,12 @@ bool NearlyEqual(const XMFLOAT3& a, const XMFLOAT3& b, float epsilon = 0.0001f)
         NearlyEqual(a.z, b.z, epsilon);
 }
 
+bool SunMatches(const NewPipelineSunState& a, const NewPipelineSunState& b)
+{
+    return a.enabled == b.enabled && NearlyEqual(a.direction, b.direction) &&
+        NearlyEqual(a.color, b.color) && NearlyEqual(a.intensity, b.intensity);
+}
+
 std::string EnabledString(bool value)
 {
     return value ? "enabled" : "disabled";
@@ -103,10 +102,34 @@ void NewPipelineClientRenderPath::SetRuntimeConfig(const RuntimeConfig& value)
 
 void NewPipelineClientRenderPath::SetSunState(const NewPipelineSunState& value)
 {
+    if (IsStaticLightingBakeActive())
+    {
+        wi::backlog::post("Client sun change ignored while static lighting bake is active");
+        return;
+    }
     sun_state = value;
     sun_state.direction = NormalizeDirectionOrDefault(sun_state.direction);
     if (scene_initialized)
+    {
         ApplySunStateToScene(local_scene, sun_state);
+        if (baked_sun_reference_valid && !SunMatches(sun_state, baked_sun_state))
+        {
+            client_static_lighting.MarkStale("runtime sun differs from baked sun");
+            lightmap_bake_status = client_static_lighting.GetLightmapStatus();
+            reflection_probe_status = client_static_lighting.GetProbeStatus();
+            client_static_lighting.DisableLightmaps(local_scene);
+            if (wi::scene::EnvironmentProbeComponent* probe = local_scene.probes.GetComponent(environment_probe_entity))
+            {
+                InitializeBlackEnvironmentProbe(*probe);
+                CreateEnvironmentProbeMipViews();
+            }
+        }
+        else if (baked_sun_reference_valid && client_static_lighting.IsStale())
+        {
+            client_static_lighting.ClearStale();
+            LoadStaticLightingAssets();
+        }
+    }
 }
 
 void NewPipelineClientRenderPath::SetDebugPreviewMode(DebugPreviewMode mode)
@@ -129,8 +152,8 @@ std::string NewPipelineClientRenderPath::GetEffectiveAlgorithmSummary() const
 
 std::string NewPipelineClientRenderPath::GetDebugStatusSummary() const
 {
-    return GetEffectiveAlgorithmSummary() + "\n" + lightmap_bake_status + "\n" +
-        reflection_probe_status + "\nRemote decoded: " +
+    return GetEffectiveAlgorithmSummary() + "\n" + client_static_lighting.GetStatusSummary() +
+        "\nRemote decoded: " +
         (remote_consume.accepted_valid ? std::string{"available"} : std::string{"unavailable"}) +
         "\nRemote DDGI: frame " + std::to_string(remote_ddgi_frame_index) +
         (remote_consume.history_valid ? " converged" : " warming") +
@@ -386,11 +409,9 @@ void NewPipelineClientRenderPath::InitializeSceneIfNeeded()
     scene_source_root_entity = result.loaded_root_entity;
     if (!scene_asset_path.empty())
     {
-        const ClientLightmapPackageResult package_result = client_lightmap_package.Load(scene_asset_path, local_scene);
+        const ClientLightmapPackageResult package_result = client_static_lighting.LoadLightmaps(scene_asset_path, local_scene);
         wi::backlog::post(package_result.diagnostic);
-        lightmap_bake_status = package_result.success
-            ? "Lightmap: " + package_result.diagnostic
-            : "Lightmap: unavailable - " + package_result.diagnostic;
+        lightmap_bake_status = client_static_lighting.GetLightmapStatus();
     }
     else
     {
@@ -400,6 +421,10 @@ void NewPipelineClientRenderPath::InitializeSceneIfNeeded()
 
     scene_initialized = true;
     ApplyEnvironmentProbeSettings(false);
+    baked_sun_state = sun_state;
+    baked_sun_reference_valid =
+        client_static_lighting.GetLightmapState() == ClientLightingAssetState::Valid ||
+        client_static_lighting.GetProbeState() == ClientLightingAssetState::Valid;
 }
 
 void NewPipelineClientRenderPath::ApplyRenderSettings(bool log_changes)
@@ -469,12 +494,8 @@ void NewPipelineClientRenderPath::ApplyEnvironmentProbeSettings(bool log_changes
 
     if (!render_settings.environment_probe_enabled)
     {
-        if (environment_probe_entity != wi::ecs::INVALID_ENTITY)
-        {
-            local_scene.Entity_Remove(environment_probe_entity);
-            environment_probe_entity = wi::ecs::INVALID_ENTITY;
-            environment_probe_created_by_client = false;
-        }
+        if (wi::scene::EnvironmentProbeComponent* probe = local_scene.probes.GetComponent(environment_probe_entity))
+            InitializeBlackEnvironmentProbe(*probe);
         environment_probe_load_attempted = false;
         reflection_probe_mip_subresources.clear();
         if (log_changes)
@@ -486,17 +507,11 @@ void NewPipelineClientRenderPath::ApplyEnvironmentProbeSettings(bool log_changes
 
     if (environment_probe_entity == wi::ecs::INVALID_ENTITY)
     {
-        environment_probe_entity = local_scene.Entity_CreateEnvironmentProbe(kClientEnvironmentProbeName, XMFLOAT3(0.0f, 3.0f, 0.0f));
+        environment_probe_entity = local_scene.Entity_CreateEnvironmentProbe(kClientEnvironmentProbeName, XMFLOAT3(0, 0, 0));
         environment_probe_created_by_client = true;
         environment_probe_load_attempted = false;
-    }
-
-    if (wi::scene::TransformComponent* transform = local_scene.transforms.GetComponent(environment_probe_entity))
-    {
-        transform->ClearTransform();
-        transform->Translate(XMFLOAT3(0.0f, 3.0f, 0.0f));
-        transform->Scale(XMFLOAT3(18.0f, 8.0f, 18.0f));
-        transform->UpdateTransform();
+        if (wi::scene::TransformComponent* transform = local_scene.transforms.GetComponent(environment_probe_entity))
+            PlaceNewEnvironmentProbe(*transform);
     }
 
     if (!environment_probe_load_attempted && !IsReflectionProbeBakeActive())
@@ -506,6 +521,38 @@ void NewPipelineClientRenderPath::ApplyEnvironmentProbeSettings(bool log_changes
     {
         wi::backlog::post("Client baked environment probe: enabled; " + reflection_probe_status);
     }
+}
+
+void NewPipelineClientRenderPath::PlaceNewEnvironmentProbe(wi::scene::TransformComponent& transform) const
+{
+    wi::primitive::AABB bounds = local_scene.bounds;
+    if (!bounds.IsValid())
+    {
+        for (size_t i = 0; i < local_scene.objects.GetCount(); ++i)
+        {
+            const wi::scene::ObjectComponent& object = local_scene.objects[i];
+            const wi::scene::MeshComponent* mesh = local_scene.meshes.GetComponent(object.meshID);
+            const wi::scene::TransformComponent* object_transform =
+                local_scene.transforms.GetComponent(local_scene.objects.GetEntity(i));
+            if (mesh != nullptr && mesh->aabb.IsValid() && object_transform != nullptr)
+                bounds = wi::primitive::AABB::Merge(bounds, mesh->aabb.transform(object_transform->GetWorldMatrix()));
+        }
+    }
+
+    XMFLOAT3 center = {};
+    XMFLOAT3 half_width = XMFLOAT3(1, 1, 1);
+    if (bounds.IsValid())
+    {
+        center = bounds.getCenter();
+        half_width = bounds.getHalfWidth();
+        half_width.x = std::max(1.0f, half_width.x * 1.05f);
+        half_width.y = std::max(1.0f, half_width.y * 1.05f);
+        half_width.z = std::max(1.0f, half_width.z * 1.05f);
+    }
+    transform.ClearTransform();
+    transform.Translate(center);
+    transform.Scale(half_width);
+    transform.UpdateTransform();
 }
 
 void NewPipelineClientRenderPath::InitializeBlackEnvironmentProbe(wi::scene::EnvironmentProbeComponent& probe)
@@ -530,52 +577,64 @@ void NewPipelineClientRenderPath::LoadEnvironmentProbeAsset()
 {
     environment_probe_load_attempted = true;
     reflection_probe_mip_subresources.clear();
-    reflection_probe_asset_path = scene_asset_path.empty() ? std::string{} : ClientReflectionProbePath(scene_asset_path);
+    reflection_probe_asset_path = scene_asset_path.empty()
+        ? std::string{}
+        : ClientReflectionProbePackage::PackagePathForScene(scene_asset_path);
 
     wi::scene::EnvironmentProbeComponent* probe = local_scene.probes.GetComponent(environment_probe_entity);
     if (probe == nullptr)
     {
         reflection_probe_status = "Reflection Probe: unavailable (entity missing)";
+        client_static_lighting.SetProbeStatus(ClientLightingAssetState::Unavailable, reflection_probe_status);
         return;
     }
 
-    if (reflection_probe_asset_path.empty() || !wi::helper::FileExists(reflection_probe_asset_path))
+    if (reflection_probe_asset_path.empty())
     {
         InitializeBlackEnvironmentProbe(*probe);
-        reflection_probe_status = reflection_probe_asset_path.empty()
-            ? "Reflection Probe: unavailable (no persistent .wiscene)"
-            : "Reflection Probe: package missing; black fallback";
-        wi::backlog::post("Client Reflection Probe package missing: " + reflection_probe_asset_path);
+        reflection_probe_status = "Reflection Probe: UNAVAILABLE no persistent .wiscene";
+        client_static_lighting.SetProbeStatus(ClientLightingAssetState::Unavailable, reflection_probe_status);
         CreateEnvironmentProbeMipViews();
         return;
     }
 
-    probe->resource = {};
-    probe->texture = {};
-    probe->textureName = reflection_probe_asset_path;
-    probe->resolution = kClientReflectionProbeResolution;
+    const ClientReflectionProbeDescriptor descriptor = ClientReflectionProbePackage::Describe(
+        local_scene, environment_probe_entity, kClientReflectionProbeResolution);
+    ClientReflectionProbePackageResult load_result = client_static_lighting.LoadProbe(scene_asset_path, descriptor);
+    reflection_probe_status = load_result.diagnostic;
+    if (!load_result.success)
+    {
+        InitializeBlackEnvironmentProbe(*probe);
+        wi::backlog::post(load_result.diagnostic + "; black fallback");
+        CreateEnvironmentProbeMipViews();
+        return;
+    }
+
+    probe->resource = load_result.resource;
+    probe->texture = load_result.resource.GetTexture();
+    probe->textureName.clear();
+    probe->resolution = descriptor.resolution;
     probe->SetRealTime(false);
-    probe->CreateRenderData();
-    const bool valid_cube = probe->resource.IsValid() && probe->texture.IsValid() &&
-        has_flag(probe->texture.GetDesc().misc_flags, wi::graphics::ResourceMiscFlag::TEXTURECUBE) &&
-        probe->texture.GetDesc().array_size >= 6;
-    if (!valid_cube)
-    {
-        InitializeBlackEnvironmentProbe(*probe);
-        reflection_probe_status = "Reflection Probe: invalid DDS; black fallback";
-        wi::backlog::post("Client Reflection Probe package invalid: " + reflection_probe_asset_path);
-        CreateEnvironmentProbeMipViews();
-        return;
-    }
-
     probe->SetDirty(false);
     probe->render_dirty = false;
     probe->first_render = false;
     CreateEnvironmentProbeMipViews();
-    reflection_probe_status = "Reflection Probe: loaded " +
-        std::to_string(probe->texture.GetDesc().width) + "px, " +
-        std::to_string(probe->texture.GetDesc().mip_levels) + " mips";
-    wi::backlog::post("Client Reflection Probe loaded: " + reflection_probe_asset_path);
+    wi::backlog::post(load_result.diagnostic + " -> " + reflection_probe_asset_path);
+}
+
+void NewPipelineClientRenderPath::LoadStaticLightingAssets()
+{
+    if (scene_asset_path.empty())
+        return;
+    const ClientLightmapPackageResult lightmap_result =
+        client_static_lighting.LoadLightmaps(scene_asset_path, local_scene);
+    lightmap_bake_status = client_static_lighting.GetLightmapStatus();
+    wi::backlog::post(lightmap_result.diagnostic);
+    environment_probe_load_attempted = false;
+    if (render_settings.environment_probe_enabled)
+        LoadEnvironmentProbeAsset();
+    if (!render_settings.baked_lightmaps_enabled)
+        client_static_lighting.DisableLightmaps(local_scene);
 }
 
 void NewPipelineClientRenderPath::CreateEnvironmentProbeMipViews()
@@ -620,7 +679,7 @@ void NewPipelineClientRenderPath::ApplyBakedLightmapSettings(bool previous_enabl
         return;
 
     const bool changed = previous_enabled != render_settings.baked_lightmaps_enabled;
-    if (changed && render_settings.baked_lightmaps_enabled)
+    if (changed && render_settings.baked_lightmaps_enabled && !client_static_lighting.IsStale())
     {
         RestoreBakedLightmaps();
     }
@@ -637,42 +696,12 @@ void NewPipelineClientRenderPath::ApplyBakedLightmapSettings(bool previous_enabl
 
 void NewPipelineClientRenderPath::DisableBakedLightmaps()
 {
-    saved_lightmaps.clear();
-    for (size_t i = 0; i < local_scene.objects.GetCount(); ++i)
-    {
-        wi::scene::ObjectComponent& object = local_scene.objects[i];
-        if (object.lightmap.IsValid())
-        {
-            SavedLightmap saved;
-            saved.entity = local_scene.objects.GetEntity(i);
-            saved.width = object.lightmapWidth;
-            saved.height = object.lightmapHeight;
-            saved.texture = object.lightmap;
-            saved_lightmaps.push_back(std::move(saved));
-        }
-
-        object.SetLightmapRenderRequest(false);
-        object.lightmap = {};
-        object.lightmap_render = {};
-        object.lightmapTextureData.clear();
-    }
+    client_static_lighting.DisableLightmaps(local_scene);
 }
 
 void NewPipelineClientRenderPath::RestoreBakedLightmaps()
 {
-    for (const SavedLightmap& saved : saved_lightmaps)
-    {
-        wi::scene::ObjectComponent* object = local_scene.objects.GetComponent(saved.entity);
-        if (object == nullptr)
-            continue;
-
-        object->lightmapWidth = saved.width;
-        object->lightmapHeight = saved.height;
-        object->lightmapTextureData.clear();
-        object->lightmap = saved.texture;
-        object->lightmap_render = {};
-    }
-    saved_lightmaps.clear();
+    client_static_lighting.RestoreLightmaps(local_scene);
 }
 
 bool NewPipelineClientRenderPath::ObjectSupportsLightmapBake(const wi::scene::ObjectComponent& object) const
@@ -693,6 +722,42 @@ bool NewPipelineClientRenderPath::ObjectSupportsLightmapBake(const wi::scene::Ob
     return true;
 }
 
+void NewPipelineClientRenderPath::RequestStaticLightingBake()
+{
+    if (IsStaticLightingBakeActive())
+    {
+        wi::backlog::post("Client static lighting request ignored: a bake is already active");
+        return;
+    }
+    static_lighting_bake_requested = true;
+    RequestLightmapBake();
+    if (!IsLightmapBakeActive())
+        static_lighting_bake_requested = false;
+}
+
+void NewPipelineClientRenderPath::CancelStaticLightingBake()
+{
+    static_lighting_bake_requested = false;
+    if (IsLightmapBakeActive())
+        CancelLightmapBake();
+    else if (IsReflectionProbeBakeActive())
+        CancelReflectionProbeBake();
+}
+
+bool NewPipelineClientRenderPath::IsStaticLightingBakeActive() const
+{
+    return static_lighting_bake_requested || IsLightmapBakeActive() || IsReflectionProbeBakeActive();
+}
+
+std::string NewPipelineClientRenderPath::GetStaticLightingBakeStatus() const
+{
+    if (static_lighting_bake_requested && IsLightmapBakeActive())
+        return "Client Lighting 1/2 - " + lightmap_bake_status;
+    if (static_lighting_bake_requested && IsReflectionProbeBakeActive())
+        return "Client Lighting 2/2 - " + reflection_probe_status;
+    return client_static_lighting.GetStatusSummary();
+}
+
 void NewPipelineClientRenderPath::RequestLightmapBake()
 {
     if (IsLightmapBakeActive())
@@ -709,16 +774,20 @@ void NewPipelineClientRenderPath::RequestLightmapBake()
     {
         render_settings.lightmap_bake_requested = false;
         lightmap_bake_state = LightmapBakeState::Failed;
-        lightmap_bake_status = "Lightmap: unavailable (no persistent .wiscene)";
+        lightmap_bake_status = "Lightmap: UNAVAILABLE no persistent .wiscene";
+        client_static_lighting.SetLightmapStatus(ClientLightingAssetState::Unavailable, lightmap_bake_status);
         wi::backlog::post(lightmap_bake_status);
         return;
     }
+    if (environment_probe_entity != wi::ecs::INVALID_ENTITY)
+        ClientReflectionProbePackage::EnsureProbeId(local_scene, environment_probe_entity);
     render_settings.baked_lightmaps_enabled = true;
     render_settings.lightmap_bake_requested = true;
     previous_raytrace_bounce_count = wi::renderer::GetRaytraceBounceCount();
     lightmap_cancel_requested = false;
     lightmap_bake_state = LightmapBakeState::Preparing;
     lightmap_bake_status = "Lightmap: preparing atlas and scene metadata";
+    client_static_lighting.SetLightmapStatus(ClientLightingAssetState::Baking, lightmap_bake_status);
     wi::backlog::post("Client lightmap bake requested: " + scene_asset_path);
 }
 
@@ -736,8 +805,10 @@ void NewPipelineClientRenderPath::RequestReflectionProbeBake()
     }
     if (!scene_initialized || scene_asset_path.empty())
     {
+        static_lighting_bake_requested = false;
         reflection_probe_bake_state = ReflectionProbeBakeState::Failed;
-        reflection_probe_status = "Reflection Probe: unavailable (no persistent .wiscene)";
+        reflection_probe_status = "Reflection Probe: UNAVAILABLE no persistent .wiscene";
+        client_static_lighting.SetProbeStatus(ClientLightingAssetState::Unavailable, reflection_probe_status);
         wi::backlog::post(reflection_probe_status);
         return;
     }
@@ -748,8 +819,20 @@ void NewPipelineClientRenderPath::RequestReflectionProbeBake()
     wi::scene::EnvironmentProbeComponent* probe = local_scene.probes.GetComponent(environment_probe_entity);
     if (probe == nullptr)
     {
+        static_lighting_bake_requested = false;
         reflection_probe_bake_state = ReflectionProbeBakeState::Failed;
         reflection_probe_status = "Reflection Probe: failed (entity unavailable)";
+        client_static_lighting.SetProbeStatus(ClientLightingAssetState::Unavailable, reflection_probe_status);
+        wi::backlog::post(reflection_probe_status);
+        return;
+    }
+    if (ClientReflectionProbePackage::GetProbeId(local_scene, environment_probe_entity).empty())
+    {
+        static_lighting_bake_requested = false;
+        reflection_probe_bake_state = ReflectionProbeBakeState::Failed;
+        reflection_probe_status =
+            "Reflection Probe: STALE placement is not persisted; run Generate Client Lighting";
+        client_static_lighting.SetProbeStatus(ClientLightingAssetState::Stale, reflection_probe_status);
         wi::backlog::post(reflection_probe_status);
         return;
     }
@@ -769,10 +852,23 @@ void NewPipelineClientRenderPath::RequestReflectionProbeBake()
 
     environment_probe_load_attempted = true;
     reflection_probe_mip_subresources.clear();
-    reflection_probe_asset_path = ClientReflectionProbePath(scene_asset_path);
+    reflection_probe_asset_path = ClientReflectionProbePackage::PackagePathForScene(scene_asset_path);
     reflection_probe_bake_state = ReflectionProbeBakeState::Capturing;
     reflection_probe_status = "Reflection Probe: capturing 128px BC6H cubemap";
+    client_static_lighting.SetProbeStatus(ClientLightingAssetState::Baking, reflection_probe_status);
     wi::backlog::post("Client Reflection Probe bake requested: " + reflection_probe_asset_path);
+}
+
+void NewPipelineClientRenderPath::CancelReflectionProbeBake()
+{
+    if (!IsReflectionProbeBakeActive())
+        return;
+    const std::string cancellation = "Reflection Probe: cancelled; previous package preserved";
+    reflection_probe_bake_state = ReflectionProbeBakeState::Failed;
+    environment_probe_load_attempted = false;
+    LoadEnvironmentProbeAsset();
+    reflection_probe_status = cancellation;
+    wi::backlog::post(reflection_probe_status);
 }
 
 bool NewPipelineClientRenderPath::IsReflectionProbeBakeActive() const
@@ -791,6 +887,8 @@ void NewPipelineClientRenderPath::UpdateReflectionProbeBake()
     {
         reflection_probe_bake_state = ReflectionProbeBakeState::Failed;
         reflection_probe_status = "Reflection Probe: failed (entity disappeared)";
+        client_static_lighting.SetProbeStatus(ClientLightingAssetState::Corrupt, reflection_probe_status);
+        static_lighting_bake_requested = false;
         wi::backlog::post(reflection_probe_status);
         return;
     }
@@ -800,65 +898,61 @@ void NewPipelineClientRenderPath::UpdateReflectionProbeBake()
         probe->texture.GetDesc().format != wi::graphics::Format::BC6H_UF16 ||
         !has_flag(probe->texture.GetDesc().misc_flags, wi::graphics::ResourceMiscFlag::TEXTURECUBE))
     {
+        const std::string failure = "Reflection Probe: failed (capture texture is not BC6H cubemap)";
         reflection_probe_bake_state = ReflectionProbeBakeState::Failed;
-        reflection_probe_status = "Reflection Probe: failed (capture texture is not BC6H cubemap)";
+        static_lighting_bake_requested = false;
+        environment_probe_load_attempted = false;
+        LoadEnvironmentProbeAsset();
+        reflection_probe_status = failure;
         wi::backlog::post(reflection_probe_status);
         return;
     }
 
     reflection_probe_bake_state = ReflectionProbeBakeState::Saving;
-    reflection_probe_status = "Reflection Probe: saving external DDS";
-    namespace fs = std::filesystem;
-    const fs::path final_path(reflection_probe_asset_path);
-    const fs::path temp_path(final_path.parent_path() /
-        (final_path.stem().string() + ".tmp" + final_path.extension().string()));
-    const fs::path backup_path(final_path.string() + ".backup");
-    std::error_code ec;
-    fs::remove(temp_path, ec);
-    ec.clear();
-    if (!wi::helper::saveTextureToFile(probe->texture, temp_path.string()))
+    reflection_probe_status = "Reflection Probe: saving validated .clientprobe package";
+    client_static_lighting.SetProbeStatus(ClientLightingAssetState::Baking, reflection_probe_status);
+    const ClientReflectionProbeDescriptor descriptor = ClientReflectionProbePackage::Describe(
+        local_scene, environment_probe_entity, kClientReflectionProbeResolution);
+    std::string error;
+    if (!client_static_lighting.ProbePackage().Save(scene_asset_path, descriptor, probe->texture, error))
     {
+        const std::string failure = "Reflection Probe: failed - " + error;
         reflection_probe_bake_state = ReflectionProbeBakeState::Failed;
-        reflection_probe_status = "Reflection Probe: failed (DDS save failed)";
+        static_lighting_bake_requested = false;
+        environment_probe_load_attempted = false;
+        LoadEnvironmentProbeAsset();
+        reflection_probe_status = failure;
         wi::backlog::post(reflection_probe_status);
         return;
     }
 
-    fs::remove(backup_path, ec);
-    ec.clear();
-    const bool had_previous = fs::exists(final_path, ec) && !ec;
-    ec.clear();
-    if (had_previous)
+    ClientReflectionProbePackageResult verify_result =
+        client_static_lighting.LoadProbe(scene_asset_path, descriptor);
+    if (!verify_result.success)
     {
-        fs::rename(final_path, backup_path, ec);
-        if (ec)
-        {
-            fs::remove(temp_path, ec);
-            reflection_probe_bake_state = ReflectionProbeBakeState::Failed;
-            reflection_probe_status = "Reflection Probe: failed to preserve previous DDS";
-            wi::backlog::post(reflection_probe_status);
-            return;
-        }
-    }
-    fs::rename(temp_path, final_path, ec);
-    if (ec)
-    {
-        std::error_code rollback_ec;
-        if (had_previous)
-            fs::rename(backup_path, final_path, rollback_ec);
-        fs::remove(temp_path, rollback_ec);
         reflection_probe_bake_state = ReflectionProbeBakeState::Failed;
-        reflection_probe_status = "Reflection Probe: failed to commit DDS - " + ec.message();
+        reflection_probe_status =
+            "Reflection Probe: committed but reload verification failed - " + verify_result.diagnostic;
+        client_static_lighting.SetProbeStatus(ClientLightingAssetState::Corrupt, reflection_probe_status);
+        static_lighting_bake_requested = false;
         wi::backlog::post(reflection_probe_status);
         return;
     }
-    if (had_previous)
-        fs::remove(backup_path, ec);
-
+    probe->resource = verify_result.resource;
+    probe->texture = verify_result.resource.GetTexture();
+    probe->textureName.clear();
+    probe->SetDirty(false);
+    probe->render_dirty = false;
+    probe->first_render = false;
     CreateEnvironmentProbeMipViews();
     reflection_probe_bake_state = ReflectionProbeBakeState::Completed;
-    reflection_probe_status = "Reflection Probe: complete 128px, " +
+    reflection_probe_status = "Reflection Probe: VALID 128px, " +
         std::to_string(probe->texture.GetDesc().mip_levels) + " mips -> " + reflection_probe_asset_path;
+    client_static_lighting.SetProbeStatus(ClientLightingAssetState::Valid, reflection_probe_status);
+    client_static_lighting.ClearStale();
+    baked_sun_state = sun_state;
+    baked_sun_reference_valid = true;
+    static_lighting_bake_requested = false;
     wi::backlog::post(reflection_probe_status);
 }
 
@@ -905,13 +999,12 @@ bool NewPipelineClientRenderPath::SavePreparedScene(const std::string& path, std
         scene_source_root_entity = wi::ecs::INVALID_ENTITY;
     }
 
-    const bool recreate_client_probe = environment_probe_created_by_client &&
-        environment_probe_entity != wi::ecs::INVALID_ENTITY;
-    if (recreate_client_probe)
+    // Persist the authored/generated probe entity, placement and stable ID in
+    // the single canonical scene. The large BC6H cubemap remains external.
+    if (wi::scene::EnvironmentProbeComponent* probe =
+        local_scene.probes.GetComponent(environment_probe_entity))
     {
-        local_scene.Entity_Remove(environment_probe_entity);
-        environment_probe_entity = wi::ecs::INVALID_ENTITY;
-        environment_probe_created_by_client = false;
+        probe->textureName.clear();
     }
 
     {
@@ -919,8 +1012,6 @@ bool NewPipelineClientRenderPath::SavePreparedScene(const std::string& path, std
         if (!archive.IsOpen())
         {
             error = "cannot create prepared scene archive: " + path;
-            if (recreate_client_probe)
-                ApplyEnvironmentProbeSettings(false);
             return false;
         }
         local_scene.Serialize(archive);
@@ -932,8 +1023,6 @@ bool NewPipelineClientRenderPath::SavePreparedScene(const std::string& path, std
         // that case (FAST_FAIL_INVALID_ARG).
     }
 
-    if (recreate_client_probe)
-        ApplyEnvironmentProbeSettings(false);
     if (!wi::helper::FileExists(path))
     {
         error = "prepared scene archive was not written: " + path;
@@ -1098,6 +1187,7 @@ void NewPipelineClientRenderPath::UpdateLightmapBake()
         active_lightmap_bake_entity = wi::ecs::INVALID_ENTITY;
         lightmap_bake_state = LightmapBakeState::Cancelled;
         lightmap_bake_status = "Lightmap: cancelled; original scene/package preserved";
+        static_lighting_bake_requested = false;
         lightmap_cancel_requested = false;
         wi::backlog::post(lightmap_bake_status);
         return;
@@ -1200,7 +1290,7 @@ void NewPipelineClientRenderPath::FinishLightmapBake()
     lightmap_bake_state = LightmapBakeState::Saving;
     lightmap_bake_status = "Lightmap: saving external package";
     std::string error;
-    if (!client_lightmap_package.Save(
+    if (!client_static_lighting.LightmapPackage().Save(
         prepared_package_temp_path,
         prepared_scene_hash,
         local_scene,
@@ -1221,7 +1311,8 @@ void NewPipelineClientRenderPath::FinishLightmapBake()
     // replaces the transient accumulation textures with the committed BC6H
     // package and catches hash, object-ID, CRC and GPU upload failures now
     // instead of only after the next process launch.
-    const ClientLightmapPackageResult load_result = client_lightmap_package.Load(scene_asset_path, local_scene);
+    const ClientLightmapPackageResult load_result =
+        client_static_lighting.LoadLightmaps(scene_asset_path, local_scene);
     if (!load_result.success || load_result.loaded_count != lightmap_bake_completed.size())
     {
         wi::renderer::SetRaytraceBounceCount(previous_raytrace_bounce_count);
@@ -1229,6 +1320,8 @@ void NewPipelineClientRenderPath::FinishLightmapBake()
         active_lightmap_bake_entity = wi::ecs::INVALID_ENTITY;
         lightmap_bake_state = LightmapBakeState::Failed;
         lightmap_bake_status = "Lightmap: committed but reload verification failed - " + load_result.diagnostic;
+        client_static_lighting.SetLightmapStatus(ClientLightingAssetState::Corrupt, lightmap_bake_status);
+        static_lighting_bake_requested = false;
         wi::backlog::post(lightmap_bake_status);
         return;
     }
@@ -1238,9 +1331,30 @@ void NewPipelineClientRenderPath::FinishLightmapBake()
     lightmap_bake_status = "Lightmap: complete and reload-verified " +
         std::to_string(load_result.loaded_count) + " objects -> " +
         ClientLightmapPackage::PackagePathForScene(scene_asset_path);
+    client_static_lighting.SetLightmapStatus(ClientLightingAssetState::Valid, lightmap_bake_status);
+    environment_probe_created_by_client = false;
+    client_static_lighting.ClearStale();
+    baked_sun_state = sun_state;
+    baked_sun_reference_valid = true;
     prepared_scene_temp_path.clear();
     prepared_package_temp_path.clear();
     wi::backlog::post(lightmap_bake_status);
+    if (static_lighting_bake_requested)
+    {
+        // The lightmap commit also persisted the probe ID and placement. The
+        // following capture is therefore validated against the final scene.
+        if (wi::scene::EnvironmentProbeComponent* probe = local_scene.probes.GetComponent(environment_probe_entity))
+            InitializeBlackEnvironmentProbe(*probe);
+        RequestReflectionProbeBake();
+    }
+    else
+    {
+        client_static_lighting.SetProbeStatus(
+            ClientLightingAssetState::Stale,
+            "Reflection Probe: STALE scene changed; regenerate Client Lighting");
+        if (wi::scene::EnvironmentProbeComponent* probe = local_scene.probes.GetComponent(environment_probe_entity))
+            InitializeBlackEnvironmentProbe(*probe);
+    }
 }
 
 void NewPipelineClientRenderPath::FailLightmapBake(const std::string& reason)
@@ -1254,6 +1368,7 @@ void NewPipelineClientRenderPath::FailLightmapBake(const std::string& reason)
     active_lightmap_bake_entity = wi::ecs::INVALID_ENTITY;
     lightmap_bake_state = LightmapBakeState::Failed;
     lightmap_bake_status = "Lightmap: failed - " + reason;
+    static_lighting_bake_requested = false;
     wi::backlog::post(lightmap_bake_status);
 }
 
@@ -1278,9 +1393,20 @@ void NewPipelineClientRenderPath::ReloadSceneAfterLightmapBakeAbort()
         scene_asset_path = result.loaded_asset_path;
     scene_source_root_entity = result.loaded_root_entity;
     ApplySunStateToScene(local_scene, sun_state);
-    const ClientLightmapPackageResult package_result = client_lightmap_package.Load(scene_asset_path, local_scene);
+    const ClientLightmapPackageResult package_result =
+        client_static_lighting.LoadLightmaps(scene_asset_path, local_scene);
     wi::backlog::post(package_result.diagnostic);
+    lightmap_bake_status = client_static_lighting.GetLightmapStatus();
     ApplyEnvironmentProbeSettings(false);
+    if (baked_sun_reference_valid && !SunMatches(sun_state, baked_sun_state))
+    {
+        client_static_lighting.MarkStale("runtime sun differs from baked sun");
+        lightmap_bake_status = client_static_lighting.GetLightmapStatus();
+        reflection_probe_status = client_static_lighting.GetProbeStatus();
+        client_static_lighting.DisableLightmaps(local_scene);
+        if (wi::scene::EnvironmentProbeComponent* probe = local_scene.probes.GetComponent(environment_probe_entity))
+            InitializeBlackEnvironmentProbe(*probe);
+    }
 }
 
 void NewPipelineClientRenderPath::UpdateLocalCamera(float dt)

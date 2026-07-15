@@ -115,13 +115,35 @@ FNV-1a hash, entry bounds, and per-entry CRC before assigning GPU textures. A
 missing, stale, truncated, or corrupt package is logged once and leaves the
 lightmap contribution black. CPU package bytes are released after upload.
 
-The Client debug window's `Generate Lightmap` button is the only authoring
-entry point. It generates missing atlas UVs with xatlas, assigns stable object
+The Client debug window's recommended `Generate Client Lighting` entry point
+persists the Client probe placement, generates missing atlas UVs with xatlas, assigns stable object
 IDs, serializes a lightmap-free scene to a temporary file, and then bakes static
 opaque objects sequentially at 256-pixel target resolution, 512 samples, and
 three bounces. Completion writes BC6H data to a temporary package and commits
-the scene/package pair with rollback backups. `Cancel` or any failure preserves
-the original files and reloads the original scene/package.
+the scene/package pair with rollback backups. It then captures and reload-verifies
+the Reflection Probe. The individual Lightmap and Probe buttons remain available
+for diagnostics. `Cancel Bake` or any failure preserves the previous files.
+
+## Client reflection probe asset
+
+The canonical scene contains the Client probe entity, its transform/volume and
+the stable `newpipeline.client_probe_id`. The BC6H cubemap is stored in one sibling
+`<scene>.clientprobe` package. Its header validates the full source-scene hash,
+probe ID, placement, resolution, mip count and payload CRC before loading the DDS
+payload from memory. The former raw `.clientprobe.dds` format is not loaded and is
+deleted after the next successful probe bake; there is no parallel legacy/r2 path.
+
+An authored `NewPipelineEnvironmentProbe` keeps its scene transform. If it is
+missing, Generate Client Lighting creates a probe from the scene bounds and saves
+that entity into the same canonical `.wiscene`. Normal startup never creates IDs,
+modifies the scene or captures a probe. Missing, corrupt and stale packages use a
+black fallback and expose `MISSING`, `CORRUPT` or `STALE` in the Client panel.
+
+Lightmaps and the Reflection Probe share the `ClientStaticLighting` asset-state
+service. Changing the runtime sun away from the baked sun marks both contributions
+`STALE` and disables them instead of combining mismatched static and realtime
+lighting. Returning to the baked sun reloads the validated packages. Sun controls
+are locked while a static-lighting bake is active.
 
 ## Remote video V2
 

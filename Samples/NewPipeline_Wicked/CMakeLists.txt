@@ -125,6 +125,8 @@ newpipeline_wicked_add_windows_target(
 target_sources(NewPipeline_Wicked_Client PRIVATE
     NewPipelineClientLightmap.cpp
     NewPipelineClientLightmap.h
+    NewPipelineClientStaticLighting.cpp
+    NewPipelineClientStaticLighting.h
     "${WICKED_ROOT_DIR}/Editor/xatlas.cpp"
     "${WICKED_ROOT_DIR}/Editor/xatlas.h")
 
