@@ -44,6 +44,16 @@ void main(uint3 DTid : SV_DispatchThreadID, uint groupIndex : SV_GroupIndex)
 	bvhprim.packed_prim = prim.pack2();
 	bvhprim.flags = 0;
 	bvhprim.flags |= inst.layerMask & 0xFF;
+	if (geometry.flags & SHADERMESH_FLAG_EMITTEDPARTICLE)
+	{
+		bvhprim.flags &= ~BVH_PRIMITIVE_MASK_LIGHTMAP;
+	}
+	else
+	{
+		// This is independent of authored render layers: all visible static
+		// geometry participates when the baker traces with the lightmap mask.
+		bvhprim.flags |= BVH_PRIMITIVE_MASK_LIGHTMAP;
+	}
 	if (geometry.flags & SHADERMESH_FLAG_DOUBLE_SIDED)
 	{
 		bvhprim.flags |= BVH_PRIMITIVE_FLAG_DOUBLE_SIDED;

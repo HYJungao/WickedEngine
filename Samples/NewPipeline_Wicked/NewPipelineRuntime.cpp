@@ -143,12 +143,16 @@ const char* ToString(DebugPreviewMode mode)
     case DebugPreviewMode::RemoteAO: return "remote_ao";
     case DebugPreviewMode::RemoteSpecularIndirect: return "remote_specular_indirect";
     case DebugPreviewMode::RemoteShadowVisibility: return "remote_shadow_visibility";
+    case DebugPreviewMode::ElasticIndirectDiffuse: return "elastic_indirect_diffuse";
+    case DebugPreviewMode::ElasticAO: return "elastic_ao";
     case DebugPreviewMode::RemoteOverview: return "remote_overview";
     case DebugPreviewMode::TransportIndirectDiffuse: return "transport_indirect_diffuse";
     case DebugPreviewMode::TransportAO: return "transport_ao";
     case DebugPreviewMode::TransportSpecularIndirect: return "transport_specular_indirect";
     case DebugPreviewMode::TransportShadowVisibility: return "transport_shadow_visibility";
     case DebugPreviewMode::LocalReflectionProbe: return "local_reflection_probe";
+    case DebugPreviewMode::LocalLightmapValidity: return "local_lightmap_validity";
+    case DebugPreviewMode::LocalIndirectFinalInput: return "local_indirect_final_input";
     default: return "unknown";
     }
 }

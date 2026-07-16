@@ -11280,7 +11280,7 @@ void RefreshLightmaps(const Scene& scene, CommandList cmd)
 			cb.xTracePixelOffset.y = (halton.y * 2 - 1) * cb.xTraceResolution_rcp.y;
 			cb.xTracePixelOffset.x *= 1.4f;	// boost the jitter by a bit
 			cb.xTracePixelOffset.y *= 1.4f;	// boost the jitter by a bit
-			uint8_t instanceInclusionMask = 0xFF;
+			uint8_t instanceInclusionMask = raytracing_inclusion_mask_lightmap;
 			cb.xTraceUserData.y = instanceInclusionMask;
 			cb.xTraceSampleIndex = object.lightmapIterationCount;
 			device->BindDynamicConstantBuffer(cb, CB_GETBINDSLOT(RaytracingCB), cmd);
@@ -12006,6 +12006,17 @@ void Visibility_Surface(
 		device->Barrier(GPUBarrier::Memory(res.texture_lightmap_irradiance), cmd);
 		lightmap_irradiance_uav = device->GetDescriptorIndex(res.texture_lightmap_irradiance, SubresourceType::UAV);
 	}
+	int lightmap_validity_uav = -1;
+	if (res.texture_lightmap_validity != nullptr && res.texture_lightmap_validity->IsValid())
+	{
+		device->Barrier(GPUBarrier::Image(
+			res.texture_lightmap_validity,
+			res.texture_lightmap_validity->desc.layout,
+			ResourceState::UNORDERED_ACCESS), cmd);
+		device->ClearUAV(res.texture_lightmap_validity, 0, cmd);
+		device->Barrier(GPUBarrier::Memory(res.texture_lightmap_validity), cmd);
+		lightmap_validity_uav = device->GetDescriptorIndex(res.texture_lightmap_validity, SubresourceType::UAV);
+	}
 
 	device->BindResource(&res.binned_tiles, 0, cmd);
 	device->BindUAV(&res.texture_normal_roughness, 0, cmd);
@@ -12015,16 +12026,20 @@ void Visibility_Surface(
 	{
 		uint32_t global_tile_offset;
 		int32_t lightmap_irradiance_uav;
+		int32_t lightmap_validity_uav;
 	};
 	VisibilitySurfacePushConstants push = {};
 	push.lightmap_irradiance_uav = lightmap_irradiance_uav;
+	push.lightmap_validity_uav = lightmap_validity_uav;
+	const bool surface_diagnostics_requested = lightmap_irradiance_uav >= 0 || lightmap_validity_uav >= 0;
 	uint64_t bins_offset = 0;
 
 	// surface dispatches per material type:
 	device->EventBegin("Surface parameters UNIFORM", cmd);
 	for (uint i = 0; i < MaterialComponent::SHADERTYPE_COUNT; ++i)
 	{
-		if (i != MaterialComponent::SHADERTYPE_UNLIT && i != MaterialComponent::SHADERTYPE_INTERIORMAPPING) // these shaders are special, they don't use normals or roughness based post processing
+		if (surface_diagnostics_requested ||
+			(i != MaterialComponent::SHADERTYPE_UNLIT && i != MaterialComponent::SHADERTYPE_INTERIORMAPPING)) // special types skip normal output unless diagnostics need surface classification
 		{
 			device->BindComputeShader(&shaders[CSTYPE_VISIBILITY_SURFACE_UNIFORM_PERMUTATION_BEGIN + i], cmd);
 			device->PushConstants(&push, sizeof(push), cmd);
@@ -12038,7 +12053,8 @@ void Visibility_Surface(
 	device->EventBegin("Surface parameters DIVERGENT", cmd);
 	for (uint i = 0; i < MaterialComponent::SHADERTYPE_COUNT; ++i)
 	{
-		if (i != MaterialComponent::SHADERTYPE_UNLIT && i != MaterialComponent::SHADERTYPE_INTERIORMAPPING) // these shaders are special, they don't use normals or roughness based post processing
+		if (surface_diagnostics_requested ||
+			(i != MaterialComponent::SHADERTYPE_UNLIT && i != MaterialComponent::SHADERTYPE_INTERIORMAPPING)) // special types skip normal output unless diagnostics need surface classification
 		{
 			device->BindComputeShader(&shaders[CSTYPE_VISIBILITY_SURFACE_DIVERGENT_PERMUTATION_BEGIN + i], cmd);
 			device->PushConstants(&push, sizeof(push), cmd);
@@ -12058,6 +12074,13 @@ void Visibility_Surface(
 			res.texture_lightmap_irradiance,
 			ResourceState::UNORDERED_ACCESS,
 			res.texture_lightmap_irradiance->desc.layout), cmd);
+	}
+	if (res.texture_lightmap_validity != nullptr && res.texture_lightmap_validity->IsValid())
+	{
+		device->Barrier(GPUBarrier::Image(
+			res.texture_lightmap_validity,
+			ResourceState::UNORDERED_ACCESS,
+			res.texture_lightmap_validity->desc.layout), cmd);
 	}
 
 	wi::profiler::EndRange(range);
@@ -12091,15 +12114,73 @@ void Visibility_Shade(
 		device->Barrier(GPUBarrier::Memory(res.texture_specular_indirect), cmd);
 		specular_indirect_uav = device->GetDescriptorIndex(res.texture_specular_indirect, SubresourceType::UAV);
 	}
+	int local_indirect_diffuse_uav = -1;
+	if (res.texture_local_indirect_diffuse != nullptr && res.texture_local_indirect_diffuse->IsValid())
+	{
+		device->Barrier(GPUBarrier::Image(
+			res.texture_local_indirect_diffuse,
+			res.texture_local_indirect_diffuse->desc.layout,
+			ResourceState::UNORDERED_ACCESS), cmd);
+		device->ClearUAV(res.texture_local_indirect_diffuse, 0, cmd);
+		device->Barrier(GPUBarrier::Memory(res.texture_local_indirect_diffuse), cmd);
+		local_indirect_diffuse_uav = device->GetDescriptorIndex(res.texture_local_indirect_diffuse, SubresourceType::UAV);
+	}
+	int elastic_indirect_diffuse_uav = -1;
+	if (res.texture_elastic_indirect_diffuse != nullptr && res.texture_elastic_indirect_diffuse->IsValid())
+	{
+		device->Barrier(GPUBarrier::Image(
+			res.texture_elastic_indirect_diffuse,
+			res.texture_elastic_indirect_diffuse->desc.layout,
+			ResourceState::UNORDERED_ACCESS), cmd);
+		device->ClearUAV(res.texture_elastic_indirect_diffuse, 0, cmd);
+		device->Barrier(GPUBarrier::Memory(res.texture_elastic_indirect_diffuse), cmd);
+		elastic_indirect_diffuse_uav = device->GetDescriptorIndex(res.texture_elastic_indirect_diffuse, SubresourceType::UAV);
+	}
+	int elastic_ao_uav = -1;
+	if (res.texture_elastic_ao != nullptr && res.texture_elastic_ao->IsValid())
+	{
+		device->Barrier(GPUBarrier::Image(
+			res.texture_elastic_ao,
+			res.texture_elastic_ao->desc.layout,
+			ResourceState::UNORDERED_ACCESS), cmd);
+		device->ClearUAV(res.texture_elastic_ao, 0, cmd);
+		device->Barrier(GPUBarrier::Memory(res.texture_elastic_ao), cmd);
+		elastic_ao_uav = device->GetDescriptorIndex(res.texture_elastic_ao, SubresourceType::UAV);
+	}
 
 	const uint visibility_tilecount_flat = res.tile_count.x * res.tile_count.y;
 	struct VisibilityShadePushConstants
 	{
 		uint32_t global_tile_offset;
 		int32_t specular_indirect_uav;
+		int32_t local_indirect_diffuse_uav;
+		int32_t local_indirect_padding[3];
+		int32_t elastic_indirect_diffuse_uav;
+		int32_t elastic_ao_uav;
+		int32_t remote_indirect_diffuse_texture;
+		int32_t remote_ao_texture;
+		float remote_indirect_diffuse_weight;
+		float remote_ao_weight;
+		XMFLOAT4 remote_clip_x;
+		XMFLOAT4 remote_clip_y;
+		XMFLOAT4 remote_clip_w;
 	};
+	static_assert(sizeof(VisibilityShadePushConstants) == 96);
 	VisibilityShadePushConstants push = {};
 	push.specular_indirect_uav = specular_indirect_uav;
+	push.local_indirect_diffuse_uav = local_indirect_diffuse_uav;
+	push.elastic_indirect_diffuse_uav = elastic_indirect_diffuse_uav;
+	push.elastic_ao_uav = elastic_ao_uav;
+	push.remote_indirect_diffuse_texture = device->GetDescriptorIndex(res.texture_remote_indirect_diffuse, SubresourceType::SRV);
+	push.remote_ao_texture = device->GetDescriptorIndex(res.texture_remote_ao, SubresourceType::SRV);
+	push.remote_indirect_diffuse_weight = res.remote_indirect_diffuse_weight;
+	push.remote_ao_weight = res.remote_ao_weight;
+	const XMFLOAT4X4& remote_vp = res.remote_view_projection;
+	// DirectXMath stores row-vector matrices. HLSL consumes the same bytes as a
+	// column-major matrix, so clip x/y/w are the CPU matrix columns 0/1/3.
+	push.remote_clip_x = XMFLOAT4(remote_vp._11, remote_vp._21, remote_vp._31, remote_vp._41);
+	push.remote_clip_y = XMFLOAT4(remote_vp._12, remote_vp._22, remote_vp._32, remote_vp._42);
+	push.remote_clip_w = XMFLOAT4(remote_vp._14, remote_vp._24, remote_vp._34, remote_vp._44);
 	uint64_t bins_offset = 0;
 
 	// shading dispatches per material type:
@@ -12132,6 +12213,27 @@ void Visibility_Shade(
 			res.texture_specular_indirect,
 			ResourceState::UNORDERED_ACCESS,
 			res.texture_specular_indirect->desc.layout));
+	}
+	if (res.texture_local_indirect_diffuse != nullptr && res.texture_local_indirect_diffuse->IsValid())
+	{
+		PushBarrier(GPUBarrier::Image(
+			res.texture_local_indirect_diffuse,
+			ResourceState::UNORDERED_ACCESS,
+			res.texture_local_indirect_diffuse->desc.layout));
+	}
+	if (res.texture_elastic_indirect_diffuse != nullptr && res.texture_elastic_indirect_diffuse->IsValid())
+	{
+		PushBarrier(GPUBarrier::Image(
+			res.texture_elastic_indirect_diffuse,
+			ResourceState::UNORDERED_ACCESS,
+			res.texture_elastic_indirect_diffuse->desc.layout));
+	}
+	if (res.texture_elastic_ao != nullptr && res.texture_elastic_ao->IsValid())
+	{
+		PushBarrier(GPUBarrier::Image(
+			res.texture_elastic_ao,
+			ResourceState::UNORDERED_ACCESS,
+			res.texture_elastic_ao->desc.layout));
 	}
 	FlushBarriers(cmd);
 

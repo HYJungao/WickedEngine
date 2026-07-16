@@ -6,9 +6,13 @@
 #include "wiFont.h"
 #include "wiTextureHelper.h"
 
+#include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <filesystem>
+#include <limits>
+#include <sstream>
 #include <unordered_set>
 #include <utility>
 
@@ -20,6 +24,9 @@ namespace
 // encode/decode and scheduling jitter before falling back to local rendering.
 constexpr float kRemoteStaleTimeoutSeconds = 5.0f;
 constexpr uint64_t kMaxRemoteFrameAgeUsec = 5'000'000;
+constexpr float kRemoteFullQualitySeconds = 1.5f;
+constexpr float kElasticBlendAttackSpeed = 5.0f;
+constexpr float kElasticBlendReleaseSpeed = 10.0f;
 constexpr float kControlDirtyPublishIntervalSeconds = 1.0f / 30.0f;
 constexpr float kControlHeartbeatIntervalSeconds = 1.0f / 5.0f;
 constexpr const char* kClientEnvironmentProbeName = "NewPipelineEnvironmentProbe";
@@ -27,6 +34,106 @@ constexpr uint32_t kMobileShadow2DResolution = 1024;
 constexpr uint32_t kMobileShadowCubeResolution = 512;
 constexpr uint32_t kMobileLightmapResolution = 256;
 constexpr uint32_t kClientReflectionProbeResolution = 128;
+constexpr const char* kLightmapBakeModeMetadataKey = "newpipeline.lightmap_bake_mode";
+
+enum class LightmapBakeEligibility : uint8_t
+{
+    Eligible,
+    ForcedEligible,
+    AuthorExcluded,
+    NonRenderableOrMissingMesh,
+    Dynamic,
+    SkinnedSoftBodyOrParticle,
+    Transparent,
+};
+
+struct LightmapBakeCoverage
+{
+    uint32_t total = 0;
+    uint32_t eligible = 0;
+    uint32_t forced_eligible = 0;
+    uint32_t author_excluded = 0;
+    uint32_t unsupported = 0;
+    uint32_t dynamic = 0;
+    uint32_t deformed = 0;
+    uint32_t transparent = 0;
+    uint32_t atlas_failures = 0;
+};
+
+std::string GetLightmapBakeMode(const wi::scene::Scene& scene, wi::ecs::Entity entity)
+{
+    const wi::scene::MetadataComponent* metadata = scene.metadatas.GetComponent(entity);
+    if (metadata == nullptr)
+        return "auto";
+
+    std::string mode = metadata->string_values.get(kLightmapBakeModeMetadataKey);
+    std::transform(mode.begin(), mode.end(), mode.begin(), [](unsigned char character) {
+        return static_cast<char>(std::tolower(character));
+    });
+    return mode.empty() ? "auto" : mode;
+}
+
+LightmapBakeEligibility ClassifyLightmapBakeEligibility(
+    const wi::scene::Scene& scene,
+    wi::ecs::Entity entity,
+    const wi::scene::ObjectComponent& object)
+{
+    const std::string mode = GetLightmapBakeMode(scene, entity);
+    if (mode == "exclude")
+        return LightmapBakeEligibility::AuthorExcluded;
+
+    const wi::scene::MeshComponent* mesh = scene.meshes.GetComponent(object.meshID);
+    if (!object.IsRenderable() || mesh == nullptr || !mesh->IsRenderable())
+        return LightmapBakeEligibility::NonRenderableOrMissingMesh;
+
+    // An explicit include is the only way to opt dynamic/deforming/transparent
+    // content into a static bake. Missing or non-renderable geometry remains a
+    // hard safety failure because it cannot produce a valid atlas.
+    if (mode == "include")
+        return LightmapBakeEligibility::ForcedEligible;
+
+    if (object.IsDynamic() || mesh->IsDynamic())
+        return LightmapBakeEligibility::Dynamic;
+    if (mesh->IsSkinned() || scene.softbodies.Contains(object.meshID) || scene.emitters.Contains(entity))
+        return LightmapBakeEligibility::SkinnedSoftBodyOrParticle;
+    if ((object.GetFilterMask() & wi::enums::FILTER_TRANSPARENT) != 0)
+        return LightmapBakeEligibility::Transparent;
+    for (const wi::scene::MeshComponent::MeshSubset& subset : mesh->subsets)
+    {
+        const wi::scene::MaterialComponent* material = scene.materials.GetComponent(subset.materialID);
+        if (material != nullptr && (material->GetFilterMask() & wi::enums::FILTER_TRANSPARENT) != 0)
+            return LightmapBakeEligibility::Transparent;
+    }
+    return LightmapBakeEligibility::Eligible;
+}
+
+void AccumulateCoverage(LightmapBakeCoverage& coverage, LightmapBakeEligibility eligibility)
+{
+    switch (eligibility)
+    {
+    case LightmapBakeEligibility::Eligible: ++coverage.eligible; break;
+    case LightmapBakeEligibility::ForcedEligible: ++coverage.forced_eligible; break;
+    case LightmapBakeEligibility::AuthorExcluded: ++coverage.author_excluded; break;
+    case LightmapBakeEligibility::NonRenderableOrMissingMesh: ++coverage.unsupported; break;
+    case LightmapBakeEligibility::Dynamic: ++coverage.dynamic; break;
+    case LightmapBakeEligibility::SkinnedSoftBodyOrParticle: ++coverage.deformed; break;
+    case LightmapBakeEligibility::Transparent: ++coverage.transparent; break;
+    }
+}
+
+std::string FormatLightmapBakeCoverage(const LightmapBakeCoverage& coverage, size_t queued)
+{
+    return "total=" + std::to_string(coverage.total) +
+        " queued=" + std::to_string(queued) +
+        " eligible_auto=" + std::to_string(coverage.eligible) +
+        " eligible_forced=" + std::to_string(coverage.forced_eligible) +
+        " skipped_author=" + std::to_string(coverage.author_excluded) +
+        " skipped_dynamic=" + std::to_string(coverage.dynamic) +
+        " skipped_skinned_softbody_particle=" + std::to_string(coverage.deformed) +
+        " skipped_transparent=" + std::to_string(coverage.transparent) +
+        " skipped_unsupported=" + std::to_string(coverage.unsupported) +
+        " atlas_failures=" + std::to_string(coverage.atlas_failures);
+}
 
 uint64_t NowUsec()
 {
@@ -77,6 +184,13 @@ bool SunMatches(const NewPipelineSunState& a, const NewPipelineSunState& b)
 std::string EnabledString(bool value)
 {
     return value ? "enabled" : "disabled";
+}
+
+float SmoothWeight(float current, float target, float dt)
+{
+    const float speed = target > current ? kElasticBlendAttackSpeed : kElasticBlendReleaseSpeed;
+    const float blend = 1.0f - std::exp(-std::max(0.0f, dt) * speed);
+    return std::lerp(current, target, blend);
 }
 } // namespace
 
@@ -147,6 +261,7 @@ std::string NewPipelineClientRenderPath::GetEffectiveAlgorithmSummary() const
         " | " + (render_settings.ssao_enabled ? "SSAO" : "SSAO off") +
         " | " + (render_settings.baked_lightmaps_enabled ? "Baked Lightmap" : "Baked Lightmap off") +
         " | " + (render_settings.environment_probe_enabled ? "Baked Probe 128" : "Baked Probe off") +
+        " | Elastic DDGI/RTAO" +
         " | local DDGI/RT/SSR off";
 }
 
@@ -157,7 +272,18 @@ std::string NewPipelineClientRenderPath::GetDebugStatusSummary() const
         (remote_consume.accepted_valid ? std::string{"available"} : std::string{"unavailable"}) +
         "\nRemote DDGI: frame " + std::to_string(remote_ddgi_frame_index) +
         (remote_consume.history_valid ? " converged" : " warming") +
-        " reset=" + ToString(remote_ddgi_reset_reason);
+        " reset=" + ToString(remote_ddgi_reset_reason) +
+        "\n" + GetElasticLightingStatus();
+}
+
+std::string NewPipelineClientRenderPath::GetElasticLightingStatus() const
+{
+    const int quality_percent = static_cast<int>(std::round(std::clamp(elastic_remote_quality, 0.0f, 1.0f) * 100.0f));
+    const int gi_percent = static_cast<int>(std::round(std::clamp(elastic_remote_gi_weight, 0.0f, 1.0f) * 100.0f));
+    const int ao_percent = static_cast<int>(std::round(std::clamp(elastic_remote_ao_weight, 0.0f, 1.0f) * 100.0f));
+    return "Elastic quality " + std::to_string(quality_percent) + "% | GI remote " +
+        std::to_string(gi_percent) + "% | AO remote " + std::to_string(ao_percent) +
+        "%\nAlignment: world reprojection (no remote depth)";
 }
 
 void NewPipelineClientRenderPath::SetInputActive(bool active)
@@ -176,6 +302,8 @@ void NewPipelineClientRenderPath::SetRenderSettings(const NewPipelineClientRende
     const bool shadows_changed = previous.shadow_maps_enabled != render_settings.shadow_maps_enabled;
     const bool ssao_changed = previous.ssao_enabled != render_settings.ssao_enabled;
     const bool probe_changed = previous.environment_probe_enabled != render_settings.environment_probe_enabled;
+    render_settings.remote_gi_max_weight = std::clamp(render_settings.remote_gi_max_weight, 0.0f, 1.0f);
+    render_settings.remote_ao_max_weight = std::clamp(render_settings.remote_ao_max_weight, 0.0f, 1.0f);
 
     if (scene_initialized)
     {
@@ -190,6 +318,7 @@ void NewPipelineClientRenderPath::SetRenderSettings(const NewPipelineClientRende
     ApplySSAOSettings(ssao_changed);
     if (scene_initialized)
         ApplyEnvironmentProbeSettings(probe_changed);
+    ApplyElasticLightingResources();
 }
 
 void NewPipelineClientRenderPath::Start()
@@ -222,9 +351,17 @@ void NewPipelineClientRenderPath::ResizeBuffers()
     wi::RenderPath3D::ResizeBuffers();
     local_ao_snapshot = {};
     local_lightmap_irradiance = {};
+    local_lightmap_validity = {};
+    local_indirect_final_input = {};
     local_specular_indirect = {};
+    elastic_indirect_diffuse = {};
+    elastic_ao = {};
     visibilityResources.texture_lightmap_irradiance = nullptr;
+    visibilityResources.texture_lightmap_validity = nullptr;
+    visibilityResources.texture_local_indirect_diffuse = nullptr;
     visibilityResources.texture_specular_indirect = nullptr;
+    visibilityResources.texture_elastic_indirect_diffuse = nullptr;
+    visibilityResources.texture_elastic_ao = nullptr;
     if (rtAO.IsValid())
     {
         wi::graphics::TextureDesc desc = rtAO.GetDesc();
@@ -252,8 +389,58 @@ void NewPipelineClientRenderPath::ResizeBuffers()
             wi::backlog::post("Client Local Lightmap Irradiance texture creation failed: " +
                 std::to_string(internal_resolution.x) + "x" + std::to_string(internal_resolution.y));
         }
+
+        wi::graphics::TextureDesc validity_desc = desc;
+        validity_desc.format = wi::graphics::Format::R8G8B8A8_UNORM;
+        if (wi::graphics::GetDevice()->CreateTexture(&validity_desc, nullptr, &local_lightmap_validity))
+        {
+            wi::graphics::GetDevice()->SetName(&local_lightmap_validity, "newpipeline.client.local_lightmap_validity");
+            visibilityResources.texture_lightmap_validity = &local_lightmap_validity;
+        }
+        else
+        {
+            wi::backlog::post("Client Local Lightmap Validity texture creation failed: " +
+                std::to_string(internal_resolution.x) + "x" + std::to_string(internal_resolution.y));
+        }
+
+        if (wi::graphics::GetDevice()->CreateTexture(&desc, nullptr, &local_indirect_final_input))
+        {
+            wi::graphics::GetDevice()->SetName(&local_indirect_final_input, "newpipeline.client.local_indirect_final_input");
+            visibilityResources.texture_local_indirect_diffuse = &local_indirect_final_input;
+        }
+        else
+        {
+            wi::backlog::post("Client Local Indirect Final Input texture creation failed: " +
+                std::to_string(internal_resolution.x) + "x" + std::to_string(internal_resolution.y));
+        }
+
+        wi::graphics::TextureDesc elastic_gi_desc = desc;
+        if (wi::graphics::GetDevice()->CreateTexture(&elastic_gi_desc, nullptr, &elastic_indirect_diffuse))
+        {
+            wi::graphics::GetDevice()->SetName(&elastic_indirect_diffuse, "newpipeline.client.elastic_indirect_diffuse");
+            visibilityResources.texture_elastic_indirect_diffuse = &elastic_indirect_diffuse;
+        }
+        else
+        {
+            wi::backlog::post("Client Elastic Indirect Diffuse texture creation failed: " +
+                std::to_string(internal_resolution.x) + "x" + std::to_string(internal_resolution.y));
+        }
+
+        wi::graphics::TextureDesc elastic_ao_desc = desc;
+        elastic_ao_desc.format = wi::graphics::Format::R8G8B8A8_UNORM;
+        if (wi::graphics::GetDevice()->CreateTexture(&elastic_ao_desc, nullptr, &elastic_ao))
+        {
+            wi::graphics::GetDevice()->SetName(&elastic_ao, "newpipeline.client.elastic_ao");
+            visibilityResources.texture_elastic_ao = &elastic_ao;
+        }
+        else
+        {
+            wi::backlog::post("Client Elastic AO texture creation failed: " +
+                std::to_string(internal_resolution.x) + "x" + std::to_string(internal_resolution.y));
+        }
     }
     EnsureSpecularIndirectDebugTexture();
+    ApplyElasticLightingResources();
 }
 
 void NewPipelineClientRenderPath::EnsureSpecularIndirectDebugTexture()
@@ -306,35 +493,9 @@ void NewPipelineClientRenderPath::Update(float dt)
     MaintainWebRTC(dt);
     PublishControlPacket(dt);
 
-    // The authored Sponza dust emitter is useful in the Editor, but it is too
-    // expensive and visually ambiguous in the low-end Client: its bright
-    // particle sprites look like lightmap fireflies and its procedural
-    // geometry can enter the bake TLAS.  Mask emitters only for the duration
-    // of the Client scene update, then restore the serialized layer state so
-    // Generate Lightmap never modifies this authoring choice in the .wiscene.
-    wi::vector<std::pair<wi::ecs::Entity, uint32_t>> emitter_layer_masks;
-    emitter_layer_masks.reserve(local_scene.emitters.GetCount());
-    for (size_t i = 0; i < local_scene.emitters.GetCount(); ++i)
-    {
-        const wi::ecs::Entity entity = local_scene.emitters.GetEntity(i);
-        if (wi::scene::LayerComponent* layer = local_scene.layers.GetComponent(entity))
-        {
-            emitter_layer_masks.emplace_back(entity, layer->layerMask);
-            layer->layerMask = 0;
-        }
-        local_scene.emitters[i].layerMask = 0;
-    }
-
     wi::RenderPath3D::Update(dt);
-
-    for (const auto& saved : emitter_layer_masks)
-    {
-        if (wi::scene::LayerComponent* layer = local_scene.layers.GetComponent(saved.first))
-            layer->layerMask = saved.second;
-    }
-    for (size_t i = 0; i < local_scene.emitters.GetCount(); ++i)
-        local_scene.emitters[i].layerMask = 0;
     AcquireRemoteVideoFrame(dt);
+    UpdateElasticLighting(dt);
 
     if (!status_logged)
     {
@@ -404,12 +565,16 @@ void NewPipelineClientRenderPath::InitializeSceneIfNeeded()
     wi::backlog::post(scene_message);
     if (!result.diagnostic.empty())
         wi::backlog::post("Client scene diagnostic: " + result.diagnostic);
+    wi::backlog::post("Client scene parity: " +
+        FormatSceneParityFingerprint(ComputeSceneParityFingerprint(local_scene)));
 
     scene_asset_path = result.loaded_asset_path;
     scene_source_root_entity = result.loaded_root_entity;
     if (!scene_asset_path.empty())
     {
         const ClientLightmapPackageResult package_result = client_static_lighting.LoadLightmaps(scene_asset_path, local_scene);
+        if (package_result.scene_replaced)
+            scene_source_root_entity = wi::ecs::INVALID_ENTITY;
         wi::backlog::post(package_result.diagnostic);
         lightmap_bake_status = client_static_lighting.GetLightmapStatus();
     }
@@ -475,6 +640,66 @@ void NewPipelineClientRenderPath::ApplySSAOSettings(bool log_changes)
     {
         wi::backlog::post(std::string{"Client local AO (SSAO): "} + EnabledString(render_settings.ssao_enabled));
     }
+}
+
+void NewPipelineClientRenderPath::UpdateElasticLighting(float dt)
+{
+    float quality = 0.0f;
+    if (remote_consume.accepted_valid)
+    {
+        const float freshness = remote_consume.stale_timer <= kRemoteFullQualitySeconds
+            ? 1.0f
+            : 1.0f - (remote_consume.stale_timer - kRemoteFullQualitySeconds) /
+                (kRemoteStaleTimeoutSeconds - kRemoteFullQualitySeconds);
+        quality = std::clamp(freshness, 0.0f, 1.0f) *
+            std::clamp(remote_consume.confidence, 0.0f, 1.0f);
+    }
+    elastic_remote_quality = quality;
+
+    const bool gi_available =
+        (accepted_remote_buffer_mask & RemoteBufferKindMask(RemoteBufferSemantic::RemoteIndirectDiffuse)) != 0 &&
+        accepted_remote_textures[static_cast<size_t>(RemoteBufferSemantic::RemoteIndirectDiffuse)].IsValid();
+    const bool ao_available =
+        (accepted_remote_buffer_mask & RemoteBufferKindMask(RemoteBufferSemantic::RemoteAO)) != 0 &&
+        accepted_remote_textures[static_cast<size_t>(RemoteBufferSemantic::RemoteAO)].IsValid();
+
+    const float ddgi_readiness = remote_consume.history_valid
+        ? 1.0f
+        : std::clamp(static_cast<float>(remote_ddgi_frame_index) / 64.0f, 0.0f, 1.0f);
+    const float gi_target = render_settings.remote_gi_enabled && gi_available
+        ? render_settings.remote_gi_max_weight * quality * ddgi_readiness
+        : 0.0f;
+    const float ao_target = render_settings.remote_ao_enabled && ao_available
+        ? render_settings.remote_ao_max_weight * quality
+        : 0.0f;
+    elastic_remote_gi_weight = SmoothWeight(elastic_remote_gi_weight, gi_target, dt);
+    elastic_remote_ao_weight = SmoothWeight(elastic_remote_ao_weight, ao_target, dt);
+    if (elastic_remote_gi_weight < 0.0001f)
+        elastic_remote_gi_weight = 0.0f;
+    if (elastic_remote_ao_weight < 0.0001f)
+        elastic_remote_ao_weight = 0.0f;
+
+    ApplyElasticLightingResources();
+}
+
+void NewPipelineClientRenderPath::ApplyElasticLightingResources()
+{
+    const size_t gi_index = static_cast<size_t>(RemoteBufferSemantic::RemoteIndirectDiffuse);
+    const size_t ao_index = static_cast<size_t>(RemoteBufferSemantic::RemoteAO);
+    visibilityResources.texture_remote_indirect_diffuse =
+        elastic_remote_gi_weight > 0.0f && accepted_remote_textures[gi_index].IsValid()
+            ? &accepted_remote_textures[gi_index]
+            : nullptr;
+    visibilityResources.texture_remote_ao =
+        elastic_remote_ao_weight > 0.0f && accepted_remote_textures[ao_index].IsValid()
+            ? &accepted_remote_textures[ao_index]
+            : nullptr;
+    visibilityResources.remote_indirect_diffuse_weight = elastic_remote_gi_weight;
+    visibilityResources.remote_ao_weight = elastic_remote_ao_weight;
+    visibilityResources.remote_view_projection = accepted_remote_metadata.view_projection;
+    visibilityResources.texture_elastic_indirect_diffuse =
+        elastic_indirect_diffuse.IsValid() ? &elastic_indirect_diffuse : nullptr;
+    visibilityResources.texture_elastic_ao = elastic_ao.IsValid() ? &elastic_ao : nullptr;
 }
 
 void NewPipelineClientRenderPath::ApplyEnvironmentProbeSettings(bool log_changes)
@@ -628,11 +853,17 @@ void NewPipelineClientRenderPath::LoadStaticLightingAssets()
         return;
     const ClientLightmapPackageResult lightmap_result =
         client_static_lighting.LoadLightmaps(scene_asset_path, local_scene);
+    if (lightmap_result.scene_replaced)
+    {
+        scene_source_root_entity = wi::ecs::INVALID_ENTITY;
+        environment_probe_entity = wi::ecs::INVALID_ENTITY;
+        environment_probe_created_by_client = false;
+    }
     lightmap_bake_status = client_static_lighting.GetLightmapStatus();
     wi::backlog::post(lightmap_result.diagnostic);
     environment_probe_load_attempted = false;
     if (render_settings.environment_probe_enabled)
-        LoadEnvironmentProbeAsset();
+        ApplyEnvironmentProbeSettings(false);
     if (!render_settings.baked_lightmaps_enabled)
         client_static_lighting.DisableLightmaps(local_scene);
 }
@@ -704,24 +935,6 @@ void NewPipelineClientRenderPath::RestoreBakedLightmaps()
     client_static_lighting.RestoreLightmaps(local_scene);
 }
 
-bool NewPipelineClientRenderPath::ObjectSupportsLightmapBake(const wi::scene::ObjectComponent& object) const
-{
-    if (!object.IsRenderable() || object.IsDynamic() || object.meshID == wi::ecs::INVALID_ENTITY ||
-        (object.GetFilterMask() & wi::enums::FILTER_TRANSPARENT) != 0)
-        return false;
-
-    const wi::scene::MeshComponent* mesh = local_scene.meshes.GetComponent(object.meshID);
-    if (mesh == nullptr || !mesh->IsRenderable() || mesh->IsDynamic() || mesh->IsSkinned())
-        return false;
-    for (const wi::scene::MeshComponent::MeshSubset& subset : mesh->subsets)
-    {
-        const wi::scene::MaterialComponent* material = local_scene.materials.GetComponent(subset.materialID);
-        if (material != nullptr && (material->GetFilterMask() & wi::enums::FILTER_TRANSPARENT) != 0)
-            return false;
-    }
-    return true;
-}
-
 void NewPipelineClientRenderPath::RequestStaticLightingBake()
 {
     if (IsStaticLightingBakeActive())
@@ -779,8 +992,22 @@ void NewPipelineClientRenderPath::RequestLightmapBake()
         wi::backlog::post(lightmap_bake_status);
         return;
     }
+    source_scene_hash_before_bake = ClientLightmapPackage::HashFile(scene_asset_path);
+    if (source_scene_hash_before_bake == 0)
+    {
+        render_settings.lightmap_bake_requested = false;
+        lightmap_bake_state = LightmapBakeState::Failed;
+        lightmap_bake_status = "Lightmap: failed - source scene is unreadable";
+        client_static_lighting.SetLightmapStatus(ClientLightingAssetState::Unavailable, lightmap_bake_status);
+        wi::backlog::post(lightmap_bake_status);
+        return;
+    }
     if (environment_probe_entity != wi::ecs::INVALID_ENTITY)
         ClientReflectionProbePackage::EnsureProbeId(local_scene, environment_probe_entity);
+    lightmap_bake_scene_fingerprint = ComputeSceneParityFingerprint(local_scene);
+    lightmap_bake_scene_fingerprint_valid = true;
+    wi::backlog::post("Client lightmap scene baseline: " +
+        FormatSceneParityFingerprint(lightmap_bake_scene_fingerprint));
     render_settings.baked_lightmaps_enabled = true;
     render_settings.lightmap_bake_requested = true;
     previous_raytrace_bounce_count = wi::renderer::GetRaytraceBounceCount();
@@ -1000,7 +1227,8 @@ bool NewPipelineClientRenderPath::SavePreparedScene(const std::string& path, std
     }
 
     // Persist the authored/generated probe entity, placement and stable ID in
-    // the single canonical scene. The large BC6H cubemap remains external.
+    // the derived Client scene. The canonical source and large BC6H cubemap
+    // remain external and untouched.
     if (wi::scene::EnvironmentProbeComponent* probe =
         local_scene.probes.GetComponent(environment_probe_entity))
     {
@@ -1040,6 +1268,12 @@ bool NewPipelineClientRenderPath::PrepareLightmapBake()
         FailLightmapBake("source scene is missing or unreadable: " + scene_asset_path);
         return false;
     }
+    std::string source_error;
+    if (!VerifySourceSceneUnchanged(source_error))
+    {
+        FailLightmapBake(source_error);
+        return false;
+    }
 
     lightmap_bake_queue.clear();
     lightmap_bake_completed.clear();
@@ -1047,16 +1281,28 @@ bool NewPipelineClientRenderPath::PrepareLightmapBake()
     lightmap_bake_next_index = 0;
     lightmap_bake_skipped = 0;
     active_lightmap_bake_entity = wi::ecs::INVALID_ENTITY;
-    prepared_scene_hash = 0;
+    prepared_derived_scene_hash = 0;
+    const float max_float = std::numeric_limits<float>::max();
+    lightmap_irradiance_min = XMFLOAT3(max_float, max_float, max_float);
+    lightmap_irradiance_sum = {};
+    lightmap_irradiance_max = {};
+    lightmap_valid_texel_count = 0;
+    lightmap_missing_texel_count = 0;
 
     std::unordered_map<wi::ecs::Entity, XMUINT2> mesh_dimensions;
     std::unordered_set<std::string> object_ids;
+    LightmapBakeCoverage coverage;
+    coverage.total = static_cast<uint32_t>(local_scene.objects.GetCount());
     uint32_t skipped_logged = 0;
     for (size_t i = 0; i < local_scene.objects.GetCount(); ++i)
     {
         wi::scene::ObjectComponent& object = local_scene.objects[i];
         const wi::ecs::Entity entity = local_scene.objects.GetEntity(i);
-        if (!ObjectSupportsLightmapBake(object))
+        const LightmapBakeEligibility eligibility =
+            ClassifyLightmapBakeEligibility(local_scene, entity, object);
+        AccumulateCoverage(coverage, eligibility);
+        if (eligibility != LightmapBakeEligibility::Eligible &&
+            eligibility != LightmapBakeEligibility::ForcedEligible)
         {
             ++lightmap_bake_skipped;
             continue;
@@ -1081,6 +1327,7 @@ bool NewPipelineClientRenderPath::PrepareLightmapBake()
                 atlas_error))
             {
                 ++lightmap_bake_skipped;
+                ++coverage.atlas_failures;
                 if (skipped_logged++ < 8)
                     wi::backlog::post("Client lightmap atlas skipped object " + std::to_string(entity) + ": " + atlas_error);
                 continue;
@@ -1111,13 +1358,16 @@ bool NewPipelineClientRenderPath::PrepareLightmapBake()
         lightmap_bake_queue.push_back(entity);
     }
 
+    wi::backlog::post("Client lightmap coverage: " +
+        FormatLightmapBakeCoverage(coverage, lightmap_bake_queue.size()));
+
     if (lightmap_bake_queue.empty())
     {
         FailLightmapBake("no eligible static opaque objects were found");
         return false;
     }
 
-    prepared_scene_temp_path = scene_asset_path + ".clientlightmap.scene.tmp";
+    prepared_scene_temp_path = ClientLightmapPackage::DerivedScenePathForScene(scene_asset_path) + ".tmp";
     prepared_package_temp_path = ClientLightmapPackage::PackagePathForScene(scene_asset_path) + ".tmp";
     CleanupLightmapBakeTemps();
     std::string save_error;
@@ -1126,8 +1376,8 @@ bool NewPipelineClientRenderPath::PrepareLightmapBake()
         FailLightmapBake(save_error);
         return false;
     }
-    prepared_scene_hash = ClientLightmapPackage::HashFile(prepared_scene_temp_path);
-    if (prepared_scene_hash == 0)
+    prepared_derived_scene_hash = ClientLightmapPackage::HashFile(prepared_scene_temp_path);
+    if (prepared_derived_scene_hash == 0)
     {
         FailLightmapBake("failed to hash prepared scene");
         return false;
@@ -1184,9 +1434,14 @@ void NewPipelineClientRenderPath::UpdateLightmapBake()
         wi::renderer::SetRaytraceBounceCount(previous_raytrace_bounce_count);
         CleanupLightmapBakeTemps();
         ReloadSceneAfterLightmapBakeAbort();
+        std::string source_error;
+        const bool source_unchanged = VerifySourceSceneUnchanged(source_error);
+        LogLightmapSceneParity("cancelled");
         active_lightmap_bake_entity = wi::ecs::INVALID_ENTITY;
         lightmap_bake_state = LightmapBakeState::Cancelled;
-        lightmap_bake_status = "Lightmap: cancelled; original scene/package preserved";
+        lightmap_bake_status = source_unchanged
+            ? "Lightmap: cancelled; source and previous sidecars preserved"
+            : "Lightmap: cancelled; previous sidecars preserved, but " + source_error;
         static_lighting_bake_requested = false;
         lightmap_cancel_requested = false;
         wi::backlog::post(lightmap_bake_status);
@@ -1224,6 +1479,22 @@ void NewPipelineClientRenderPath::UpdateLightmapBake()
         FailLightmapBake("BC6H compression failed for object " + object_name);
         return;
     }
+    const wi::scene::ObjectComponent::LightmapStatistics& statistics = object->lightmapStatistics;
+    if (statistics.valid_texel_count > 0)
+    {
+        lightmap_irradiance_min.x = std::min(lightmap_irradiance_min.x, statistics.irradiance_min.x);
+        lightmap_irradiance_min.y = std::min(lightmap_irradiance_min.y, statistics.irradiance_min.y);
+        lightmap_irradiance_min.z = std::min(lightmap_irradiance_min.z, statistics.irradiance_min.z);
+        lightmap_irradiance_max.x = std::max(lightmap_irradiance_max.x, statistics.irradiance_max.x);
+        lightmap_irradiance_max.y = std::max(lightmap_irradiance_max.y, statistics.irradiance_max.y);
+        lightmap_irradiance_max.z = std::max(lightmap_irradiance_max.z, statistics.irradiance_max.z);
+        const float count = static_cast<float>(statistics.valid_texel_count);
+        lightmap_irradiance_sum.x += statistics.irradiance_average.x * count;
+        lightmap_irradiance_sum.y += statistics.irradiance_average.y * count;
+        lightmap_irradiance_sum.z += statistics.irradiance_average.z * count;
+        lightmap_valid_texel_count += statistics.valid_texel_count;
+    }
+    lightmap_missing_texel_count += statistics.missing_texel_count;
     lightmap_bake_completed.push_back(active_lightmap_bake_entity);
     active_lightmap_bake_entity = wi::ecs::INVALID_ENTITY;
     StartNextLightmapBake();
@@ -1232,33 +1503,71 @@ void NewPipelineClientRenderPath::UpdateLightmapBake()
 bool NewPipelineClientRenderPath::CommitLightmapBakeFiles(std::string& error)
 {
     namespace fs = std::filesystem;
-    const fs::path scene_final(scene_asset_path);
+    const fs::path scene_final(ClientLightmapPackage::DerivedScenePathForScene(scene_asset_path));
     const fs::path package_final(ClientLightmapPackage::PackagePathForScene(scene_asset_path));
     const fs::path scene_temp(prepared_scene_temp_path);
     const fs::path package_temp(prepared_package_temp_path);
-    const fs::path scene_backup(scene_asset_path + ".clientlightmap.backup");
+    const fs::path scene_backup(scene_final.string() + ".backup");
     const fs::path package_backup(package_final.string() + ".backup");
     std::error_code ec;
+
+    if (!fs::is_regular_file(scene_temp, ec) || ec)
+    {
+        error = "prepared derived scene is missing";
+        return false;
+    }
+    ec.clear();
+    if (!fs::is_regular_file(package_temp, ec) || ec)
+    {
+        error = "prepared lightmap package is missing";
+        return false;
+    }
+
+    // Recover the previous valid output if an earlier process stopped after
+    // moving a sidecar to its backup but before installing the replacement.
+    ec.clear();
+    if (!fs::exists(scene_final, ec) && fs::exists(scene_backup, ec))
+        fs::rename(scene_backup, scene_final, ec);
+    if (ec)
+    {
+        error = "failed to recover previous derived scene: " + ec.message();
+        return false;
+    }
+    ec.clear();
+    if (!fs::exists(package_final, ec) && fs::exists(package_backup, ec))
+        fs::rename(package_backup, package_final, ec);
+    if (ec)
+    {
+        error = "failed to recover previous lightmap package: " + ec.message();
+        return false;
+    }
 
     fs::remove(scene_backup, ec);
     ec.clear();
     fs::remove(package_backup, ec);
     ec.clear();
-    fs::rename(scene_final, scene_backup, ec);
-    if (ec)
-    {
-        error = "failed to back up source scene: " + ec.message();
-        return false;
-    }
+    const bool had_scene = fs::exists(scene_final, ec) && !ec;
+    ec.clear();
     const bool had_package = fs::exists(package_final, ec) && !ec;
     ec.clear();
+    if (had_scene)
+    {
+        fs::rename(scene_final, scene_backup, ec);
+        if (ec)
+        {
+            error = "failed to preserve previous derived scene: " + ec.message();
+            return false;
+        }
+    }
     if (had_package)
     {
         fs::rename(package_final, package_backup, ec);
         if (ec)
         {
-            fs::rename(scene_backup, scene_final, ec);
-            error = "failed to back up previous lightmap package";
+            std::error_code rollback_ec;
+            if (had_scene)
+                fs::rename(scene_backup, scene_final, rollback_ec);
+            error = "failed to preserve previous lightmap package: " + ec.message();
             return false;
         }
     }
@@ -1271,17 +1580,35 @@ bool NewPipelineClientRenderPath::CommitLightmapBakeFiles(std::string& error)
         std::error_code rollback_ec;
         fs::remove(scene_final, rollback_ec);
         fs::remove(package_final, rollback_ec);
-        fs::rename(scene_backup, scene_final, rollback_ec);
+        if (had_scene)
+            fs::rename(scene_backup, scene_final, rollback_ec);
         if (had_package)
             fs::rename(package_backup, package_final, rollback_ec);
-        error = "failed to commit prepared scene/lightmap package: " + ec.message();
+        error = "failed to commit derived scene/lightmap sidecars: " + ec.message();
         return false;
     }
 
-    fs::remove(scene_backup, ec);
+    if (had_scene)
+        fs::remove(scene_backup, ec);
     ec.clear();
     if (had_package)
         fs::remove(package_backup, ec);
+    return true;
+}
+
+bool NewPipelineClientRenderPath::VerifySourceSceneUnchanged(std::string& error) const
+{
+    const uint64_t current_hash = ClientLightmapPackage::HashFile(scene_asset_path);
+    if (source_scene_hash_before_bake == 0 || current_hash == 0)
+    {
+        error = "canonical source scene could not be hashed";
+        return false;
+    }
+    if (current_hash != source_scene_hash_before_bake)
+    {
+        error = "canonical source scene changed during Client lightmap generation";
+        return false;
+    }
     return true;
 }
 
@@ -1289,20 +1616,65 @@ void NewPipelineClientRenderPath::FinishLightmapBake()
 {
     lightmap_bake_state = LightmapBakeState::Saving;
     lightmap_bake_status = "Lightmap: saving external package";
+    const float reciprocal_valid = lightmap_valid_texel_count > 0
+        ? 1.0f / static_cast<float>(lightmap_valid_texel_count)
+        : 0.0f;
+    if (lightmap_valid_texel_count == 0)
+        lightmap_irradiance_min = {};
+    wi::backlog::post(
+        "Client lightmap irradiance statistics: valid_texels=" + std::to_string(lightmap_valid_texel_count) +
+        " missing_texels=" + std::to_string(lightmap_missing_texel_count) +
+        " min=" + std::to_string(lightmap_irradiance_min.x) + "," +
+            std::to_string(lightmap_irradiance_min.y) + "," + std::to_string(lightmap_irradiance_min.z) +
+        " average=" + std::to_string(lightmap_irradiance_sum.x * reciprocal_valid) + "," +
+            std::to_string(lightmap_irradiance_sum.y * reciprocal_valid) + "," +
+            std::to_string(lightmap_irradiance_sum.z * reciprocal_valid) +
+        " max=" + std::to_string(lightmap_irradiance_max.x) + "," +
+            std::to_string(lightmap_irradiance_max.y) + "," + std::to_string(lightmap_irradiance_max.z));
     std::string error;
+    if (!VerifySourceSceneUnchanged(error))
+    {
+        FailLightmapBake(error);
+        return;
+    }
     if (!client_static_lighting.LightmapPackage().Save(
         prepared_package_temp_path,
-        prepared_scene_hash,
+        source_scene_hash_before_bake,
+        prepared_derived_scene_hash,
         local_scene,
         lightmap_bake_completed,
         lightmap_bake_settings,
         error))
+    {
+        wi::backlog::post("Client lightmap package diagnostics: save_failures=1 load_failures=0");
+        FailLightmapBake(error);
+        return;
+    }
+
+    // Validate the exact temporary outputs through the cold-start path before
+    // either final sidecar is moved. A malformed archive/package therefore
+    // cannot displace the previous known-good pair.
+    wi::scene::Scene validation_scene;
+    const ClientLightmapPackageResult temp_load_result =
+        client_static_lighting.LightmapPackage().LoadFromPaths(
+            scene_asset_path,
+            prepared_scene_temp_path,
+            prepared_package_temp_path,
+            validation_scene);
+    if (!temp_load_result.success || temp_load_result.loaded_count != lightmap_bake_completed.size())
+    {
+        wi::backlog::post("Client lightmap package diagnostics: temp_validation_failures=1");
+        FailLightmapBake("temporary sidecar validation failed - " + temp_load_result.diagnostic);
+        return;
+    }
+    if (!VerifySourceSceneUnchanged(error))
     {
         FailLightmapBake(error);
         return;
     }
     if (!CommitLightmapBakeFiles(error))
     {
+        wi::backlog::post("Client lightmap package diagnostics: commit_failures=1 load_failures=0");
         FailLightmapBake(error);
         return;
     }
@@ -1315,6 +1687,7 @@ void NewPipelineClientRenderPath::FinishLightmapBake()
         client_static_lighting.LoadLightmaps(scene_asset_path, local_scene);
     if (!load_result.success || load_result.loaded_count != lightmap_bake_completed.size())
     {
+        wi::backlog::post("Client lightmap package diagnostics: save_failures=0 load_failures=1");
         wi::renderer::SetRaytraceBounceCount(previous_raytrace_bounce_count);
         render_settings.lightmap_bake_requested = false;
         active_lightmap_bake_entity = wi::ecs::INVALID_ENTITY;
@@ -1323,16 +1696,37 @@ void NewPipelineClientRenderPath::FinishLightmapBake()
         client_static_lighting.SetLightmapStatus(ClientLightingAssetState::Corrupt, lightmap_bake_status);
         static_lighting_bake_requested = false;
         wi::backlog::post(lightmap_bake_status);
+        LogLightmapSceneParity("reload verification failed");
         return;
     }
+    scene_source_root_entity = wi::ecs::INVALID_ENTITY;
+    environment_probe_entity = wi::ecs::INVALID_ENTITY;
+    environment_probe_created_by_client = false;
+    environment_probe_load_attempted = false;
+    ApplyEnvironmentProbeSettings(false);
+    if (!VerifySourceSceneUnchanged(error))
+    {
+        wi::renderer::SetRaytraceBounceCount(previous_raytrace_bounce_count);
+        render_settings.lightmap_bake_requested = false;
+        active_lightmap_bake_entity = wi::ecs::INVALID_ENTITY;
+        lightmap_bake_state = LightmapBakeState::Failed;
+        lightmap_bake_status = "Lightmap: sidecars committed but " + error;
+        client_static_lighting.SetLightmapStatus(ClientLightingAssetState::Stale, lightmap_bake_status);
+        static_lighting_bake_requested = false;
+        wi::backlog::post(lightmap_bake_status);
+        return;
+    }
+    wi::backlog::post("Client lightmap package diagnostics: save_failures=0 load_failures=0 loaded=" +
+        std::to_string(load_result.loaded_count));
+    LogLightmapSceneParity("completed");
     wi::renderer::SetRaytraceBounceCount(previous_raytrace_bounce_count);
     render_settings.lightmap_bake_requested = false;
     lightmap_bake_state = LightmapBakeState::Completed;
     lightmap_bake_status = "Lightmap: complete and reload-verified " +
         std::to_string(load_result.loaded_count) + " objects -> " +
+        ClientLightmapPackage::DerivedScenePathForScene(scene_asset_path) + " + " +
         ClientLightmapPackage::PackagePathForScene(scene_asset_path);
     client_static_lighting.SetLightmapStatus(ClientLightingAssetState::Valid, lightmap_bake_status);
-    environment_probe_created_by_client = false;
     client_static_lighting.ClearStale();
     baked_sun_state = sun_state;
     baked_sun_reference_valid = true;
@@ -1364,10 +1758,15 @@ void NewPipelineClientRenderPath::FailLightmapBake(const std::string& reason)
     wi::renderer::SetRaytraceBounceCount(previous_raytrace_bounce_count);
     CleanupLightmapBakeTemps();
     ReloadSceneAfterLightmapBakeAbort();
+    std::string source_error;
+    const bool source_unchanged = VerifySourceSceneUnchanged(source_error);
+    LogLightmapSceneParity("failed");
     render_settings.lightmap_bake_requested = false;
     active_lightmap_bake_entity = wi::ecs::INVALID_ENTITY;
     lightmap_bake_state = LightmapBakeState::Failed;
     lightmap_bake_status = "Lightmap: failed - " + reason;
+    if (!source_unchanged)
+        lightmap_bake_status += "; " + source_error;
     static_lighting_bake_requested = false;
     wi::backlog::post(lightmap_bake_status);
 }
@@ -1395,6 +1794,8 @@ void NewPipelineClientRenderPath::ReloadSceneAfterLightmapBakeAbort()
     ApplySunStateToScene(local_scene, sun_state);
     const ClientLightmapPackageResult package_result =
         client_static_lighting.LoadLightmaps(scene_asset_path, local_scene);
+    if (package_result.scene_replaced)
+        scene_source_root_entity = wi::ecs::INVALID_ENTITY;
     wi::backlog::post(package_result.diagnostic);
     lightmap_bake_status = client_static_lighting.GetLightmapStatus();
     ApplyEnvironmentProbeSettings(false);
@@ -1407,6 +1808,26 @@ void NewPipelineClientRenderPath::ReloadSceneAfterLightmapBakeAbort()
         if (wi::scene::EnvironmentProbeComponent* probe = local_scene.probes.GetComponent(environment_probe_entity))
             InitializeBlackEnvironmentProbe(*probe);
     }
+}
+
+void NewPipelineClientRenderPath::LogLightmapSceneParity(const char* phase)
+{
+    if (!lightmap_bake_scene_fingerprint_valid)
+        return;
+
+    const SceneParityFingerprint current = ComputeSceneParityFingerprint(local_scene);
+    const bool matches = current.hash == lightmap_bake_scene_fingerprint.hash;
+    wi::backlog::post(
+        std::string{"Client lightmap scene parity ["} + phase + "]: " +
+        (matches ? "MATCH " : "MISMATCH expected=0x") +
+        (matches ? FormatSceneParityFingerprint(current) :
+            [&]() {
+                std::ostringstream stream;
+                stream << std::hex << lightmap_bake_scene_fingerprint.hash << " actual="
+                       << FormatSceneParityFingerprint(current);
+                return stream.str();
+            }()));
+    lightmap_bake_scene_fingerprint_valid = false;
 }
 
 void NewPipelineClientRenderPath::UpdateLocalCamera(float dt)
@@ -1702,6 +2123,7 @@ void NewPipelineClientRenderPath::AcceptRemoteFrame(const RemoteRawFrame& frame)
     remote_consume.height = metadata.height;
     remote_consume.confidence = metadata.confidence;
     remote_consume.accepted_valid = true;
+    accepted_remote_metadata = metadata;
     remote_ddgi_frame_index = metadata.ddgi_frame_index;
     remote_ddgi_reset_reason = metadata.ddgi_reset_reason;
     remote_consume.placeholder = false;
@@ -1845,6 +2267,10 @@ const wi::graphics::Texture* NewPipelineClientRenderPath::GetDebugPreviewTexture
         return visibilityResources.texture_normal_roughness.IsValid() ? &visibilityResources.texture_normal_roughness : nullptr;
     case DebugPreviewMode::LocalIndirectDiffuse:
         return local_lightmap_irradiance.IsValid() ? &local_lightmap_irradiance : nullptr;
+    case DebugPreviewMode::LocalLightmapValidity:
+        return local_lightmap_validity.IsValid() ? &local_lightmap_validity : nullptr;
+    case DebugPreviewMode::LocalIndirectFinalInput:
+        return local_indirect_final_input.IsValid() ? &local_indirect_final_input : nullptr;
     case DebugPreviewMode::LocalAO:
         return local_ao_snapshot.IsValid() ? &local_ao_snapshot : nullptr;
     case DebugPreviewMode::LocalSpecularIndirect:
@@ -1863,6 +2289,10 @@ const wi::graphics::Texture* NewPipelineClientRenderPath::GetDebugPreviewTexture
         return remote_consume.accepted_valid && (accepted_remote_buffer_mask & RemoteBufferKindMask(RemoteBufferSemantic::RemoteSpecularIndirect)) && accepted_remote_textures[2].IsValid() ? &accepted_remote_textures[2] : nullptr;
     case DebugPreviewMode::RemoteShadowVisibility:
         return remote_consume.accepted_valid && (accepted_remote_buffer_mask & RemoteBufferKindMask(RemoteBufferSemantic::RemoteShadowVisibility)) && accepted_remote_textures[3].IsValid() ? &accepted_remote_textures[3] : nullptr;
+    case DebugPreviewMode::ElasticIndirectDiffuse:
+        return elastic_indirect_diffuse.IsValid() ? &elastic_indirect_diffuse : nullptr;
+    case DebugPreviewMode::ElasticAO:
+        return elastic_ao.IsValid() ? &elastic_ao : nullptr;
     case DebugPreviewMode::Final:
     case DebugPreviewMode::RemoteOverview:
     default:
@@ -1943,15 +2373,18 @@ void NewPipelineClientRenderPath::Compose(wi::graphics::CommandList cmd) const
         else if (debug_preview_mode == DebugPreviewMode::GBufferRoughness)
             fx.color = XMFLOAT4(0.0f, 0.0f, 4.0f, 1.0f);
         else if (debug_preview_mode == DebugPreviewMode::LocalIndirectDiffuse ||
+            debug_preview_mode == DebugPreviewMode::LocalIndirectFinalInput ||
             debug_preview_mode == DebugPreviewMode::LocalSpecularIndirect ||
             debug_preview_mode == DebugPreviewMode::LocalReflectionProbe ||
             debug_preview_mode == DebugPreviewMode::RemoteIndirectDiffuse ||
-            debug_preview_mode == DebugPreviewMode::RemoteSpecularIndirect)
+            debug_preview_mode == DebugPreviewMode::RemoteSpecularIndirect ||
+            debug_preview_mode == DebugPreviewMode::ElasticIndirectDiffuse)
             fx.enableDebugTonemap();
         if (debug_preview_mode == DebugPreviewMode::LocalAO ||
             debug_preview_mode == DebugPreviewMode::LocalShadowVisibility ||
             debug_preview_mode == DebugPreviewMode::RemoteAO ||
-            debug_preview_mode == DebugPreviewMode::RemoteShadowVisibility)
+            debug_preview_mode == DebugPreviewMode::RemoteShadowVisibility ||
+            debug_preview_mode == DebugPreviewMode::ElasticAO)
             fx.enableExtractChannelR();
         wi::image::Draw(debug_texture, fx, cmd);
         wi::RenderPath2D::Compose(cmd);

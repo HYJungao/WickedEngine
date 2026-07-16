@@ -26,6 +26,19 @@ struct VisibilityPushConstants
 {
 	uint global_tile_offset;
 	int specular_indirect_uav;
+	int local_indirect_diffuse_uav;
+	int local_indirect_padding0;
+	int local_indirect_padding1;
+	int local_indirect_padding2;
+	int elastic_indirect_diffuse_uav;
+	int elastic_ao_uav;
+	int remote_indirect_diffuse_texture;
+	int remote_ao_texture;
+	float remote_indirect_diffuse_weight;
+	float remote_ao_weight;
+	float4 remote_clip_x;
+	float4 remote_clip_y;
+	float4 remote_clip_w;
 };
 PUSHCONSTANT(push, VisibilityPushConstants);
 
@@ -85,11 +98,62 @@ void main(uint Gid : SV_GroupID, uint groupIndex : SV_GroupIndex)
 		surface.gi = lerp(ambient, ambient * surface.sss.rgb, saturate(surface.sss.a));
 	}
 
+	// Exact material-independent local diffuse GI consumed by Final before the
+	// remote elastic blend. Dynamic and otherwise unbaked surfaces use the same
+	// ambient/SSS fallback as the regular Final path.
+	[branch]
+	if (push.local_indirect_diffuse_uav >= 0)
+	{
+		RWTexture2D<float4> output_local_indirect_diffuse =
+			bindless_rwtextures[descriptor_index(push.local_indirect_diffuse_uav)];
+		output_local_indirect_diffuse[pixel] = float4(max(0, surface.gi * PI), 1);
+	}
+
+	// Remote DDGI and RTAO are generated in the Server frame's screen space.
+	// Reproject this frame's world-space surface into that view instead of
+	// sampling with the current screen UV. A source-depth companion is not part
+	// of the V2 transport yet, so this validates projected viewport coverage but cannot
+	// reject every old-view disocclusion.
+	float2 remote_uv = 0;
+	bool remote_reprojection_valid = false;
+	[branch]
+	if ((push.remote_indirect_diffuse_texture >= 0 && push.remote_indirect_diffuse_weight > 0) ||
+		(push.remote_ao_texture >= 0 && push.remote_ao_weight > 0))
+	{
+		const float4 world_position = float4(surface.P, 1);
+		const float remote_clip_w = dot(push.remote_clip_w, world_position);
+		if (remote_clip_w > 0)
+		{
+			const float2 remote_ndc = float2(
+				dot(push.remote_clip_x, world_position),
+				dot(push.remote_clip_y, world_position)) / remote_clip_w;
+			remote_uv = clipspace_to_uv(remote_ndc);
+			remote_reprojection_valid = all(remote_uv >= 0) && all(remote_uv <= 1);
+		}
+	}
+
+	half3 elastic_indirect_diffuse = surface.gi;
+	[branch]
+	if (remote_reprojection_valid && push.remote_indirect_diffuse_texture >= 0 &&
+		push.remote_indirect_diffuse_weight > 0)
+	{
+		Texture2D<half4> remote_indirect_diffuse =
+			bindless_textures_half4[descriptor_index(push.remote_indirect_diffuse_texture)];
+		// RemoteIndirectDiffuseFormal is irradiance (includes PI), while Wicked's
+		// internal diffuse GI term is stored after the Lambert PI divide.
+		half3 remote_gi = remote_indirect_diffuse.SampleLevel(sampler_linear_clamp, remote_uv, 0).rgb / PI;
+		elastic_indirect_diffuse = lerp(
+			elastic_indirect_diffuse,
+			remote_gi,
+			saturate(push.remote_indirect_diffuse_weight));
+	}
+
 	Lighting lighting;
-	lighting.create(0, 0, surface.gi, 0);
+	lighting.create(0, 0, elastic_indirect_diffuse, 0);
 
 	TiledLighting(surface, lighting, entity_flat_tile_index, camera);
 
+	half elastic_screen_ao = 1;
 #ifndef CARTOON
 	[branch]
 	if (camera.texture_ssr_index >= 0)
@@ -105,9 +169,35 @@ void main(uint Gid : SV_GroupID, uint groupIndex : SV_GroupIndex)
 	[branch]
 	if (camera.texture_ao_index >= 0)
 	{
-		surface.occlusion *= bindless_textures_half4[descriptor_index(camera.texture_ao_index)].SampleLevel(sampler_linear_clamp, surface.screenUV, 0).r;
+		elastic_screen_ao = bindless_textures_half4[descriptor_index(camera.texture_ao_index)].SampleLevel(
+			sampler_linear_clamp, surface.screenUV, 0).r;
 	}
+	[branch]
+	if (remote_reprojection_valid && push.remote_ao_texture >= 0 && push.remote_ao_weight > 0)
+	{
+		Texture2D<half4> remote_ao = bindless_textures_half4[descriptor_index(push.remote_ao_texture)];
+		elastic_screen_ao = lerp(
+			elastic_screen_ao,
+			remote_ao.SampleLevel(sampler_linear_clamp, remote_uv, 0).r,
+			saturate(push.remote_ao_weight));
+	}
+	surface.occlusion *= elastic_screen_ao;
 #endif // CARTOON
+
+	[branch]
+	if (push.elastic_indirect_diffuse_uav >= 0)
+	{
+		RWTexture2D<float4> output_elastic_indirect_diffuse =
+			bindless_rwtextures[descriptor_index(push.elastic_indirect_diffuse_uav)];
+		output_elastic_indirect_diffuse[pixel] = float4(max(0, elastic_indirect_diffuse * PI), 1);
+	}
+	[branch]
+	if (push.elastic_ao_uav >= 0)
+	{
+		RWTexture2D<float4> output_elastic_ao =
+			bindless_rwtextures[descriptor_index(push.elastic_ao_uav)];
+		output_elastic_ao[pixel] = float4(elastic_screen_ao.xxx, 1);
+	}
 
 	// Debug output is the exact environment/SSR/RT indirect-specular term that
 	// ApplyLighting contributes to Final, including material Fresnel, roughness

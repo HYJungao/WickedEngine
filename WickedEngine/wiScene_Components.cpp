@@ -2015,6 +2015,7 @@ namespace wi::scene
 		lightmapHeight = 0;
 		lightmapIterationCount = 0;
 		lightmapTextureData.clear();
+		lightmapStatistics = {};
 		SetLightmapRenderRequest(false);
 	}
 	void ObjectComponent::SaveLightmap()
@@ -2026,6 +2027,52 @@ namespace wi::scene
 
 			bool success = wi::helper::saveTextureToMemory(lightmap, lightmapTextureData);
 			assert(success);
+			lightmapStatistics = {};
+			if (success && lightmap.desc.format == Format::R16G16B16A16_FLOAT)
+			{
+				const uint64_t texel_count = uint64_t(lightmapWidth) * uint64_t(lightmapHeight);
+				if (lightmapTextureData.size() >= texel_count * sizeof(XMHALF4))
+				{
+					const XMHALF4* texels = reinterpret_cast<const XMHALF4*>(lightmapTextureData.data());
+					XMFLOAT3 minimum(FLT_MAX, FLT_MAX, FLT_MAX);
+					XMFLOAT3 maximum = {};
+					XMFLOAT3 sum = {};
+					for (uint64_t i = 0; i < texel_count; ++i)
+					{
+						XMFLOAT4 sample;
+						XMStoreFloat4(&sample, XMLoadHalf4(texels + i));
+						if (sample.w <= 0)
+						{
+							++lightmapStatistics.missing_texel_count;
+							continue;
+						}
+						const XMFLOAT3 irradiance(
+							std::max(0.0f, sample.x * XM_PI),
+							std::max(0.0f, sample.y * XM_PI),
+							std::max(0.0f, sample.z * XM_PI));
+						minimum.x = std::min(minimum.x, irradiance.x);
+						minimum.y = std::min(minimum.y, irradiance.y);
+						minimum.z = std::min(minimum.z, irradiance.z);
+						maximum.x = std::max(maximum.x, irradiance.x);
+						maximum.y = std::max(maximum.y, irradiance.y);
+						maximum.z = std::max(maximum.z, irradiance.z);
+						sum.x += irradiance.x;
+						sum.y += irradiance.y;
+						sum.z += irradiance.z;
+						++lightmapStatistics.valid_texel_count;
+					}
+					if (lightmapStatistics.valid_texel_count > 0)
+					{
+						const float reciprocal = 1.0f / static_cast<float>(lightmapStatistics.valid_texel_count);
+						lightmapStatistics.irradiance_min = minimum;
+						lightmapStatistics.irradiance_average = XMFLOAT3(
+							sum.x * reciprocal,
+							sum.y * reciprocal,
+							sum.z * reciprocal);
+						lightmapStatistics.irradiance_max = maximum;
+					}
+				}
+			}
 
 #ifdef OPEN_IMAGE_DENOISE
 			if (success)

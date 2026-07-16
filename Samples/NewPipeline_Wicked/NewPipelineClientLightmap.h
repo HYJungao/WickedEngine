@@ -20,7 +20,10 @@ struct ClientLightmapBakeSettings
 struct ClientLightmapPackageResult
 {
     bool success = false;
+    bool scene_replaced = false;
     uint32_t loaded_count = 0;
+    uint64_t source_scene_hash = 0;
+    uint64_t derived_scene_hash = 0;
     std::string diagnostic;
 };
 
@@ -28,7 +31,11 @@ class ClientLightmapPackage
 {
 public:
     static constexpr const char* kObjectIdMetadataKey = "newpipeline.client_lightmap_id";
+    static constexpr uint32_t kPackageVersion = 2;
+    static constexpr uint32_t kDerivedSceneVersion = 1;
+    static constexpr uint32_t kObjectMappingVersion = 1;
 
+    static std::string DerivedScenePathForScene(const std::string& scene_path);
     static std::string PackagePathForScene(const std::string& scene_path);
     static uint64_t HashFile(const std::string& path);
     static std::string GetObjectId(const wi::scene::Scene& scene, wi::ecs::Entity entity);
@@ -36,9 +43,15 @@ public:
     static void ClearSceneLightmaps(wi::scene::Scene& scene, bool preserve_dimensions = true);
 
     ClientLightmapPackageResult Load(const std::string& scene_path, wi::scene::Scene& scene);
+    ClientLightmapPackageResult LoadFromPaths(
+        const std::string& source_scene_path,
+        const std::string& derived_scene_path,
+        const std::string& package_path,
+        wi::scene::Scene& scene);
     bool Save(
         const std::string& package_path,
-        uint64_t scene_hash,
+        uint64_t source_scene_hash,
+        uint64_t derived_scene_hash,
         const wi::scene::Scene& scene,
         const std::vector<wi::ecs::Entity>& entities,
         const ClientLightmapBakeSettings& settings,

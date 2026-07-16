@@ -6,8 +6,11 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <filesystem>
+#include <iomanip>
 #include <limits>
+#include <sstream>
 #include <vector>
 
 namespace wicked_newpipeline
@@ -19,6 +22,135 @@ constexpr uint32_t kDefaultViewportHeight = 720;
 constexpr const char* kNewPipelineSunName = "NewPipelineSun";
 constexpr float kDefaultSunIntensity = 10.0f;
 constexpr float kDefaultSunRange = 100.0f;
+
+class SceneFingerprintBuilder
+{
+public:
+    void AddBool(bool value)
+    {
+        AddU32(value ? 1u : 0u);
+    }
+
+    void AddU32(uint32_t value)
+    {
+        for (uint32_t shift = 0; shift < 32; shift += 8)
+            AddByte(static_cast<uint8_t>((value >> shift) & 0xFFu));
+    }
+
+    void AddU64(uint64_t value)
+    {
+        for (uint32_t shift = 0; shift < 64; shift += 8)
+            AddByte(static_cast<uint8_t>((value >> shift) & 0xFFu));
+    }
+
+    void AddFloat(float value)
+    {
+        uint32_t bits = 0;
+        static_assert(sizeof(bits) == sizeof(value));
+        std::memcpy(&bits, &value, sizeof(bits));
+        AddU32(bits);
+    }
+
+    void AddFloat2(const XMFLOAT2& value)
+    {
+        AddFloat(value.x);
+        AddFloat(value.y);
+    }
+
+    void AddFloat3(const XMFLOAT3& value)
+    {
+        AddFloat(value.x);
+        AddFloat(value.y);
+        AddFloat(value.z);
+    }
+
+    void AddFloat4(const XMFLOAT4& value)
+    {
+        AddFloat(value.x);
+        AddFloat(value.y);
+        AddFloat(value.z);
+        AddFloat(value.w);
+    }
+
+    void AddString(const std::string& value)
+    {
+        AddU64(static_cast<uint64_t>(value.size()));
+        for (char character : value)
+            AddByte(static_cast<uint8_t>(character));
+    }
+
+    uint64_t GetHash() const
+    {
+        return hash;
+    }
+
+private:
+    void AddByte(uint8_t value)
+    {
+        hash ^= value;
+        hash *= 1099511628211ull;
+    }
+
+    uint64_t hash = 14695981039346656037ull;
+};
+
+void AddName(SceneFingerprintBuilder& builder, const wi::scene::Scene& scene, wi::ecs::Entity entity)
+{
+    const wi::scene::NameComponent* name = scene.names.GetComponent(entity);
+    builder.AddBool(name != nullptr);
+    if (name != nullptr)
+        builder.AddString(name->name);
+}
+
+void AddTransform(SceneFingerprintBuilder& builder, const wi::scene::Scene& scene, wi::ecs::Entity entity)
+{
+    const wi::scene::TransformComponent* transform = scene.transforms.GetComponent(entity);
+    builder.AddBool(transform != nullptr);
+    if (transform == nullptr)
+        return;
+    builder.AddFloat3(transform->scale_local);
+    builder.AddFloat4(transform->rotation_local);
+    builder.AddFloat3(transform->translation_local);
+}
+
+void AddLayer(SceneFingerprintBuilder& builder, const wi::scene::Scene& scene, wi::ecs::Entity entity)
+{
+    const wi::scene::LayerComponent* layer = scene.layers.GetComponent(entity);
+    builder.AddBool(layer != nullptr);
+    if (layer != nullptr)
+        builder.AddU32(layer->layerMask);
+}
+
+uint64_t StableComponentIndex(size_t index)
+{
+    return index == wi::ecs::INVALID_INDEX ? std::numeric_limits<uint64_t>::max() : static_cast<uint64_t>(index);
+}
+
+void AddParentBinding(SceneFingerprintBuilder& builder, const wi::scene::Scene& scene, wi::ecs::Entity entity)
+{
+    const wi::scene::HierarchyComponent* hierarchy = scene.hierarchy.GetComponent(entity);
+    builder.AddBool(hierarchy != nullptr);
+    if (hierarchy == nullptr)
+        return;
+
+    const wi::ecs::Entity parent = hierarchy->parentID;
+    AddName(builder, scene, parent);
+    builder.AddU64(StableComponentIndex(scene.names.GetIndex(parent)));
+    builder.AddU64(StableComponentIndex(scene.transforms.GetIndex(parent)));
+    builder.AddU64(StableComponentIndex(scene.objects.GetIndex(parent)));
+    builder.AddU64(StableComponentIndex(scene.meshes.GetIndex(parent)));
+    builder.AddU64(StableComponentIndex(scene.materials.GetIndex(parent)));
+    builder.AddU64(StableComponentIndex(scene.lights.GetIndex(parent)));
+    builder.AddU64(StableComponentIndex(scene.emitters.GetIndex(parent)));
+}
+
+void AddEntityState(SceneFingerprintBuilder& builder, const wi::scene::Scene& scene, wi::ecs::Entity entity)
+{
+    AddName(builder, scene, entity);
+    AddTransform(builder, scene, entity);
+    AddLayer(builder, scene, entity);
+    AddParentBinding(builder, scene, entity);
+}
 
 std::string SceneStatsString(const SceneInitializationResult& result)
 {
@@ -391,6 +523,144 @@ SceneInitializationResult InitializeDefaultScene(wi::scene::Scene& scene)
     PromoteAuthoritativeSunToFirstLight(scene);
 
     return result;
+}
+
+SceneParityFingerprint ComputeSceneParityFingerprint(const wi::scene::Scene& scene)
+{
+    SceneParityFingerprint result;
+    result.object_count = static_cast<uint32_t>(scene.objects.GetCount());
+    result.mesh_count = static_cast<uint32_t>(scene.meshes.GetCount());
+    result.material_count = static_cast<uint32_t>(scene.materials.GetCount());
+    result.light_count = static_cast<uint32_t>(scene.lights.GetCount());
+    result.emitter_count = static_cast<uint32_t>(scene.emitters.GetCount());
+
+    SceneFingerprintBuilder builder;
+    builder.AddString("newpipeline.scene-parity.v1");
+    builder.AddU32(result.object_count);
+    builder.AddU32(result.mesh_count);
+    builder.AddU32(result.material_count);
+    builder.AddU32(result.light_count);
+    builder.AddU32(result.emitter_count);
+
+    for (size_t i = 0; i < scene.objects.GetCount(); ++i)
+    {
+        const wi::ecs::Entity entity = scene.objects.GetEntity(i);
+        const wi::scene::ObjectComponent& object = scene.objects[i];
+        builder.AddString("object");
+        AddEntityState(builder, scene, entity);
+        builder.AddU64(StableComponentIndex(scene.meshes.GetIndex(object.meshID)));
+        builder.AddBool(object.IsRenderable());
+        builder.AddBool(object.IsCastingShadow());
+        builder.AddBool(object.IsDynamic());
+        builder.AddBool(object.IsNotVisibleInMainCamera());
+        builder.AddBool(object.IsNotVisibleInReflections());
+        builder.AddU32(object.filterMask);
+        builder.AddFloat4(object.color);
+        builder.AddFloat4(object.emissiveColor);
+        builder.AddFloat(object.lod_bias);
+        builder.AddFloat(object.draw_distance);
+    }
+
+    for (size_t i = 0; i < scene.meshes.GetCount(); ++i)
+    {
+        const wi::ecs::Entity entity = scene.meshes.GetEntity(i);
+        const wi::scene::MeshComponent& mesh = scene.meshes[i];
+        builder.AddString("mesh");
+        AddEntityState(builder, scene, entity);
+        // Atlas generation can duplicate vertices and rewrite indices without
+        // changing authored world geometry or bindings. Keep that derived bake
+        // topology out of the Client/Server authored-state fingerprint.
+        builder.AddU64(static_cast<uint64_t>(mesh.subsets.size()));
+        builder.AddU32(mesh.subsets_per_lod);
+        builder.AddBool(mesh.IsRenderable());
+        builder.AddBool(mesh.IsDynamic());
+        for (const wi::scene::MeshComponent::MeshSubset& subset : mesh.subsets)
+        {
+            builder.AddString(subset.surfaceName);
+            builder.AddU64(StableComponentIndex(scene.materials.GetIndex(subset.materialID)));
+        }
+    }
+
+    for (size_t i = 0; i < scene.materials.GetCount(); ++i)
+    {
+        const wi::ecs::Entity entity = scene.materials.GetEntity(i);
+        const wi::scene::MaterialComponent& material = scene.materials[i];
+        builder.AddString("material");
+        AddEntityState(builder, scene, entity);
+        const bool emitter_owned = scene.emitters.Contains(entity);
+        builder.AddBool(emitter_owned);
+        if (!emitter_owned)
+            builder.AddU32(static_cast<uint32_t>(material.shaderType));
+        builder.AddU32(static_cast<uint32_t>(material.userBlendMode));
+        builder.AddFloat4(material.baseColor);
+        builder.AddFloat4(material.emissiveColor);
+        builder.AddFloat(material.roughness);
+        builder.AddFloat(material.reflectance);
+        builder.AddFloat(material.metalness);
+        builder.AddFloat(material.alphaRef);
+        builder.AddBool(material.IsCastingShadow());
+        builder.AddBool(material.IsReceiveShadow());
+        builder.AddBool(material.IsDoubleSided());
+        for (const wi::scene::MaterialComponent::TextureMap& texture : material.textures)
+        {
+            builder.AddString(texture.name);
+            builder.AddU32(texture.uvset);
+        }
+    }
+
+    for (size_t i = 0; i < scene.lights.GetCount(); ++i)
+    {
+        const wi::ecs::Entity entity = scene.lights.GetEntity(i);
+        const wi::scene::LightComponent& light = scene.lights[i];
+        builder.AddString("light");
+        AddEntityState(builder, scene, entity);
+        builder.AddU32(static_cast<uint32_t>(light.GetType()));
+        builder.AddFloat3(light.color);
+        builder.AddFloat(light.intensity);
+        builder.AddFloat(light.range);
+        builder.AddFloat(light.outerConeAngle);
+        builder.AddFloat(light.innerConeAngle);
+        builder.AddFloat(light.radius);
+        builder.AddFloat(light.length);
+        builder.AddFloat(light.height);
+        builder.AddBool(light.IsCastingShadow());
+        builder.AddBool(light.IsStatic());
+        builder.AddBool(light.IsVolumetricsEnabled());
+    }
+
+    for (size_t i = 0; i < scene.emitters.GetCount(); ++i)
+    {
+        const wi::ecs::Entity entity = scene.emitters.GetEntity(i);
+        const wi::EmittedParticleSystem& emitter = scene.emitters[i];
+        builder.AddString("emitter");
+        AddEntityState(builder, scene, entity);
+        builder.AddU64(StableComponentIndex(scene.meshes.GetIndex(emitter.meshID)));
+        builder.AddU32(emitter._flags);
+        builder.AddU32(static_cast<uint32_t>(emitter.shaderType));
+        builder.AddU32(emitter.GetMaxParticleCount());
+        builder.AddFloat(emitter.count);
+        builder.AddFloat(emitter.life);
+        builder.AddFloat(emitter.random_life);
+        builder.AddFloat(emitter.size);
+        builder.AddFloat(emitter.random_factor);
+        builder.AddFloat3(emitter.velocity);
+        builder.AddFloat3(emitter.gravity);
+    }
+
+    result.hash = builder.GetHash();
+    return result;
+}
+
+std::string FormatSceneParityFingerprint(const SceneParityFingerprint& fingerprint)
+{
+    std::ostringstream stream;
+    stream << "hash=0x" << std::hex << std::setw(16) << std::setfill('0') << fingerprint.hash << std::dec
+           << " objects=" << fingerprint.object_count
+           << " meshes=" << fingerprint.mesh_count
+           << " materials=" << fingerprint.material_count
+           << " lights=" << fingerprint.light_count
+           << " emitters=" << fingerprint.emitter_count;
+    return stream.str();
 }
 
 NewPipelineCameraPreset GetDefaultCameraPreset(SceneInitializationKind kind)

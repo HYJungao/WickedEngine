@@ -16,6 +16,10 @@ struct NewPipelineClientRenderSettings
     bool environment_probe_enabled = true;
     bool baked_lightmaps_enabled = true;
     bool lightmap_bake_requested = false;
+    bool remote_gi_enabled = true;
+    bool remote_ao_enabled = true;
+    float remote_gi_max_weight = 1.0f;
+    float remote_ao_max_weight = 1.0f;
 };
 
 struct RemoteConsumeState
@@ -48,6 +52,7 @@ public:
     DebugPreviewMode GetDebugPreviewMode() const { return debug_preview_mode; }
     std::string GetEffectiveAlgorithmSummary() const;
     std::string GetDebugStatusSummary() const;
+    std::string GetElasticLightingStatus() const;
     void SetInputActive(bool active);
     void SetRenderSettings(const NewPipelineClientRenderSettings& settings);
     const NewPipelineClientRenderSettings& GetRenderSettings() const { return render_settings; }
@@ -67,6 +72,8 @@ public:
     uint32_t GetReflectionProbeDebugMip() const { return reflection_probe_debug_mip; }
     uint32_t GetReflectionProbeDebugMipCount() const;
     const wi::graphics::Texture& GetLocalLightmapIrradiance() const { return local_lightmap_irradiance; }
+    const wi::graphics::Texture& GetLocalLightmapValidity() const { return local_lightmap_validity; }
+    const wi::graphics::Texture& GetLocalIndirectFinalInput() const { return local_indirect_final_input; }
 
     void Start() override;
     void Update(float dt) override;
@@ -91,6 +98,8 @@ private:
     void ConfigureLowEndLocalRendering();
     void ApplyShadowSettings(bool log_changes);
     void ApplySSAOSettings(bool log_changes);
+    void UpdateElasticLighting(float dt);
+    void ApplyElasticLightingResources();
     void ApplyEnvironmentProbeSettings(bool log_changes);
     void LoadStaticLightingAssets();
     void LoadEnvironmentProbeAsset();
@@ -102,7 +111,6 @@ private:
     void ApplyBakedLightmapSettings(bool previous_enabled, bool log_changes, bool force_log = false);
     void DisableBakedLightmaps();
     void RestoreBakedLightmaps();
-    bool ObjectSupportsLightmapBake(const wi::scene::ObjectComponent& object) const;
     bool PrepareLightmapBake();
     void UpdateLightmapBake();
     bool StartNextLightmapBake();
@@ -110,8 +118,10 @@ private:
     void FailLightmapBake(const std::string& reason);
     bool SavePreparedScene(const std::string& path, std::string& error);
     bool CommitLightmapBakeFiles(std::string& error);
+    bool VerifySourceSceneUnchanged(std::string& error) const;
     void CleanupLightmapBakeTemps();
     void ReloadSceneAfterLightmapBakeAbort();
+    void LogLightmapSceneParity(const char* phase);
 
     RuntimeConfig config;
     enum class LightmapBakeState : uint8_t
@@ -155,13 +165,22 @@ private:
     size_t lightmap_bake_next_index = 0;
     uint32_t lightmap_bake_skipped = 0;
     uint32_t previous_raytrace_bounce_count = 0;
-    uint64_t prepared_scene_hash = 0;
+    uint64_t source_scene_hash_before_bake = 0;
+    uint64_t prepared_derived_scene_hash = 0;
+    XMFLOAT3 lightmap_irradiance_min = {};
+    XMFLOAT3 lightmap_irradiance_sum = {};
+    XMFLOAT3 lightmap_irradiance_max = {};
+    uint64_t lightmap_valid_texel_count = 0;
+    uint64_t lightmap_missing_texel_count = 0;
+    SceneParityFingerprint lightmap_bake_scene_fingerprint;
+    bool lightmap_bake_scene_fingerprint_valid = false;
     bool lightmap_cancel_requested = false;
     FileMockControlMailbox mock_control_mailbox;
     FileMockRemoteMailbox mock_remote_mailbox;
     WebRTCVideoTransport webrtc_transport;
     std::array<wi::graphics::Texture, static_cast<size_t>(RemoteBufferSemantic::Count)> accepted_remote_textures;
     uint32_t accepted_remote_buffer_mask = 0;
+    RemoteFrameMetadata accepted_remote_metadata;
     wi::ecs::Entity environment_probe_entity = wi::ecs::INVALID_ENTITY;
     bool environment_probe_created_by_client = false;
     bool environment_probe_load_attempted = false;
@@ -187,7 +206,14 @@ private:
     bool input_active = true;
     mutable wi::graphics::Texture local_ao_snapshot;
     wi::graphics::Texture local_lightmap_irradiance;
+    wi::graphics::Texture local_lightmap_validity;
+    wi::graphics::Texture local_indirect_final_input;
     wi::graphics::Texture local_specular_indirect;
+    wi::graphics::Texture elastic_indirect_diffuse;
+    wi::graphics::Texture elastic_ao;
+    float elastic_remote_gi_weight = 0.0f;
+    float elastic_remote_ao_weight = 0.0f;
+    float elastic_remote_quality = 0.0f;
     bool          status_logged = false;
     uint32_t remote_ddgi_frame_index = 0;
     DDGIResetReason remote_ddgi_reset_reason = DDGIResetReason::None;

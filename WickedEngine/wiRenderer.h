@@ -38,6 +38,9 @@ namespace wi::renderer
 	constexpr uint8_t raytracing_inclusion_mask_shadow = 1 << 0;
 	constexpr uint8_t raytracing_inclusion_mask_reflection = 1 << 1;
 	constexpr uint8_t raytracing_inclusion_mask_diffuse = 1 << 2;
+	// Dedicated to baked-lightmap rays. Runtime particles clear this bit while
+	// remaining visible to rasterization and all other raytracing effects.
+	constexpr uint8_t raytracing_inclusion_mask_lightmap = 1 << 3;
 
 	constexpr uint32_t CombineStencilrefs(wi::enums::STENCILREF engineStencilRef, uint8_t userStencilRef)
 	{
@@ -439,7 +442,22 @@ namespace wi::renderer
 		wi::graphics::GPUBuffer binned_tiles;			 // material type binning
 		wi::graphics::Texture texture_normal_roughness;
 		const wi::graphics::Texture* texture_lightmap_irradiance = nullptr; // optional material-independent lightmap irradiance output
+		const wi::graphics::Texture* texture_lightmap_validity = nullptr; // optional: green=baked, magenta=geometry without lightmap, black=sky
+		const wi::graphics::Texture* texture_local_indirect_diffuse = nullptr; // optional local Final GI input before remote blending (RGB includes PI)
 		const wi::graphics::Texture* texture_specular_indirect = nullptr; // optional final indirect-specular contribution for debugging
+		// Optional elastic-rendering inputs. These are screen-space results from
+		// another view; Visibility_Shade reprojects the current world-space
+		// surface into remote_view_projection before sampling them.
+		const wi::graphics::Texture* texture_remote_indirect_diffuse = nullptr; // material-independent irradiance (RGB, includes PI)
+		const wi::graphics::Texture* texture_remote_ao = nullptr; // scalar screen-space AO in R
+		float remote_indirect_diffuse_weight = 0;
+		float remote_ao_weight = 0;
+		XMFLOAT4X4 remote_view_projection = wi::math::IDENTITY_MATRIX;
+		// Optional outputs containing the values that were actually consumed by
+		// Final after local/remote blending. They are useful for validation and
+		// do not trigger an additional surface reconstruction pass.
+		const wi::graphics::Texture* texture_elastic_indirect_diffuse = nullptr;
+		const wi::graphics::Texture* texture_elastic_ao = nullptr;
 
 		// You can request any of these extra outputs to be written by VisibilityResolve:
 		const wi::graphics::Texture* depthbuffer = nullptr; // depth buffer that matches with post projection
@@ -453,7 +471,16 @@ namespace wi::renderer
 			binned_tiles = {};
 			texture_normal_roughness = {};
 			texture_lightmap_irradiance = nullptr;
+			texture_lightmap_validity = nullptr;
+			texture_local_indirect_diffuse = nullptr;
 			texture_specular_indirect = nullptr;
+			texture_remote_indirect_diffuse = nullptr;
+			texture_remote_ao = nullptr;
+			remote_indirect_diffuse_weight = 0;
+			remote_ao_weight = 0;
+			remote_view_projection = wi::math::IDENTITY_MATRIX;
+			texture_elastic_indirect_diffuse = nullptr;
+			texture_elastic_ao = nullptr;
 		}
 	};
 	void CreateVisibilityResourcesSimple(VisibilityResources& res, XMUINT2 resolution);

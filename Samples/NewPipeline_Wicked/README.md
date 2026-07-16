@@ -32,8 +32,10 @@ automatic camera orbit is applied.
 
 The Client starts on `Final`; receiving a remote frame never changes the
 selection. Its **Preview Buffer** menu contains the local low-end buffers,
-including material-independent `Local Lightmap Irradiance`,
-the four accepted remote buffers, and an explicit `Remote 2x2 Overview`. The
+including strict `Local Lightmap Irradiance`, `Local Lightmap Validity`, and
+material-independent `Local Indirect (Final Input)`,
+the four accepted remote buffers, the actual `Elastic GI` / `Elastic AO` Final
+inputs, and an explicit `Remote 2x2 Overview`. The
 Server debug panel contains `Final`, its four local producer buffers, and four
 pre-I420 `Transport` previews. Missing buffers render an explicit black/red
 `UNAVAILABLE` placeholder instead of silently falling back to Final. The
@@ -97,47 +99,95 @@ ray-traced diffuse/reflections/shadows, SSGI, SSR, screen-space shadows, and
 planar reflections are disabled. Lightmaps contribute to both Final and the
 full-resolution `Local Lightmap Irradiance` preview. That preview stores
 material-independent irradiance in RGB (`sampledLightmap * PI`) and validity in
-alpha; missing lightmaps and sky remain black. Static probes contribute to Final,
-and raster shadows remain in the light shadow-map atlas. Remote Server buffers are still
-received and available in the Client debug views. The effective algorithms are
+alpha; missing lightmaps and sky remain black. `Local Lightmap Validity` uses
+green for geometry with a valid lightmap/atlas, magenta for geometry without one,
+and black for sky. `Local Indirect (Final Input)` shows the exact local diffuse GI
+term used by Final before remote blending, including the ambient fallback on
+dynamic or otherwise unbaked geometry. Static probes contribute to Final,
+and raster shadows remain in the light shadow-map atlas. Remote DDGI and RTAO
+are consumed by Final through the elastic-lighting path described below;
+reflection and shadow remain preview-only. The effective algorithms are
 printed at startup and displayed in both debug panels.
+
+Lightmap eligibility is scene-independent. Automatic mode accepts renderable,
+opaque, non-dynamic meshes and excludes skinned, soft-body and particle-owned
+geometry. An object metadata string named `newpipeline.lightmap_bake_mode` can be
+set to `auto` (default), `exclude`, or `include`; explicit `include` may override
+dynamic/deformation/transparency checks but cannot make missing or non-renderable
+geometry bakeable. Preparation logs categorized coverage and atlas/package errors.
+
+## Elastic GI and AO
+
+The Client always computes its local fallback first: baked Lightmap (or ambient
+fallback) for diffuse GI and SSAO for screen-space AO. An accepted Server frame
+stores the exact Server view-projection matrix alongside the decoded DDGI and
+RTAO textures. During `Visibility_Shade`, each current world-space surface is
+projected into that Server view before the remote textures are sampled.
+
+Remote DDGI irradiance is converted to Wicked's internal Lambert-divided GI
+term and blended with the local GI. Local SSAO and remote RTAO are blended as
+screen-space AO before the result is multiplied by material AO. The current
+policy derives a transport quality from frame freshness and Server confidence,
+ramps DDGI in with its convergence state, applies independent user maximums,
+and smooths attack/release transitions. Missing, rejected, or stale inputs
+therefore converge back to the local result without changing render modes.
+
+The `Elastic GI / AO` panel exposes independent enable switches and maximum
+remote weights. `Elastic GI (Final Input)` and `Elastic AO (Final Input)` show
+the full-resolution values actually consumed by Final. V2 does not yet carry a
+source depth companion, so reprojection rejects out-of-viewport samples but
+cannot identify every old-view disocclusion; those pixels will require depth
+validation in a later policy revision.
 
 ## Client lightmap assets
 
-The Client uses one canonical `.wiscene`; it does not create a second baked
-scene. Persistent atlas UVs, per-object dimensions, and the
-`newpipeline.client_lightmap_id` metadata value stay in the canonical scene.
-BC6H texels are stored in a sibling package: `Sponza.wiscene` uses
-`Sponza.clientlightmap`.
+The authored `.wiscene` is immutable. Generated atlas topology, per-object
+dimensions, stable lightmap IDs, and the generated probe identity/placement are
+stored in a sibling derived scene. For any input scene the paths are derived by
+extension, for example:
 
-Normal startup is read-only. It validates the package version, source-scene
-FNV-1a hash, entry bounds, and per-entry CRC before assigning GPU textures. A
-missing, stale, truncated, or corrupt package is logged once and leaves the
-lightmap contribution black. CPU package bytes are released after upload.
+```text
+Sponza.wiscene                  authored source (never replaced by a bake)
+Sponza.clientlightmap.scene     derived Client atlas/identity scene
+Sponza.clientlightmap           BC6H lightmap package
+Sponza.clientprobe              BC6H reflection-probe package
+```
+
+Normal startup first loads the canonical source. It then validates the package
+version, source and derived-scene FNV-1a hashes, derived-scene and stable-ID
+mapping versions, bake settings, entry bounds, and per-entry CRC in a temporary
+scene. Only a completely valid sidecar pair replaces the Client's in-memory
+scene. Missing, stale, truncated, or corrupt sidecars leave the canonical scene
+active without partially attaching generated state. CPU package bytes are
+released after GPU upload.
 
 The Client debug window's recommended `Generate Client Lighting` entry point
 persists the Client probe placement, generates missing atlas UVs with xatlas, assigns stable object
 IDs, serializes a lightmap-free scene to a temporary file, and then bakes static
 opaque objects sequentially at 256-pixel target resolution, 512 samples, and
 three bounces. Completion writes BC6H data to a temporary package and commits
-the scene/package pair with rollback backups. It then captures and reload-verifies
-the Reflection Probe. The individual Lightmap and Probe buttons remain available
-for diagnostics. `Cancel Bake` or any failure preserves the previous files.
+only the two sidecars with rollback backups after the temporary pair passes the
+cold-start loader. The source hash is checked before preparation, before commit,
+and after reload. It then captures and reload-verifies the Reflection Probe. The
+individual Lightmap and Probe buttons remain available for diagnostics. `Cancel
+Bake` or any pre-commit failure preserves the previous sidecars and leaves the
+source byte-for-byte untouched.
 
 ## Client reflection probe asset
 
-The canonical scene contains the Client probe entity, its transform/volume and
-the stable `newpipeline.client_probe_id`. The BC6H cubemap is stored in one sibling
-`<scene>.clientprobe` package. Its header validates the full source-scene hash,
-probe ID, placement, resolution, mip count and payload CRC before loading the DDS
-payload from memory. The former raw `.clientprobe.dds` format is not loaded and is
-deleted after the next successful probe bake; there is no parallel legacy/r2 path.
+The derived Client scene contains the probe entity, its transform/volume and the
+stable `newpipeline.client_probe_id`. The BC6H cubemap is stored in one sibling
+`<scene>.clientprobe` package. Its header validates the full source and derived
+scene hashes, probe ID, placement, resolution, mip count and payload CRC before
+loading the DDS payload from memory. The former raw `.clientprobe.dds` format is
+not loaded and is deleted after the next successful probe bake; there is no
+parallel legacy/r2 path.
 
 An authored `NewPipelineEnvironmentProbe` keeps its scene transform. If it is
 missing, Generate Client Lighting creates a probe from the scene bounds and saves
-that entity into the same canonical `.wiscene`. Normal startup never creates IDs,
-modifies the scene or captures a probe. Missing, corrupt and stale packages use a
-black fallback and expose `MISSING`, `CORRUPT` or `STALE` in the Client panel.
+that entity into the derived `.clientlightmap.scene`. Normal startup never writes
+the source or captures a probe. Missing, corrupt and stale packages use a black
+fallback and expose `MISSING`, `CORRUPT` or `STALE` in the Client panel.
 
 Lightmaps and the Reflection Probe share the `ClientStaticLighting` asset-state
 service. Changing the runtime sun away from the baked sun marks both contributions

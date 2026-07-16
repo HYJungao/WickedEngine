@@ -15,6 +15,7 @@ struct VisibilityPushConstants
 {
 	uint global_tile_offset;
 	int lightmap_irradiance_uav;
+	int lightmap_validity_uav;
 };
 PUSHCONSTANT(push, VisibilityPushConstants);
 
@@ -77,6 +78,19 @@ void main(uint Gid : SV_GroupID, uint groupIndex : SV_GroupIndex)
 		output_lightmap_irradiance[pixel] = surface.IsGIApplied()
 			? float4(surface.gi * PI, 1)
 			: 0;
+	}
+
+	// Primitive validity is established before this shader is dispatched, so a
+	// written pixel always contains geometry. Do not classify from brightness:
+	// a valid lightmap texel is allowed to be physically black.
+	[branch]
+	if (push.lightmap_validity_uav >= 0)
+	{
+		RWTexture2D<float4> output_lightmap_validity =
+			bindless_rwtextures[descriptor_index(push.lightmap_validity_uav)];
+		output_lightmap_validity[pixel] = surface.IsGIApplied()
+			? float4(0, 1, 0, 1)
+			: float4(1, 0, 1, 1);
 	}
 
 	// Write out sampleable attributes for post processing into textures:

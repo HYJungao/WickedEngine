@@ -149,7 +149,10 @@ float4 main(Input input) : SV_TARGET
 	ray.Direction = normalize(sample_hemisphere_cos(surface.N, rng));
 	ray.TMin = 0.001;
 	ray.TMax = FLT_MAX;
-	float3 result = 0;
+	// Match the flat diffuse GI fallback used before a lightmap is attached.
+	// Weather::ambient is intentionally unoccluded, so seed every baked texel
+	// with it instead of only adding it to paths that manage to escape to sky.
+	float3 result = GetAmbientColor();
 	float3 energy = 1;
 
 	const uint bounces = xTraceUserData.x;

@@ -25,9 +25,8 @@ namespace wicked_newpipeline
 namespace
 {
 constexpr std::array<uint8_t, 4> kMagic = {'N', 'P', 'L', 'M'};
-constexpr uint32_t kVersion = 1;
 constexpr uint32_t kFormatBC6H = static_cast<uint32_t>(wi::graphics::Format::BC6H_UF16);
-constexpr size_t kHeaderSize = 4 + 4 + 8 + 4 + 4 + 4 + 4;
+constexpr size_t kHeaderSize = 4 + 4 + 8 + 8 + 4 + 4 + 4 + 4 + 4 + 4 + 4;
 
 template<typename T>
 void Append(wi::vector<uint8_t>& bytes, T value)
@@ -108,6 +107,13 @@ struct PackageEntry
 };
 } // namespace
 
+std::string ClientLightmapPackage::DerivedScenePathForScene(const std::string& scene_path)
+{
+    std::filesystem::path path(scene_path);
+    path.replace_extension(".clientlightmap.scene");
+    return path.generic_string();
+}
+
 std::string ClientLightmapPackage::PackagePathForScene(const std::string& scene_path)
 {
     std::filesystem::path path(scene_path);
@@ -161,16 +167,32 @@ void ClientLightmapPackage::ClearSceneLightmaps(wi::scene::Scene& scene, bool pr
 
 ClientLightmapPackageResult ClientLightmapPackage::Load(const std::string& scene_path, wi::scene::Scene& scene)
 {
-    ClientLightmapPackageResult result;
-    ClearSceneLightmaps(scene);
+    return LoadFromPaths(
+        scene_path,
+        DerivedScenePathForScene(scene_path),
+        PackagePathForScene(scene_path),
+        scene);
+}
 
-    if (scene_path.empty())
+ClientLightmapPackageResult ClientLightmapPackage::LoadFromPaths(
+    const std::string& source_scene_path,
+    const std::string& derived_scene_path,
+    const std::string& package_path,
+    wi::scene::Scene& scene)
+{
+    ClientLightmapPackageResult result;
+
+    if (source_scene_path.empty())
     {
         result.diagnostic = "Client Lightmap package unavailable: scene has no source path";
         return result;
     }
 
-    const std::string package_path = PackagePathForScene(scene_path);
+    if (!wi::helper::FileExists(derived_scene_path))
+    {
+        result.diagnostic = "Client Lightmap derived scene missing: " + derived_scene_path;
+        return result;
+    }
     wi::vector<uint8_t> bytes;
     if (!wi::helper::FileRead(package_path, bytes))
     {
@@ -185,43 +207,86 @@ ClientLightmapPackageResult ClientLightmapPackage::Load(const std::string& scene
 
     size_t cursor = kMagic.size();
     uint32_t version = 0;
-    uint64_t scene_hash = 0;
+    uint64_t source_scene_hash = 0;
+    uint64_t derived_scene_hash = 0;
+    uint32_t derived_scene_version = 0;
+    uint32_t object_mapping_version = 0;
+    uint32_t resolution = 0;
     uint32_t sample_count = 0;
     uint32_t bounce_count = 0;
     uint32_t entry_count = 0;
     uint32_t reserved = 0;
-    if (!Read(bytes, cursor, version) || !Read(bytes, cursor, scene_hash) ||
+    if (!Read(bytes, cursor, version) || !Read(bytes, cursor, source_scene_hash) ||
+        !Read(bytes, cursor, derived_scene_hash) || !Read(bytes, cursor, derived_scene_version) ||
+        !Read(bytes, cursor, object_mapping_version) || !Read(bytes, cursor, resolution) ||
         !Read(bytes, cursor, sample_count) || !Read(bytes, cursor, bounce_count) ||
         !Read(bytes, cursor, entry_count) || !Read(bytes, cursor, reserved))
     {
         result.diagnostic = "Client Lightmap package truncated header: " + package_path;
         return result;
     }
-    if (version != kVersion)
+    if (version != kPackageVersion)
     {
         result.diagnostic = "Client Lightmap package version mismatch: " + std::to_string(version);
         return result;
     }
-    const uint64_t current_scene_hash = HashFile(scene_path);
-    if (current_scene_hash == 0 || current_scene_hash != scene_hash)
+    if (derived_scene_version != kDerivedSceneVersion)
     {
-        result.diagnostic = "Client Lightmap package scene hash mismatch; regenerate lightmaps";
+        result.diagnostic = "Client Lightmap derived scene version mismatch: " +
+            std::to_string(derived_scene_version);
         return result;
     }
-    if (entry_count > scene.objects.GetCount() || entry_count > 1'000'000u)
+    if (object_mapping_version != kObjectMappingVersion)
     {
-        result.diagnostic = "Client Lightmap package unreasonable entry count";
+        result.diagnostic = "Client Lightmap object mapping version mismatch: " +
+            std::to_string(object_mapping_version);
+        return result;
+    }
+    if (resolution == 0 || sample_count == 0 || bounce_count == 0)
+    {
+        result.diagnostic = "Client Lightmap package contains invalid bake settings";
+        return result;
+    }
+
+    result.source_scene_hash = HashFile(source_scene_path);
+    if (result.source_scene_hash == 0 || result.source_scene_hash != source_scene_hash)
+    {
+        result.diagnostic = "Client Lightmap package source hash mismatch; regenerate lightmaps";
+        return result;
+    }
+    result.derived_scene_hash = HashFile(derived_scene_path);
+    if (result.derived_scene_hash == 0 || result.derived_scene_hash != derived_scene_hash)
+    {
+        result.diagnostic = "Client Lightmap package derived hash mismatch; regenerate lightmaps";
+        return result;
+    }
+
+    wi::scene::Scene derived_scene;
+    wi::scene::LoadModel(derived_scene, derived_scene_path, XMMatrixIdentity(), false);
+    ClearSceneLightmaps(derived_scene);
+    if (derived_scene.objects.GetCount() == 0 || entry_count > derived_scene.objects.GetCount() ||
+        entry_count > 1'000'000u)
+    {
+        result.diagnostic = "Client Lightmap derived scene is empty or package entry count is unreasonable";
         return result;
     }
 
     std::unordered_map<std::string, wi::scene::ObjectComponent*> objects_by_id;
-    objects_by_id.reserve(scene.objects.GetCount());
-    for (size_t i = 0; i < scene.objects.GetCount(); ++i)
+    objects_by_id.reserve(derived_scene.objects.GetCount());
+    std::unordered_set<std::string> derived_ids;
+    for (size_t i = 0; i < derived_scene.objects.GetCount(); ++i)
     {
-        const wi::ecs::Entity entity = scene.objects.GetEntity(i);
-        const std::string id = GetObjectId(scene, entity);
+        const wi::ecs::Entity entity = derived_scene.objects.GetEntity(i);
+        const std::string id = GetObjectId(derived_scene, entity);
         if (!id.empty())
-            objects_by_id[id] = &scene.objects[i];
+        {
+            if (!derived_ids.insert(id).second)
+            {
+                result.diagnostic = "Client Lightmap derived scene contains duplicate object id: " + id;
+                return result;
+            }
+            objects_by_id[id] = &derived_scene.objects[i];
+        }
     }
 
     std::vector<PackageEntry> entries;
@@ -288,6 +353,15 @@ ClientLightmapPackageResult ClientLightmapPackage::Load(const std::string& scene
         if (object_it == objects_by_id.end())
             continue;
         wi::scene::ObjectComponent& object = *object_it->second;
+        const wi::scene::MeshComponent* mesh = derived_scene.meshes.GetComponent(object.meshID);
+        if (mesh == nullptr || mesh->vertex_atlas.empty() ||
+            object.lightmapWidth != entry.width || object.lightmapHeight != entry.height)
+        {
+            result.diagnostic = "Client Lightmap derived atlas/dimensions mismatch: " + entry.id;
+            ClearSceneLightmaps(derived_scene);
+            result.loaded_count = 0;
+            return result;
+        }
         wi::graphics::Texture texture;
         if (!wi::texturehelper::CreateTexture(
             texture,
@@ -297,7 +371,7 @@ ClientLightmapPackageResult ClientLightmapPackage::Load(const std::string& scene
             wi::graphics::Format::BC6H_UF16))
         {
             result.diagnostic = "Client Lightmap package GPU texture creation failed: " + entry.id;
-            ClearSceneLightmaps(scene);
+            ClearSceneLightmaps(derived_scene);
             return result;
         }
         wi::graphics::GetDevice()->SetName(&texture, "newpipeline.client.lightmap");
@@ -313,29 +387,38 @@ ClientLightmapPackageResult ClientLightmapPackage::Load(const std::string& scene
         result.diagnostic = "Client Lightmap package object ID mismatch: loaded " +
             std::to_string(result.loaded_count) + "/" + std::to_string(entry_count) +
             "; regenerate lightmaps";
-        ClearSceneLightmaps(scene);
+        ClearSceneLightmaps(derived_scene);
         result.loaded_count = 0;
         return result;
     }
 
+    // The canonical source scene remains live until every sidecar validation,
+    // object mapping and GPU upload has succeeded. Only then is the complete
+    // derived Client scene installed, so corrupt sidecars can never be
+    // partially attached to the caller's scene.
+    scene.Clear();
+    scene.Merge(derived_scene);
     result.success = true;
+    result.scene_replaced = true;
     result.diagnostic = "Client Lightmap package loaded: " + std::to_string(result.loaded_count) +
-        "/" + std::to_string(entry_count) + " objects, samples=" + std::to_string(sample_count) +
+        "/" + std::to_string(entry_count) + " objects, resolution=" + std::to_string(resolution) +
+        " samples=" + std::to_string(sample_count) +
         " bounces=" + std::to_string(bounce_count);
     return result;
 }
 
 bool ClientLightmapPackage::Save(
     const std::string& package_path,
-    uint64_t scene_hash,
+    uint64_t source_scene_hash,
+    uint64_t derived_scene_hash,
     const wi::scene::Scene& scene,
     const std::vector<wi::ecs::Entity>& entities,
     const ClientLightmapBakeSettings& settings,
     std::string& error) const
 {
-    if (scene_hash == 0)
+    if (source_scene_hash == 0 || derived_scene_hash == 0)
     {
-        error = "prepared scene hash is zero";
+        error = "source or derived scene hash is zero";
         return false;
     }
 
@@ -389,8 +472,12 @@ bool ClientLightmapPackage::Save(
     wi::vector<uint8_t> bytes;
     bytes.reserve(static_cast<size_t>(payload_offset));
     bytes.insert(bytes.end(), kMagic.begin(), kMagic.end());
-    Append(bytes, kVersion);
-    Append(bytes, scene_hash);
+    Append(bytes, kPackageVersion);
+    Append(bytes, source_scene_hash);
+    Append(bytes, derived_scene_hash);
+    Append(bytes, kDerivedSceneVersion);
+    Append(bytes, kObjectMappingVersion);
+    Append(bytes, settings.resolution);
     Append(bytes, settings.sample_count);
     Append(bytes, settings.bounce_count);
     Append(bytes, static_cast<uint32_t>(entries.size()));

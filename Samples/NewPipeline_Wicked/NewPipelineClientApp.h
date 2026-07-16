@@ -25,6 +25,7 @@ private:
     RuntimeConfig                runtime_config;
     NewPipelineClientRenderPath  render_path;
     wi::gui::Window              debug_window;
+    wi::gui::Window              elastic_lighting_window;
     wi::gui::CheckBox            sun_enabled_checkbox;
     wi::gui::Slider              sun_yaw_slider;
     wi::gui::Slider              sun_pitch_slider;
@@ -42,6 +43,11 @@ private:
     wi::gui::Button              generate_reflection_probe_button;
     wi::gui::Slider              reflection_probe_mip_slider;
     wi::gui::Label               reflection_probe_progress_label;
+    wi::gui::CheckBox            remote_gi_checkbox;
+    wi::gui::Slider              remote_gi_weight_slider;
+    wi::gui::CheckBox            remote_ao_checkbox;
+    wi::gui::Slider              remote_ao_weight_slider;
+    wi::gui::Label               elastic_lighting_status_label;
     bool                         configured = false;
     bool                         debug_ui_created = false;
 };

@@ -508,7 +508,10 @@ void NewPipelineServerRenderPath::PublishRemotePayload(float dt)
     slot.metadata.reset_this_frame = ddgi_announced_reset_serial != ddgi_reset_serial;
     if (slot.metadata.reset_this_frame)
         ddgi_announced_reset_serial = ddgi_reset_serial;
-    slot.metadata.confidence = available_mask == static_cast<uint32_t>(RemoteBufferKind::All) ? 1.0f : 0.75f;
+    // Buffer availability is described independently by available_buffer_mask.
+    // Missing an optional reflection or shadow buffer must not reduce the
+    // confidence of a valid DDGI or AO tile.
+    slot.metadata.confidence = 1.0f;
     slot.metadata.valid = true;
     slot.metadata.ddgi_frame_index = local_scene.ddgi.frame_index;
     slot.metadata.ddgi_reset_reason = ddgi_reset_reason;
@@ -659,6 +662,8 @@ void NewPipelineServerRenderPath::InitializeSceneIfNeeded()
     wi::backlog::post(scene_message);
     if (!result.diagnostic.empty())
         wi::backlog::post("Server scene diagnostic: " + result.diagnostic);
+    wi::backlog::post("Server scene parity: " +
+        FormatSceneParityFingerprint(ComputeSceneParityFingerprint(local_scene)));
     wi::backlog::post(config.remote_source == RemoteSourceMode::Mock
         ? "Server using file mock control source: " + mock_control_mailbox.GetRootDirectory()
         : "Server using WebRTC DataChannel for client control only; frame output is video-track only.");

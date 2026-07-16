@@ -13,6 +13,7 @@ struct BVHPushConstants
 static const uint BVH_BUILDER_GROUPSIZE = 64;
 
 // lower 8-bits in the flags are for instance masking
+static const uint BVH_PRIMITIVE_MASK_LIGHTMAP = 1 << 3;
 static const uint BVH_PRIMITIVE_FLAG_DOUBLE_SIDED = 1 << 8;
 static const uint BVH_PRIMITIVE_FLAG_TRANSPARENT = 1 << 9;
 

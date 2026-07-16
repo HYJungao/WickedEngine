@@ -1186,6 +1186,17 @@ namespace wi::scene
 		wi::graphics::Texture lightmap_render;
 		wi::graphics::Texture lightmap;
 		mutable uint32_t lightmapIterationCount = 0;
+		struct LightmapStatistics
+		{
+			XMFLOAT3 irradiance_min = {};
+			XMFLOAT3 irradiance_average = {};
+			XMFLOAT3 irradiance_max = {};
+			uint64_t valid_texel_count = 0;
+			uint64_t missing_texel_count = 0;
+		};
+		// Non-serialized validation data populated from the uncompressed bake in
+		// SaveLightmap(), before BC6H replaces lightmapTextureData.
+		LightmapStatistics lightmapStatistics;
 		int vb_ao_srv = -1;
 		wi::graphics::GPUBuffer vb_ao;
 		wi::graphics::GPUBuffer wetmap;

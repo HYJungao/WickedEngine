@@ -5267,6 +5267,10 @@ namespace wi::scene
 				}
 				instance.instance_id = (uint32_t)instanceIndex;
 				instance.instance_mask = emitter.layerMask == 0 ? 0 : 0xFF;
+				// Particles are runtime-only geometry. They remain visible in the
+				// scene, shadows, reflections and diffuse GI, but must not become
+				// transient occluders in a persistent lightmap bake.
+				instance.instance_mask &= ~wi::renderer::raytracing_inclusion_mask_lightmap;
 				if (material != nullptr && !material->IsCastingShadow())
 				{
 					instance.instance_mask &= ~wi::renderer::raytracing_inclusion_mask_shadow;
@@ -5464,6 +5468,7 @@ namespace wi::scene
 				}
 				instance.instance_id = (uint32_t)instanceIndex;
 				instance.instance_mask = rainEmitter.layerMask == 0 ? 0 : 0xFF;
+				instance.instance_mask &= ~wi::renderer::raytracing_inclusion_mask_lightmap;
 				instance.bottom_level = &rainEmitter.BLAS;
 				instance.instance_contribution_to_hit_group_index = 0;
 				instance.flags = RaytracingAccelerationStructureDesc::TopLevel::Instance::FLAG_TRIANGLE_CULL_DISABLE;

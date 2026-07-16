@@ -58,6 +58,8 @@ void NewPipelineClientApp::CreateDebugUI()
     preview_buffer_combo.AddItem("Normal XY", static_cast<uint64_t>(DebugPreviewMode::GBufferNormalXY));
     preview_buffer_combo.AddItem("Roughness", static_cast<uint64_t>(DebugPreviewMode::GBufferRoughness));
     preview_buffer_combo.AddItem("Local Lightmap Irradiance", static_cast<uint64_t>(DebugPreviewMode::LocalIndirectDiffuse));
+    preview_buffer_combo.AddItem("Local Lightmap Validity", static_cast<uint64_t>(DebugPreviewMode::LocalLightmapValidity));
+    preview_buffer_combo.AddItem("Local Indirect (Final Input)", static_cast<uint64_t>(DebugPreviewMode::LocalIndirectFinalInput));
     preview_buffer_combo.AddItem("Local AO", static_cast<uint64_t>(DebugPreviewMode::LocalAO));
     preview_buffer_combo.AddItem("Local Probe Specular", static_cast<uint64_t>(DebugPreviewMode::LocalSpecularIndirect));
     preview_buffer_combo.AddItem("Local Probe Cubemap", static_cast<uint64_t>(DebugPreviewMode::LocalReflectionProbe));
@@ -66,6 +68,8 @@ void NewPipelineClientApp::CreateDebugUI()
     preview_buffer_combo.AddItem("Remote AO", static_cast<uint64_t>(DebugPreviewMode::RemoteAO));
     preview_buffer_combo.AddItem("Remote Specular Indirect", static_cast<uint64_t>(DebugPreviewMode::RemoteSpecularIndirect));
     preview_buffer_combo.AddItem("Remote Shadow Visibility", static_cast<uint64_t>(DebugPreviewMode::RemoteShadowVisibility));
+    preview_buffer_combo.AddItem("Elastic GI (Final Input)", static_cast<uint64_t>(DebugPreviewMode::ElasticIndirectDiffuse));
+    preview_buffer_combo.AddItem("Elastic AO (Final Input)", static_cast<uint64_t>(DebugPreviewMode::ElasticAO));
     preview_buffer_combo.AddItem("Remote 2x2 Overview", static_cast<uint64_t>(DebugPreviewMode::RemoteOverview));
     preview_buffer_combo.SetSelectedByUserdataWithoutCallback(static_cast<uint64_t>(render_path.GetDebugPreviewMode()));
     preview_buffer_combo.OnSelect([this](const wi::gui::EventArgs& args) {
@@ -200,7 +204,64 @@ void NewPipelineClientApp::CreateDebugUI()
     reflection_probe_progress_label.SetSize(XMFLOAT2(310.0f, 55.0f));
     debug_window.AddWidget(&reflection_probe_progress_label);
 
+    elastic_lighting_window.Create(
+        "Elastic GI / AO",
+        wi::gui::Window::WindowControls::MOVE | wi::gui::Window::WindowControls::COLLAPSE);
+    elastic_lighting_window.SetPos(XMFLOAT2(375.0f, 80.0f));
+    elastic_lighting_window.SetSize(XMFLOAT2(340.0f, 190.0f));
+
+    remote_gi_checkbox.Create("Remote DDGI: ");
+    remote_gi_checkbox.SetPos(XMFLOAT2(150.0f, 10.0f));
+    remote_gi_checkbox.SetSize(XMFLOAT2(18.0f, 18.0f));
+    remote_gi_checkbox.SetCheck(initial_render_settings.remote_gi_enabled);
+    remote_gi_checkbox.OnClick([this](const wi::gui::EventArgs& args) {
+        NewPipelineClientRenderSettings settings = render_path.GetRenderSettings();
+        settings.remote_gi_enabled = args.bValue;
+        render_path.SetRenderSettings(settings);
+    });
+    elastic_lighting_window.AddWidget(&remote_gi_checkbox);
+
+    remote_gi_weight_slider.Create(0.0f, 1.0f, initial_render_settings.remote_gi_max_weight, 100.0f, "GI Remote Max: ");
+    remote_gi_weight_slider.SetPos(XMFLOAT2(150.0f, 38.0f));
+    remote_gi_weight_slider.SetSize(XMFLOAT2(150.0f, 18.0f));
+    remote_gi_weight_slider.valueInputField.SetFloatPrecision(2);
+    remote_gi_weight_slider.OnSlide([this](const wi::gui::EventArgs& args) {
+        NewPipelineClientRenderSettings settings = render_path.GetRenderSettings();
+        settings.remote_gi_max_weight = args.fValue;
+        render_path.SetRenderSettings(settings);
+    });
+    elastic_lighting_window.AddWidget(&remote_gi_weight_slider);
+
+    remote_ao_checkbox.Create("Remote RTAO: ");
+    remote_ao_checkbox.SetPos(XMFLOAT2(150.0f, 68.0f));
+    remote_ao_checkbox.SetSize(XMFLOAT2(18.0f, 18.0f));
+    remote_ao_checkbox.SetCheck(initial_render_settings.remote_ao_enabled);
+    remote_ao_checkbox.OnClick([this](const wi::gui::EventArgs& args) {
+        NewPipelineClientRenderSettings settings = render_path.GetRenderSettings();
+        settings.remote_ao_enabled = args.bValue;
+        render_path.SetRenderSettings(settings);
+    });
+    elastic_lighting_window.AddWidget(&remote_ao_checkbox);
+
+    remote_ao_weight_slider.Create(0.0f, 1.0f, initial_render_settings.remote_ao_max_weight, 100.0f, "AO Remote Max: ");
+    remote_ao_weight_slider.SetPos(XMFLOAT2(150.0f, 96.0f));
+    remote_ao_weight_slider.SetSize(XMFLOAT2(150.0f, 18.0f));
+    remote_ao_weight_slider.valueInputField.SetFloatPrecision(2);
+    remote_ao_weight_slider.OnSlide([this](const wi::gui::EventArgs& args) {
+        NewPipelineClientRenderSettings settings = render_path.GetRenderSettings();
+        settings.remote_ao_max_weight = args.fValue;
+        render_path.SetRenderSettings(settings);
+    });
+    elastic_lighting_window.AddWidget(&remote_ao_weight_slider);
+
+    elastic_lighting_status_label.Create("Elastic Lighting Status");
+    elastic_lighting_status_label.SetText(render_path.GetElasticLightingStatus());
+    elastic_lighting_status_label.SetPos(XMFLOAT2(10.0f, 126.0f));
+    elastic_lighting_status_label.SetSize(XMFLOAT2(310.0f, 45.0f));
+    elastic_lighting_window.AddWidget(&elastic_lighting_status_label);
+
     render_path.GetGUI().AddWidget(&debug_window);
+    render_path.GetGUI().AddWidget(&elastic_lighting_window);
     debug_ui_created = true;
 }
 
@@ -247,6 +308,7 @@ void NewPipelineClientApp::Update(float dt)
         static_lighting_progress_label.SetText(render_path.GetStaticLightingBakeStatus());
         lightmap_progress_label.SetText(render_path.GetLightmapBakeStatus());
         reflection_probe_progress_label.SetText(render_path.GetReflectionProbeBakeStatus());
+        elastic_lighting_status_label.SetText(render_path.GetElasticLightingStatus());
         const bool lightmap_active = render_path.IsLightmapBakeActive();
         const bool probe_active = render_path.IsReflectionProbeBakeActive();
         const bool static_lighting_active = render_path.IsStaticLightingBakeActive();

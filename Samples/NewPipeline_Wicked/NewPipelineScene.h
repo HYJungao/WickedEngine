@@ -29,11 +29,26 @@ struct NewPipelineCameraPreset
     XMFLOAT3 rotation = XMFLOAT3(wi::math::DegreesToRadians(5), 0, 0);
 };
 
+// Hashes authored scene state that must remain identical between Client and
+// Server and must not be changed as a side effect of baking. Runtime lightmap
+// textures, atlas data and bake request flags are intentionally excluded.
+struct SceneParityFingerprint
+{
+    uint64_t hash = 0;
+    uint32_t object_count = 0;
+    uint32_t mesh_count = 0;
+    uint32_t material_count = 0;
+    uint32_t light_count = 0;
+    uint32_t emitter_count = 0;
+};
+
 const char* ToString(SceneInitializationKind kind);
 const char* GetNewPipelineSunName();
 uint32_t GetNewPipelineSunShadowIndex(const wi::scene::Scene& scene);
 NewPipelineSunState MakeSunStateFromAngles(bool enabled, float yaw_degrees, float pitch_degrees);
 SceneInitializationResult InitializeDefaultScene(wi::scene::Scene& scene);
+SceneParityFingerprint ComputeSceneParityFingerprint(const wi::scene::Scene& scene);
+std::string FormatSceneParityFingerprint(const SceneParityFingerprint& fingerprint);
 NewPipelineCameraPreset GetDefaultCameraPreset(SceneInitializationKind kind);
 void InitializeDefaultCamera(
     wi::scene::CameraComponent& camera,

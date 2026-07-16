@@ -18,7 +18,7 @@ namespace wicked_newpipeline
 namespace
 {
 constexpr std::array<uint8_t, 4> kProbeMagic = {'N', 'P', 'R', 'B'};
-constexpr uint32_t kProbeVersion = 1;
+constexpr uint32_t kProbeVersion = 2;
 constexpr uint32_t kProbeFormatBC6H = static_cast<uint32_t>(wi::graphics::Format::BC6H_UF16);
 constexpr uint32_t kMaxProbeIdLength = 4096;
 
@@ -230,7 +230,8 @@ ClientReflectionProbePackageResult ClientReflectionProbePackage::Load(
 
     size_t cursor = kProbeMagic.size();
     uint32_t version = 0;
-    uint64_t scene_hash = 0;
+    uint64_t source_scene_hash = 0;
+    uint64_t derived_scene_hash = 0;
     uint32_t id_length = 0;
     ClientReflectionProbeDescriptor stored;
     uint32_t mip_count = 0;
@@ -238,7 +239,8 @@ ClientReflectionProbePackageResult ClientReflectionProbePackage::Load(
     uint64_t payload_offset = 0;
     uint64_t payload_size = 0;
     uint32_t payload_crc = 0;
-    if (!ReadInteger(bytes, cursor, version) || !ReadInteger(bytes, cursor, scene_hash) ||
+    if (!ReadInteger(bytes, cursor, version) || !ReadInteger(bytes, cursor, source_scene_hash) ||
+        !ReadInteger(bytes, cursor, derived_scene_hash) ||
         !ReadInteger(bytes, cursor, id_length) || id_length > kMaxProbeIdLength ||
         cursor > bytes.size() || id_length > bytes.size() - cursor)
     {
@@ -269,11 +271,16 @@ ClientReflectionProbePackageResult ClientReflectionProbePackage::Load(
         return result;
     }
 
-    const uint64_t current_scene_hash = ClientLightmapPackage::HashFile(scene_path);
-    if (current_scene_hash == 0 || current_scene_hash != scene_hash || expected.id.empty() || !Matches(stored, expected))
+    const uint64_t current_source_hash = ClientLightmapPackage::HashFile(scene_path);
+    const uint64_t current_derived_hash = ClientLightmapPackage::HashFile(
+        ClientLightmapPackage::DerivedScenePathForScene(scene_path));
+    if (current_source_hash == 0 || current_source_hash != source_scene_hash ||
+        current_derived_hash == 0 || current_derived_hash != derived_scene_hash ||
+        expected.id.empty() || !Matches(stored, expected))
     {
         result.state = ClientLightingAssetState::Stale;
-        result.diagnostic = "Reflection Probe: STALE scene/probe placement changed; regenerate Client Lighting";
+        result.diagnostic =
+            "Reflection Probe: STALE source/derived scene or probe placement changed; regenerate Client Lighting";
         return result;
     }
     const uint8_t* payload = bytes.data() + static_cast<size_t>(payload_offset);
@@ -336,10 +343,12 @@ bool ClientReflectionProbePackage::Save(
         error = "reflection capture is not a BC6H cubemap";
         return false;
     }
-    const uint64_t scene_hash = ClientLightmapPackage::HashFile(scene_path);
-    if (scene_hash == 0)
+    const uint64_t source_scene_hash = ClientLightmapPackage::HashFile(scene_path);
+    const uint64_t derived_scene_hash = ClientLightmapPackage::HashFile(
+        ClientLightmapPackage::DerivedScenePathForScene(scene_path));
+    if (source_scene_hash == 0 || derived_scene_hash == 0)
     {
-        error = "failed to hash source scene for reflection probe package";
+        error = "failed to hash source or derived scene for reflection probe package";
         return false;
     }
 
@@ -353,7 +362,8 @@ bool ClientReflectionProbePackage::Save(
     wi::vector<uint8_t> bytes;
     bytes.insert(bytes.end(), kProbeMagic.begin(), kProbeMagic.end());
     AppendInteger(bytes, kProbeVersion);
-    AppendInteger(bytes, scene_hash);
+    AppendInteger(bytes, source_scene_hash);
+    AppendInteger(bytes, derived_scene_hash);
     AppendInteger(bytes, static_cast<uint32_t>(descriptor.id.size()));
     bytes.insert(bytes.end(), descriptor.id.begin(), descriptor.id.end());
     AppendFloat(bytes, descriptor.position.x);
@@ -396,7 +406,8 @@ ClientLightmapPackageResult ClientStaticLighting::LoadLightmaps(
         state = ClientLightingAssetState::Valid;
     else if (result.diagnostic.find("missing") != std::string::npos)
         state = ClientLightingAssetState::Missing;
-    else if (result.diagnostic.find("hash mismatch") != std::string::npos)
+    else if (result.diagnostic.find("hash mismatch") != std::string::npos ||
+        result.diagnostic.find("version mismatch") != std::string::npos)
         state = ClientLightingAssetState::Stale;
     SetLightmapStatus(state, result.success ? "Lightmap: VALID " + result.diagnostic : "Lightmap: " + result.diagnostic);
     return result;
