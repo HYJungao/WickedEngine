@@ -36,6 +36,16 @@ constexpr uint32_t kMobileLightmapResolution = 256;
 constexpr uint32_t kClientReflectionProbeResolution = 128;
 constexpr const char* kLightmapBakeModeMetadataKey = "newpipeline.lightmap_bake_mode";
 
+uint32_t NormalizeLightmapBakeDimension(uint32_t dimension)
+{
+    // Scene::Update applies this normalization when the render request creates
+    // the accumulation textures. Do it before serializing the derived scene so
+    // the sidecar dimensions already match the final BC6H package dimensions.
+    dimension = wi::math::GetNextPowerOfTwo(dimension + 1u) / 2u;
+    dimension = (dimension + 3u) & ~3u;
+    return std::clamp(dimension, 16u, 16384u);
+}
+
 enum class LightmapBakeEligibility : uint8_t
 {
     Eligible,
@@ -1332,14 +1342,16 @@ bool NewPipelineClientRenderPath::PrepareLightmapBake()
                     wi::backlog::post("Client lightmap atlas skipped object " + std::to_string(entity) + ": " + atlas_error);
                 continue;
             }
-            mesh_dimensions[object.meshID] = dimensions;
         }
         else
         {
             if (object.lightmapWidth > 0 && object.lightmapHeight > 0)
                 dimensions = {object.lightmapWidth, object.lightmapHeight};
-            mesh_dimensions[object.meshID] = dimensions;
         }
+
+        dimensions.x = NormalizeLightmapBakeDimension(dimensions.x);
+        dimensions.y = NormalizeLightmapBakeDimension(dimensions.y);
+        mesh_dimensions[object.meshID] = dimensions;
 
         std::string id = ClientLightmapPackage::EnsureObjectId(local_scene, entity);
         if (!object_ids.insert(id).second)

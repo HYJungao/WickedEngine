@@ -332,6 +332,7 @@ ClientLightmapPackageResult ClientLightmapPackage::LoadFromPaths(
     }
 
     uint64_t expected_payload_offset = cursor;
+    uint32_t reconciled_dimension_count = 0;
     for (const PackageEntry& entry : entries)
     {
         if (entry.offset != expected_payload_offset)
@@ -354,13 +355,20 @@ ClientLightmapPackageResult ClientLightmapPackage::LoadFromPaths(
             continue;
         wi::scene::ObjectComponent& object = *object_it->second;
         const wi::scene::MeshComponent* mesh = derived_scene.meshes.GetComponent(object.meshID);
-        if (mesh == nullptr || mesh->vertex_atlas.empty() ||
-            object.lightmapWidth != entry.width || object.lightmapHeight != entry.height)
+        if (mesh == nullptr || mesh->vertex_atlas.empty())
         {
-            result.diagnostic = "Client Lightmap derived atlas/dimensions mismatch: " + entry.id;
+            result.diagnostic = "Client Lightmap derived atlas missing: " + entry.id;
             ClearSceneLightmaps(derived_scene);
             result.loaded_count = 0;
             return result;
+        }
+        if (object.lightmapWidth != entry.width || object.lightmapHeight != entry.height)
+        {
+            // The package dimensions describe the texture that was actually
+            // baked and CRC-validated. Reconcile older v2 derived scenes that
+            // captured xatlas' pre-normalized dimensions before Scene::Update
+            // applied power-of-two and BC6H block alignment.
+            ++reconciled_dimension_count;
         }
         wi::graphics::Texture texture;
         if (!wi::texturehelper::CreateTexture(
@@ -404,6 +412,11 @@ ClientLightmapPackageResult ClientLightmapPackage::LoadFromPaths(
         "/" + std::to_string(entry_count) + " objects, resolution=" + std::to_string(resolution) +
         " samples=" + std::to_string(sample_count) +
         " bounces=" + std::to_string(bounce_count);
+    if (reconciled_dimension_count > 0)
+    {
+        result.diagnostic += " dimensions_reconciled=" +
+            std::to_string(reconciled_dimension_count);
+    }
     return result;
 }
 
