@@ -6,6 +6,19 @@ if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.31)
 endif()
 
 set(MIN_OpenImageDenoise_VERSION "2.0")
+option(WICKED_ENABLE_OPENIMAGEDENOISE "Enable production lightmap denoising" ON)
+
+if(WICKED_ENABLE_OPENIMAGEDENOISE)
+    # OIDN is used by the offline lightmap path on every desktop platform,
+    # including Windows. Previously it was searched only in the non-Windows
+    # branch, which made Windows client bakes permanently report unavailable.
+    find_package(OpenImageDenoise "${MIN_OpenImageDenoise_VERSION}" CONFIG QUIET)
+    if(OpenImageDenoise_FOUND)
+        message(STATUS "OpenImageDenoise ${OpenImageDenoise_VERSION} Found.")
+    else()
+        message(STATUS "OpenImageDenoise>=${MIN_OpenImageDenoise_VERSION} not found; high-sample fallback remains enabled.")
+    endif()
+endif()
 
 include(CMakePackageConfigHelpers)
 include(GNUInstallDirs)
@@ -40,13 +53,7 @@ if (WIN32)
     endif()
 else ()
     find_package(SDL2 REQUIRED)
-    find_package(OpenImageDenoise "${MIN_OpenImageDenoise_VERSION}" QUIET)
     find_package(Threads REQUIRED)
-    if(NOT ${OpenImageDenoise_FOUND})
-        message(STATUS "OpenImageDenoise>=${MIN_OpenImageDenoise_VERSION} not found, it will be disabled.")
-    else()
-        message(STATUS "OpenImageDenoise ${OpenImageDenoise_VERSION} Found.")
-    endif()
 
     if(NOT TARGET SDL2::SDL2)
         # using old SDL2 cmake, lets create a SDL2 target ourselves
@@ -245,7 +252,6 @@ else ()
     target_link_libraries(WickedEngine_common PUBLIC
         Threads::Threads
         SDL2::SDL2
-        $<$<BOOL:${OpenImageDenoise_FOUND}>:OpenImageDenoise> # links OpenImageDenoise only if it's found
     )
 
     set_target_properties(FAudio PROPERTIES
@@ -257,6 +263,10 @@ else ()
     target_link_libraries(WickedEngine_common PUBLIC dl)
 
     set(LIBDXCOMPILER "libdxcompiler.so")
+endif()
+
+if(OpenImageDenoise_FOUND)
+    target_link_libraries(WickedEngine_common PUBLIC OpenImageDenoise)
 endif()
 
 target_link_libraries(WickedEngine_common PUBLIC ${WICKEDENGINE_STATIC_LIBRARIES})

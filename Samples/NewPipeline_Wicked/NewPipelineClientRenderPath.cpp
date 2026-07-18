@@ -166,6 +166,9 @@ std::string FormatLightmapStatistics(
             statistics.irradiance_average.y << "," << statistics.irradiance_average.z <<
         " max=" << statistics.irradiance_max.x << "," <<
             statistics.irradiance_max.y << "," << statistics.irradiance_max.z << "]" <<
+        " adaptive[texels=" << statistics.adaptive_texel_count <<
+            " converged=" << statistics.adaptive_converged_texel_count <<
+            " avg_batches=" << statistics.adaptive_average_batches << "]" <<
         " denoiser=" << (statistics.denoiser_applied ? "applied" :
             statistics.denoiser_failed ? "failed" :
             statistics.denoiser_available ? "available-not-applied" : "unavailable");
@@ -1094,9 +1097,13 @@ void NewPipelineClientRenderPath::RequestLightmapBake()
     {
         if (lightmap_bake_denoiser_available)
         {
+            // This is a maximum budget, not a uniform cost: converged texels stop
+            // tracing after the independent-batch test, while weak/rarely hit texels
+            // retain the full budget. A 512 hard cap would defeat adaptive sampling
+            // exactly where the remaining dark spots occur.
             lightmap_bake_settings.sample_count = std::max(
                 lightmap_bake_settings.sample_count,
-                kClientLightmapDenoisedSamples);
+                kClientLightmapUnfilteredSamples);
             lightmap_bake_denoiser_required =
                 lightmap_bake_settings.sample_count < kClientLightmapUnfilteredSamples;
         }
@@ -1107,8 +1114,10 @@ void NewPipelineClientRenderPath::RequestLightmapBake()
                 kClientLightmapUnfilteredSamples);
         }
         wi::backlog::post(
-            "Client lightmap production quality: sampler=owen-scrambled-sobol4"
-            " light_selection=contribution-cdf denoiser=" +
+            "Client lightmap production quality: integrator=vertex-nee-mis-v3"
+            " sampler=independent-owen-sobol-batches"
+            " light_selection=spatial-candidate-contribution-cdf"
+            " guiding=first-bounce-tile-mixture denoiser=" +
             std::string{lightmap_bake_denoiser_available ? "OIDN-required" : "unavailable-raw-fallback"} +
             " samples=" + std::to_string(lightmap_bake_settings.sample_count));
     }
@@ -1691,9 +1700,10 @@ bool NewPipelineClientRenderPath::PrepareLightmapBake()
                 " bounces=" + std::to_string(lightmap_bake_settings.bounce_count) +
                 " static_lights=" + std::to_string(static_lights) +
                 " dynamic_lights=" + std::to_string(dynamic_lights) +
-                " integrator=vertex-nee-v2" +
-                " sampler=owen-scrambled-sobol4" +
-                " light_selection=contribution-cdf" +
+                " integrator=vertex-nee-mis-v3" +
+                " sampler=independent-owen-sobol-batches" +
+                " light_selection=spatial-candidate-contribution-cdf" +
+                " guiding=first-bounce-tile-mixture" +
                 " denoiser=" + std::string{
                     lightmap_bake_denoiser_available ? "OIDN" : "unavailable"} +
                 " pause_before_save=" +

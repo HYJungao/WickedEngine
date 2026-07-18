@@ -1184,6 +1184,12 @@ namespace wi::scene
 		uint32_t filterMaskDynamic = 0;
 
 		wi::graphics::Texture lightmap_render;
+		// One independent Owen batch and its per-texel Welford state. These are
+		// transient bake resources and are never serialized into scene assets.
+		wi::graphics::Texture lightmap_batch;
+		wi::graphics::Texture lightmap_statistics_texture;
+		mutable wi::graphics::GPUBuffer lightmap_light_candidates;
+		mutable wi::graphics::GPUBuffer lightmap_guiding_histogram;
 		wi::graphics::Texture lightmap;
 		wi::graphics::Texture lightmap_coverage;
 		wi::vector<uint8_t> lightmapCoverageData;
@@ -1199,6 +1205,9 @@ namespace wi::scene
 			bool denoiser_available = false;
 			bool denoiser_applied = false;
 			bool denoiser_failed = false;
+			uint64_t adaptive_texel_count = 0;
+			uint64_t adaptive_converged_texel_count = 0;
+			float adaptive_average_batches = 0;
 		};
 		// Non-serialized validation data populated from the uncompressed bake in
 		// SaveLightmap(), before BC6H replaces lightmapTextureData.

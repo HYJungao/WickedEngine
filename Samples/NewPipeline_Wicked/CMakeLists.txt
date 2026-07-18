@@ -112,6 +112,27 @@ function(newpipeline_wicked_add_windows_target TARGET_NAME ENTRY APP_SOURCE APP_
             "$<TARGET_FILE_DIR:${TARGET_NAME}>/dxcompiler.dll"
         VERBATIM
     )
+    if(TARGET OpenImageDenoise)
+        target_link_libraries(${TARGET_NAME} PRIVATE OpenImageDenoise)
+        if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.21)
+            # Includes OpenImageDenoise.dll and its device/runtime DLLs rather
+            # than copying only the import target's primary binary.
+            add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    $<TARGET_RUNTIME_DLLS:${TARGET_NAME}>
+                    "$<TARGET_FILE_DIR:${TARGET_NAME}>"
+                COMMAND_EXPAND_LISTS
+                VERBATIM
+            )
+        else()
+            add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "$<TARGET_FILE:OpenImageDenoise>"
+                    "$<TARGET_FILE_DIR:${TARGET_NAME}>"
+                VERBATIM
+            )
+        endif()
+    endif()
     source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}" FILES
         ${ENTRY} ${APP_SOURCE} ${APP_HEADER} ${RENDER_SOURCE} ${RENDER_HEADER}
         ${NEWPIPELINE_SHARED_SOURCE} ${NEWPIPELINE_SHARED_HEADERS})

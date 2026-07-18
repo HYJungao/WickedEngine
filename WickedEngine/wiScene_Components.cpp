@@ -14,6 +14,7 @@
 #include "Utility/meshoptimizer/meshoptimizer.h"
 
 #include <cmath>
+#include <deque>
 
 #if __has_include("OpenImageDenoise/oidn.hpp")
 #include "OpenImageDenoise/oidn.hpp"
@@ -2042,6 +2043,10 @@ namespace wi::scene
 	void ObjectComponent::ClearLightmap()
 	{
 		lightmap_render = {};
+		lightmap_batch = {};
+		lightmap_statistics_texture = {};
+		lightmap_light_candidates = {};
+		lightmap_guiding_histogram = {};
 		lightmap = {};
 		lightmap_coverage = {};
 		lightmapWidth = 0;
@@ -2062,7 +2067,17 @@ namespace wi::scene
 	}
 	void ObjectComponent::SaveLightmap()
 	{
+		wi::vector<uint8_t> adaptive_statistics_data;
+		if (lightmap_statistics_texture.IsValid())
+		{
+			wi::helper::saveTextureToMemory(
+				lightmap_statistics_texture, adaptive_statistics_data);
+		}
 		lightmap_render = {};
+		lightmap_batch = {};
+		lightmap_statistics_texture = {};
+		lightmap_light_candidates = {};
+		lightmap_guiding_histogram = {};
 		if (lightmap.IsValid() && has_flag(lightmap.desc.bind_flags, BindFlag::UNORDERED_ACCESS))
 		{
 			SetLightmapRenderRequest(false);
@@ -2070,6 +2085,29 @@ namespace wi::scene
 			bool success = wi::helper::saveTextureToMemory(lightmap, lightmapTextureData);
 			assert(success);
 			lightmapStatistics = {};
+			const uint64_t adaptive_texel_count =
+				uint64_t(lightmapWidth) * uint64_t(lightmapHeight);
+			if (adaptive_statistics_data.size() >=
+				adaptive_texel_count * sizeof(XMFLOAT4))
+			{
+				const XMFLOAT4* adaptive = reinterpret_cast<const XMFLOAT4*>(
+					adaptive_statistics_data.data());
+				double batch_sum = 0;
+				for (uint64_t i = 0; i < adaptive_texel_count; ++i)
+				{
+					if (!std::isfinite(adaptive[i].z) || adaptive[i].z <= 0)
+						continue;
+					++lightmapStatistics.adaptive_texel_count;
+					batch_sum += adaptive[i].z;
+					if (adaptive[i].w > 0.5f)
+						++lightmapStatistics.adaptive_converged_texel_count;
+				}
+				if (lightmapStatistics.adaptive_texel_count > 0)
+				{
+					lightmapStatistics.adaptive_average_batches = static_cast<float>(
+						batch_sum / double(lightmapStatistics.adaptive_texel_count));
+				}
+			}
 			if (success && lightmap.desc.format == Format::R16G16B16A16_FLOAT)
 			{
 				const uint64_t texel_count = uint64_t(lightmapWidth) * uint64_t(lightmapHeight);
@@ -2127,44 +2165,150 @@ namespace wi::scene
 			lightmapStatistics.denoiser_available = denoiser.available;
 			if (success && denoiser.available)
 			{
-				size_t width = (size_t)lightmapWidth;
-				size_t height = (size_t)lightmapHeight;
+				const uint32_t width = lightmapWidth;
+				const uint32_t height = lightmapHeight;
+				const uint32_t texel_count = width * height;
+				XMHALF4* texels = reinterpret_cast<XMHALF4*>(lightmapTextureData.data());
+
+				// Connected validity islands are filtered independently. Atlas charts
+				// can be close in UV space but unrelated in world space; allowing OIDN
+				// to see both produces exactly the seam/bleed artifacts that padding is
+				// intended to prevent.
+				wi::vector<int32_t> labels(texel_count, -1);
+				wi::vector<wi::vector<uint32_t>> components;
+				std::deque<uint32_t> queue;
+				for (uint32_t seed = 0; seed < texel_count; ++seed)
 				{
-					// https://github.com/OpenImageDenoise/oidn#c11-api-example
-					oidn::DeviceRef& device = denoiser.device;
-
-					oidn::BufferRef lightmapTextureData_buffer = device.newBuffer(lightmapTextureData.size());
-					oidn::BufferRef texturedata_dst_buffer = device.newBuffer(lightmapTextureData.size());
-
-					lightmapTextureData_buffer.write(0, lightmapTextureData.size(), lightmapTextureData.data());
-					// The filter writes RGB with an 8-byte texel stride. Seed the
-					// destination so the coverage alpha lane remains deterministic.
-					texturedata_dst_buffer.write(0, lightmapTextureData.size(), lightmapTextureData.data());
-
-					// Create a denoising filter
-					oidn::FilterRef filter = device.newFilter("RTLightmap");
-					filter.setImage("color", lightmapTextureData_buffer, oidn::Format::Half3, width, height, 0, sizeof(XMHALF4));
-					filter.setImage("output", texturedata_dst_buffer, oidn::Format::Half3, width, height, 0, sizeof(XMHALF4));
-					filter.commit();
-
-					// Filter the image
-					filter.execute();
-
-					// Check for errors
-					const char* errorMessage;
-					auto error = device.getError(errorMessage);
-					if (error != oidn::Error::None)
+					if (labels[seed] >= 0 || lightmapCoverageData[seed] == 0)
+						continue;
+					const int32_t label = static_cast<int32_t>(components.size());
+					auto& component = components.emplace_back();
+					labels[seed] = label;
+					queue.push_back(seed);
+					while (!queue.empty())
 					{
-						lightmapStatistics.denoiser_failed = true;
-						wi::backlog::post(std::string("[OpenImageDenoise error] ") +
-							(errorMessage != nullptr ? errorMessage : "filter execution failed"));
-					}
-					else
-					{
-						texturedata_dst_buffer.read(0, lightmapTextureData.size(), lightmapTextureData.data());
-						lightmapStatistics.denoiser_applied = true;
+						const uint32_t index = queue.front();
+						queue.pop_front();
+						component.push_back(index);
+						const uint32_t x = index % width;
+						const uint32_t y = index / width;
+						const uint32_t neighbors[4] = {
+							y > 0 ? index - width : index,
+							y + 1 < height ? index + width : index,
+							x > 0 ? index - 1 : index,
+							x + 1 < width ? index + 1 : index,
+						};
+						for (uint32_t neighbor : neighbors)
+						{
+							if (neighbor != index && labels[neighbor] < 0 &&
+								lightmapCoverageData[neighbor] != 0)
+							{
+								labels[neighbor] = label;
+								queue.push_back(neighbor);
+							}
+						}
 					}
 				}
+
+				bool all_components_succeeded = true;
+				for (uint32_t component_index = 0;
+					component_index < components.size(); ++component_index)
+				{
+					const auto& component = components[component_index];
+					if (component.empty())
+						continue;
+					uint32_t min_x = width - 1, min_y = height - 1, max_x = 0, max_y = 0;
+					for (uint32_t index : component)
+					{
+						const uint32_t x = index % width;
+						const uint32_t y = index / width;
+						min_x = std::min(min_x, x); min_y = std::min(min_y, y);
+						max_x = std::max(max_x, x); max_y = std::max(max_y, y);
+					}
+					constexpr uint32_t padding = 8;
+					min_x = min_x > padding ? min_x - padding : 0;
+					min_y = min_y > padding ? min_y - padding : 0;
+					max_x = std::min(width - 1, max_x + padding);
+					max_y = std::min(height - 1, max_y + padding);
+					const uint32_t patch_width = max_x - min_x + 1;
+					const uint32_t patch_height = max_y - min_y + 1;
+					const uint32_t patch_count = patch_width * patch_height;
+					wi::vector<XMFLOAT3> input(patch_count);
+					wi::vector<XMFLOAT3> output(patch_count);
+					wi::vector<uint8_t> assigned(patch_count, 0);
+					std::deque<uint32_t> dilation_queue;
+
+					for (uint32_t atlas_index : component)
+					{
+						const uint32_t x = atlas_index % width;
+						const uint32_t y = atlas_index / width;
+						const uint32_t patch_index = (y - min_y) * patch_width + (x - min_x);
+						XMFLOAT4 sample;
+						XMStoreFloat4(&sample, XMLoadHalf4(texels + atlas_index));
+						input[patch_index] = XMFLOAT3(
+							std::sqrt(std::max(0.0f, sample.x)),
+							std::sqrt(std::max(0.0f, sample.y)),
+							std::sqrt(std::max(0.0f, sample.z)));
+						assigned[patch_index] = 1;
+						dilation_queue.push_back(patch_index);
+					}
+
+					// Nearest-chart extension supplies stable context at UV borders while
+					// keeping all other charts completely out of this filter invocation.
+					while (!dilation_queue.empty())
+					{
+						const uint32_t index = dilation_queue.front();
+						dilation_queue.pop_front();
+						const uint32_t x = index % patch_width;
+						const uint32_t y = index / patch_width;
+						const uint32_t neighbors[4] = {
+							y > 0 ? index - patch_width : index,
+							y + 1 < patch_height ? index + patch_width : index,
+							x > 0 ? index - 1 : index,
+							x + 1 < patch_width ? index + 1 : index,
+						};
+						for (uint32_t neighbor : neighbors)
+						{
+							if (neighbor != index && assigned[neighbor] == 0)
+							{
+								assigned[neighbor] = 1;
+								input[neighbor] = input[index];
+								dilation_queue.push_back(neighbor);
+							}
+						}
+					}
+
+					oidn::FilterRef filter = denoiser.device.newFilter("RTLightmap");
+					filter.setImage("color", input.data(), oidn::Format::Float3,
+						patch_width, patch_height);
+					filter.setImage("output", output.data(), oidn::Format::Float3,
+						patch_width, patch_height);
+					filter.commit();
+					filter.execute();
+					const char* error_message = nullptr;
+					if (denoiser.device.getError(error_message) != oidn::Error::None)
+					{
+						all_components_succeeded = false;
+						wi::backlog::post(std::string("[OpenImageDenoise error] ") +
+							(error_message != nullptr ? error_message : "filter execution failed"));
+						break;
+					}
+
+					for (uint32_t atlas_index : component)
+					{
+						const uint32_t x = atlas_index % width;
+						const uint32_t y = atlas_index / width;
+						const XMFLOAT3& denoised = output[(y - min_y) * patch_width + (x - min_x)];
+						XMFLOAT4 original;
+						XMStoreFloat4(&original, XMLoadHalf4(texels + atlas_index));
+						XMStoreHalf4(texels + atlas_index, XMVectorSet(
+							std::max(0.0f, denoised.x * denoised.x),
+							std::max(0.0f, denoised.y * denoised.y),
+							std::max(0.0f, denoised.z * denoised.z), original.w));
+					}
+				}
+				lightmapStatistics.denoiser_failed = !all_components_succeeded;
+				lightmapStatistics.denoiser_applied = all_components_succeeded && !components.empty();
 			}
 #endif // OPEN_IMAGE_DENOISE
 

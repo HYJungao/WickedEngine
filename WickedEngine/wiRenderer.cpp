@@ -1181,6 +1181,8 @@ void LoadShaders()
 	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::CS, shaders[CSTYPE_DEPTH_REPROJECT], "depth_reprojectCS.cso"); });
 	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::CS, shaders[CSTYPE_DEPTH_PYRAMID], "depth_pyramidCS.cso"); });
 	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::CS, shaders[CSTYPE_LIGHTMAP_EXPAND], "lightmap_expandCS.cso"); });
+	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::CS, shaders[CSTYPE_LIGHTMAP_ADAPTIVE], "lightmap_adaptiveCS.cso"); });
+	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::CS, shaders[CSTYPE_LIGHTMAP_LIGHTCANDIDATES], "lightmap_lightcandidatesCS.cso"); });
 
 	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::HS, shaders[HSTYPE_OBJECT], "objectHS.cso"); });
 	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::HS, shaders[HSTYPE_OBJECT_PREPASS], "objectHS_prepass.cso"); });
@@ -3618,6 +3620,10 @@ void UpdateVisibility(Visibility& vis)
 
 	if (vis.flags & Visibility::ALLOW_LIGHTS)
 	{
+		// Offline light transport is not camera-local. Keep every active light
+		// in the frame entity array while a bake is running; the conservative
+		// per-object candidate pass below performs the spatial reduction.
+		const bool lightmap_visibility = vis.scene->IsLightmapUpdateRequested();
 		// Cull lights:
 		const uint32_t light_loop = (uint32_t)std::min(vis.scene->aabb_lights.size(), vis.scene->lights.GetCount());
 		vis.visibleLights.resize(light_loop);
@@ -3634,7 +3640,8 @@ void UpdateVisibility(Visibility& vis)
 
 			const AABB& aabb = vis.scene->aabb_lights[args.jobIndex];
 
-			if ((aabb.layerMask & vis.layerMask) && vis.frustum.CheckBoxFast(aabb))
+			if ((aabb.layerMask & vis.layerMask) &&
+				(lightmap_visibility || vis.frustum.CheckBoxFast(aabb)))
 			{
 				const LightComponent& light = vis.scene->lights[args.jobIndex];
 				if (!light.IsInactive())
@@ -11230,12 +11237,41 @@ void RefreshLightmaps(const Scene& scene, CommandList cmd, uint32_t iterations_p
 		if (object.IsLightmapRenderRequested())
 		{
 			device->EventBegin("RenderObjectLightMap", cmd);
+			static constexpr uint32_t lightmap_batch_size = 64u;
 
 			const MeshComponent& mesh = scene.meshes[object.mesh_index];
 			assert(!mesh.vertex_atlas.empty());
 			assert(mesh.vb_atl.IsValid());
 
 			const TextureDesc& desc = object.lightmap_render.GetDesc();
+			const uint32_t guiding_tile_width = (desc.width + 7u) / 8u;
+			const uint32_t guiding_tile_height = (desc.height + 7u) / 8u;
+			const uint64_t guiding_buffer_size = uint64_t(guiding_tile_width) *
+				uint64_t(guiding_tile_height) * 32u * sizeof(uint32_t);
+			if (!object.lightmap_guiding_histogram.IsValid() ||
+				object.lightmap_guiding_histogram.desc.size < guiding_buffer_size)
+			{
+				GPUBufferDesc guiding_desc;
+				guiding_desc.size = std::max<uint64_t>(guiding_buffer_size, sizeof(uint32_t));
+				guiding_desc.bind_flags = BindFlag::SHADER_RESOURCE | BindFlag::UNORDERED_ACCESS;
+				guiding_desc.misc_flags = ResourceMiscFlag::BUFFER_RAW;
+				device->CreateBuffer(&guiding_desc, nullptr, &object.lightmap_guiding_histogram);
+				device->SetName(&object.lightmap_guiding_histogram, "lightmap_first_bounce_guiding");
+			}
+			if (object.lightmapIterationCount == 0)
+			{
+				device->ClearUAV(&object.lightmap_guiding_histogram, 0, cmd);
+				device->Barrier(GPUBarrier::Memory(&object.lightmap_guiding_histogram), cmd);
+				device->Barrier(GPUBarrier::Image(
+					&object.lightmap_statistics_texture,
+					object.lightmap_statistics_texture.desc.layout,
+					ResourceState::UNORDERED_ACCESS), cmd);
+				device->ClearUAV(&object.lightmap_statistics_texture, 0, cmd);
+				device->Barrier(GPUBarrier::Image(
+					&object.lightmap_statistics_texture,
+					ResourceState::UNORDERED_ACCESS,
+					object.lightmap_statistics_texture.desc.layout), cmd);
+			}
 
 			Viewport vp;
 			vp.width = (float)desc.width;
@@ -11246,6 +11282,30 @@ void RefreshLightmaps(const Scene& scene, CommandList cmd, uint32_t iterations_p
 			push.vb_nor = mesh.vb_nor.descriptor_srv;
 			push.vb_atl = mesh.vb_atl.descriptor_srv;
 			push.instanceIndex = objectIndex;
+
+			// Rebuild a conservative object-local light list every work packet so
+			// moving lights remain correct. The compact list is an acceleration
+			// structure only; the support test is conservative and cannot remove a
+			// light that could contribute to this object's bounding sphere.
+			const uint64_t candidate_buffer_size =
+				uint64_t(SHADER_ENTITY_COUNT + 1u) * sizeof(uint32_t);
+			if (!object.lightmap_light_candidates.IsValid() ||
+				object.lightmap_light_candidates.desc.size < candidate_buffer_size)
+			{
+				GPUBufferDesc candidate_desc;
+				candidate_desc.size = candidate_buffer_size;
+				candidate_desc.bind_flags = BindFlag::SHADER_RESOURCE | BindFlag::UNORDERED_ACCESS;
+				candidate_desc.misc_flags = ResourceMiscFlag::BUFFER_RAW;
+				device->CreateBuffer(&candidate_desc, nullptr, &object.lightmap_light_candidates);
+				device->SetName(&object.lightmap_light_candidates, "lightmap_light_candidates");
+			}
+			device->ClearUAV(&object.lightmap_light_candidates, 0, cmd);
+			device->Barrier(GPUBarrier::Memory(&object.lightmap_light_candidates), cmd);
+			device->BindComputeShader(&shaders[CSTYPE_LIGHTMAP_LIGHTCANDIDATES], cmd);
+			device->BindUAV(&object.lightmap_light_candidates, 0, cmd);
+			device->PushConstants(&push, sizeof(push), cmd);
+			device->Dispatch((SHADER_ENTITY_COUNT + 63u) / 64u, 1, 1, cmd);
+			device->Barrier(GPUBarrier::Memory(&object.lightmap_light_candidates), cmd);
 			uint32_t indexStart = ~0u;
 			uint32_t indexEnd = 0;
 
@@ -11269,10 +11329,25 @@ void RefreshLightmaps(const Scene& scene, CommandList cmd, uint32_t iterations_p
 			// safely run once after the whole work packet.
 			for (uint32_t iteration = 0; iteration < iterations_per_request; ++iteration)
 			{
+				const uint32_t batch_sample = object.lightmapIterationCount % lightmap_batch_size;
+				if (object.lightmapIterationCount == 128u)
+				{
+					// Publish the frozen training histogram before the first guided
+					// sample reads it through the SRV view.
+					device->Barrier(GPUBarrier::Memory(&object.lightmap_guiding_histogram), cmd);
+					// Wicked's DX12 descriptor binder doesn't accept nullptr as an
+					// unbind operation. Rebind a valid, different UAV so the guiding
+					// histogram can transition to SRV without retaining a UAV alias.
+					device->BindUAV(&object.lightmap_light_candidates, 0, cmd);
+				}
 				RenderPassImage rp[] = {
 					RenderPassImage::RenderTarget(
 						&object.lightmap_render,
 						object.lightmapIterationCount == 0 ? RenderPassImage::LoadOp::CLEAR : RenderPassImage::LoadOp::LOAD
+					),
+					RenderPassImage::RenderTarget(
+						&object.lightmap_batch,
+						batch_sample == 0 ? RenderPassImage::LoadOp::CLEAR : RenderPassImage::LoadOp::LOAD
 					),
 					RenderPassImage::DepthStencil(&lightmap_depth_tmp, RenderPassImage::LoadOp::CLEAR),
 				};
@@ -11280,6 +11355,12 @@ void RefreshLightmaps(const Scene& scene, CommandList cmd, uint32_t iterations_p
 
 				device->BindViewports(1, &vp, cmd);
 				device->BindPipelineState(&PSO_renderlightmap, cmd);
+				device->BindResource(&object.lightmap_statistics_texture, 1, cmd);
+				device->BindResource(&object.lightmap_light_candidates, 2, cmd);
+				if (object.lightmapIterationCount < 128u)
+					device->BindUAV(&object.lightmap_guiding_histogram, 0, cmd);
+				else
+					device->BindResource(&object.lightmap_guiding_histogram, 3, cmd);
 				device->BindIndexBuffer(&mesh.generalBuffer, mesh.GetIndexFormat(), mesh.ib.offset, cmd);
 				device->PushConstants(&push, sizeof(push), cmd);
 
@@ -11290,6 +11371,10 @@ void RefreshLightmaps(const Scene& scene, CommandList cmd, uint32_t iterations_p
 				cb.xTraceResolution_rcp.y = 1.0f / cb.xTraceResolution.y;
 				cb.xTraceAccumulationFactor = 1.0f / (object.lightmapIterationCount + 1.0f); // accumulation factor (alpha)
 				cb.xTraceUserData.x = raytraceBounceCount;
+				// Independent Owen-scrambled Sobol replicates.  Batch-level means
+				// provide a statistically valid error estimate for adaptive stopping.
+				cb.xTraceUserData.z = lightmap_batch_size;
+				cb.xTraceUserData.w = object.lightmapIterationCount >= 128u ? 1u : 0u;
 				XMFLOAT4 halton = wi::math::GetHaltonSequence(object.lightmapIterationCount); // for jittering the rasterization (good for eliminating atlas border artifacts)
 				cb.xTracePixelOffset.x = (halton.x * 2 - 1) * cb.xTraceResolution_rcp.x;
 				cb.xTracePixelOffset.y = (halton.y * 2 - 1) * cb.xTraceResolution_rcp.y;
@@ -11308,6 +11393,30 @@ void RefreshLightmaps(const Scene& scene, CommandList cmd, uint32_t iterations_p
 				}
 
 				device->RenderPassEnd(cmd);
+
+				// Only complete independent replicates enter Welford. This is the
+				// statistical boundary that makes the convergence test valid for QMC.
+				if (object.lightmapIterationCount > 128u &&
+					(object.lightmapIterationCount % lightmap_batch_size) == 0)
+				{
+					device->EventBegin("Lightmap adaptive statistics", cmd);
+					device->BindComputeShader(&shaders[CSTYPE_LIGHTMAP_ADAPTIVE], cmd);
+					device->BindResource(&object.lightmap_batch, 0, cmd);
+					device->BindUAV(&object.lightmap_statistics_texture, 0, cmd);
+					device->Barrier(GPUBarrier::Image(
+						&object.lightmap_statistics_texture,
+						object.lightmap_statistics_texture.desc.layout,
+						ResourceState::UNORDERED_ACCESS), cmd);
+					device->Dispatch(
+						(desc.width + POSTPROCESS_BLOCKSIZE - 1) / POSTPROCESS_BLOCKSIZE,
+						(desc.height + POSTPROCESS_BLOCKSIZE - 1) / POSTPROCESS_BLOCKSIZE,
+						1, cmd);
+					device->Barrier(GPUBarrier::Image(
+						&object.lightmap_statistics_texture,
+						ResourceState::UNORDERED_ACCESS,
+						object.lightmap_statistics_texture.desc.layout), cmd);
+					device->EventEnd(cmd);
+				}
 			}
 
 			device->Barrier(GPUBarrier::Aliasing(&lightmap_depth_tmp, &lightmap_color_tmp), cmd);

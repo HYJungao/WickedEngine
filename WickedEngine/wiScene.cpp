@@ -4745,6 +4745,13 @@ namespace wi::scene
 						device->CreateTexture(&desc, nullptr, &object.lightmap_render);
 						device->SetName(&object.lightmap_render, "lightmap_render");
 
+						device->CreateTexture(&desc, nullptr, &object.lightmap_batch);
+						device->SetName(&object.lightmap_batch, "lightmap_independent_batch");
+
+						desc.bind_flags = BindFlag::UNORDERED_ACCESS | BindFlag::SHADER_RESOURCE;
+						device->CreateTexture(&desc, nullptr, &object.lightmap_statistics_texture);
+						device->SetName(&object.lightmap_statistics_texture, "lightmap_adaptive_statistics");
+
 						object.lightmapIterationCount = 0; // reset accumulation
 					}
 					if (!object.lightmap.IsValid())

@@ -87,11 +87,14 @@ struct LightmapQmcSampler
 {
 	uint2 pixel;
 	uint sample_index;
+	uint batch_index;
 
-	void init(uint2 pixel_id, uint index)
+	void init(uint2 pixel_id, uint index, uint batch_size)
 	{
 		pixel = pixel_id;
-		sample_index = index;
+		batch_size = max(batch_size, 1u);
+		batch_index = index / batch_size;
+		sample_index = index % batch_size;
 	}
 
 	float4 sample4D(uint dimension_group)
@@ -99,7 +102,8 @@ struct LightmapQmcSampler
 		const uint seed = lightmap_hash(
 			pixel.x * 0x9e3779b9u ^
 			pixel.y * 0x85ebca6bu ^
-			dimension_group * 0xc2b2ae35u);
+			dimension_group * 0xc2b2ae35u ^
+			batch_index * 0x27d4eb2du);
 		const uint scrambled_index = lightmap_nested_uniform_scramble(
 			sample_index, lightmap_hash(seed ^ 0x243f6a88u));
 		uint4 bits = lightmap_sobol4(scrambled_index);

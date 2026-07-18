@@ -229,6 +229,8 @@ wi::vector<ShaderEntry> shaders = {
 	{"depth_reprojectCS", wi::graphics::ShaderStage::CS },
 	{"depth_pyramidCS", wi::graphics::ShaderStage::CS },
 	{"lightmap_expandCS", wi::graphics::ShaderStage::CS },
+	{"lightmap_adaptiveCS", wi::graphics::ShaderStage::CS },
+	{"lightmap_lightcandidatesCS", wi::graphics::ShaderStage::CS },
 	{"gaussian_splatCS", wi::graphics::ShaderStage::CS },
 	{"gaussian_splat_indirectCS", wi::graphics::ShaderStage::CS },
 

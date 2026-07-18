@@ -5,6 +5,12 @@
 #include "lightingHF.hlsli"
 #include "stochasticSSRHF.hlsli"
 #include "lightmap_samplingHF.hlsli"
+#include "lightmap_lightsamplingHF.hlsli"
+
+Texture2D<float4> lightmap_statistics : register(t1);
+Buffer<uint> lightmap_light_candidates : register(t2);
+Buffer<uint> lightmap_guiding_histogram : register(t3);
+RWBuffer<uint> lightmap_guiding_histogram_write : register(u0);
 
 //#define DEBUG_CHARTS
 
@@ -18,6 +24,12 @@ static const uint ANYTHIT_CUTOFF_AFTER_BOUNCE_COUNT = 4;
 // applied chroma-preservingly to individual samples, not to the converged
 // lightmap, so normal HDR indirect illumination remains representable.
 static const float LIGHTMAP_SAMPLE_RADIANCE_MAX = 16.0;
+static const uint LIGHTMAP_GUIDING_TILE_SIZE = 8u;
+static const uint LIGHTMAP_GUIDING_PHI_BINS = 8u;
+static const uint LIGHTMAP_GUIDING_Z_BINS = 4u;
+static const uint LIGHTMAP_GUIDING_BIN_COUNT =
+	LIGHTMAP_GUIDING_PHI_BINS * LIGHTMAP_GUIDING_Z_BINS;
+static const uint LIGHTMAP_GUIDING_TRAINING_SAMPLES = 128u;
 
 struct Input
 {
@@ -29,6 +41,85 @@ struct Input
 	uint primitiveID : SV_PrimitiveID;
 #endif // DEBUG_CHARTS
 };
+
+uint LightmapGuidingTileOffset(uint2 pixel)
+{
+	const uint tile_width = (xTraceResolution.x + LIGHTMAP_GUIDING_TILE_SIZE - 1u) /
+		LIGHTMAP_GUIDING_TILE_SIZE;
+	const uint2 tile = pixel / LIGHTMAP_GUIDING_TILE_SIZE;
+	return (tile.y * tile_width + tile.x) * LIGHTMAP_GUIDING_BIN_COUNT;
+}
+
+uint LightmapGuidingDirectionBin(float3 direction, float3 N)
+{
+	const float3 local = mul(get_tangentspace(N), direction);
+	const float phi = atan2(local.y, local.x) + PI;
+	const uint phi_bin = min(uint(phi * (LIGHTMAP_GUIDING_PHI_BINS / (2.0 * PI))),
+		LIGHTMAP_GUIDING_PHI_BINS - 1u);
+	const uint z_bin = min(uint(saturate(local.z) * LIGHTMAP_GUIDING_Z_BINS),
+		LIGHTMAP_GUIDING_Z_BINS - 1u);
+	return z_bin * LIGHTMAP_GUIDING_PHI_BINS + phi_bin;
+}
+
+float3 SampleLightmapGuidedPrimary(
+	uint2 pixel,
+	float3 N,
+	float4 random_sample,
+	out float throughput_weight,
+	out float proposal_pdf)
+{
+	const uint offset = LightmapGuidingTileOffset(pixel);
+	uint total = 0;
+	[unroll]
+	for (uint i = 0; i < LIGHTMAP_GUIDING_BIN_COUNT; ++i)
+		total += lightmap_guiding_histogram[offset + i];
+
+	if (total == 0 || random_sample.x < 0.5)
+	{
+		const float3 direction = normalize(lightmap_sample_hemisphere_cos(N, random_sample.yz));
+		const float cosine_pdf = saturate(dot(direction, N)) / PI;
+		float guide_pdf = 0;
+		if (total > 0)
+		{
+			const uint bin = LightmapGuidingDirectionBin(direction, N);
+			const float bin_probability = float(lightmap_guiding_histogram[offset + bin]) / float(total);
+			guide_pdf = bin_probability * LIGHTMAP_GUIDING_BIN_COUNT / (2.0 * PI);
+		}
+		const float mixture_pdf = total > 0 ? 0.5 * (cosine_pdf + guide_pdf) : cosine_pdf;
+		proposal_pdf = mixture_pdf;
+		throughput_weight = cosine_pdf / max(mixture_pdf, 1e-8);
+		return direction;
+	}
+
+	const uint target = min(uint(random_sample.y * total), total - 1u);
+	uint accumulated = 0;
+	uint selected_bin = 0;
+	[loop]
+	for (uint i = 0; i < LIGHTMAP_GUIDING_BIN_COUNT; ++i)
+	{
+		accumulated += lightmap_guiding_histogram[offset + i];
+		if (target < accumulated)
+		{
+			selected_bin = i;
+			break;
+		}
+	}
+	const uint z_bin = selected_bin / LIGHTMAP_GUIDING_PHI_BINS;
+	const uint phi_bin = selected_bin % LIGHTMAP_GUIDING_PHI_BINS;
+	const float z = (float(z_bin) + random_sample.z) / LIGHTMAP_GUIDING_Z_BINS;
+	const float phi = 2.0 * PI * (float(phi_bin) + random_sample.w) /
+		LIGHTMAP_GUIDING_PHI_BINS - PI;
+	const float radial = sqrt(saturate(1.0 - z * z));
+	const float3 local = float3(cos(phi) * radial, sin(phi) * radial, z);
+	const float3 direction = normalize(mul(local, get_tangentspace(N)));
+	const float cosine_pdf = saturate(dot(direction, N)) / PI;
+	const float bin_probability = float(lightmap_guiding_histogram[offset + selected_bin]) /
+		float(total);
+	const float guide_pdf = bin_probability * LIGHTMAP_GUIDING_BIN_COUNT / (2.0 * PI);
+	proposal_pdf = 0.5 * (cosine_pdf + guide_pdf);
+	throughput_weight = cosine_pdf / max(proposal_pdf, 1e-8);
+	return direction;
+}
 
 static const float2 tangent_directions[] = {
 	float2(1, 0),
@@ -130,6 +221,128 @@ bool IsLightmapLightEligible(ShaderEntity light, uint bounce)
 	// dynamic lights keep their direct term at runtime but can still contribute
 	// bounced indirect lighting after the first surface interaction.
 	return bounce > 0 || light.IsStaticLight();
+}
+
+struct LightmapEmitterHit
+{
+	float distance;
+	float3 radiance;
+	float light_pdf;
+	bool valid;
+};
+
+LightmapEmitterHit TraceLightmapEmitterHit(
+	RayDesc ray,
+	float3 receiver_normal,
+	uint light_bounce,
+	float geometry_distance)
+{
+	LightmapEmitterHit best = (LightmapEmitterHit)0;
+	best.distance = geometry_distance;
+	float total_weight = 0;
+	const uint light_count = lightmap_light_candidates[0];
+	for (uint i = 0; i < light_count; ++i)
+	{
+		ShaderEntity light = load_entity(lightmap_light_candidates[1u + i]);
+		if (IsLightmapLightEligible(light, light_bounce))
+			total_weight += EstimateLightmapEmitter(light, ray.Origin, receiver_normal);
+	}
+	if (total_weight <= 0)
+		return best;
+
+	for (uint i = 0; i < light_count; ++i)
+	{
+		ShaderEntity light = load_entity(lightmap_light_candidates[1u + i]);
+		if (!IsLightmapLightEligible(light, light_bounce))
+			continue;
+		const float selection_weight = EstimateLightmapEmitter(light, ray.Origin, receiver_normal);
+		if (selection_weight <= 0)
+			continue;
+
+		float hit_distance = FLT_MAX;
+		float shape_pdf = 0;
+		float3 energy_over_pdf = 0;
+		switch (light.GetType())
+		{
+		case ENTITY_TYPE_DIRECTIONALLIGHT:
+		{
+			const float angular_radius = atan(max(light.GetRadius(), 0.0));
+			if (angular_radius <= 1e-5 || geometry_distance < FLT_MAX)
+				break; // delta lights cannot be reached by continuous BSDF sampling
+			const float cos_theta_max = cos(min(angular_radius, PI * 0.499));
+			if (dot(ray.Direction, normalize(light.GetDirection().xyz)) < cos_theta_max)
+				break;
+			hit_distance = FLT_MAX - 1.0;
+			shape_pdf = LightmapUniformConePdf(cos_theta_max);
+			float3 transmittance = 1;
+			if (GetFrame().options & OPTION_BIT_REALISTIC_SKY)
+				transmittance = GetAtmosphericLightTransmittance(
+					GetWeather().atmosphere, ray.Origin, ray.Direction, texture_transmittancelut);
+			energy_over_pdf = light.GetColor().rgb * transmittance;
+		}
+		break;
+		case ENTITY_TYPE_POINTLIGHT:
+		case ENTITY_TYPE_SPOTLIGHT:
+		{
+			if (light.GetRadius() <= 1e-5 || light.GetLength() > 1e-5)
+				break;
+			hit_distance = LightmapRaySphereDistance(
+				ray.Origin, ray.Direction, light.position, light.GetRadius());
+			if (hit_distance >= best.distance)
+				break;
+			const float3 center_delta = light.position - ray.Origin;
+			const float center_dist2 = dot(center_delta, center_delta);
+			const float center_distance = sqrt(max(center_dist2, 1e-12));
+			const float radius = min(light.GetRadius(), center_distance * 0.995);
+			const float cos_theta_max = sqrt(saturate(1.0 - radius * radius / center_dist2));
+			shape_pdf = LightmapUniformConePdf(cos_theta_max);
+			float attenuation = attenuation_pointlight(
+				center_dist2, light.GetRange(), light.GetRange2Rcp());
+			if (light.GetType() == ENTITY_TYPE_SPOTLIGHT)
+			{
+				const float spot_factor = dot(normalize(center_delta), light.GetDirection());
+				attenuation = attenuation_spotlight(
+					center_dist2, light.GetRange(), light.GetRange2Rcp(), spot_factor,
+					light.GetAngleScale(), light.GetAngleOffset());
+			}
+			energy_over_pdf = light.GetColor().rgb * attenuation;
+		}
+		break;
+		case ENTITY_TYPE_RECTLIGHT:
+		{
+			const half4 quaternion = light.GetQuaternion();
+			const float3 right = rotate_vector(half3(1, 0, 0), quaternion);
+			const float3 up = rotate_vector(half3(0, 1, 0), quaternion);
+			const float3 forward = cross(up, right);
+			const float denominator = dot(ray.Direction, forward);
+			if (denominator >= -1e-6)
+				break;
+			hit_distance = dot(light.position - ray.Origin, forward) / denominator;
+			if (hit_distance <= 0.001 || hit_distance >= best.distance)
+				break;
+			const float3 local = ray.Origin + ray.Direction * hit_distance - light.position;
+			const float width = max(light.GetLength(), 1e-4);
+			const float height = max(light.GetHeight(), 1e-4);
+			if (abs(dot(local, right)) > width * 0.5 || abs(dot(local, up)) > height * 0.5)
+				break;
+			const float area = width * height;
+			const float dist2 = hit_distance * hit_distance;
+			shape_pdf = dist2 / max(-denominator * area, 1e-12);
+			energy_over_pdf = light.GetColor().rgb * attenuation_pointlight(
+				dist2, light.GetRange(), light.GetRange2Rcp()) * area * PI;
+		}
+		break;
+		}
+
+		if (hit_distance < best.distance && shape_pdf > 0 && any(energy_over_pdf > 0))
+		{
+			best.distance = hit_distance;
+			best.radiance = energy_over_pdf * shape_pdf;
+			best.light_pdf = (selection_weight / total_weight) * shape_pdf;
+			best.valid = true;
+		}
+	}
+	return best;
 }
 
 float EstimateLightmapLightContribution(ShaderEntity light, float3 P, float3 N)
@@ -410,12 +623,128 @@ float3 EvaluateLightmapDirect(
 		(PI * max(light_pick_probability, 1e-8));
 }
 
-[earlydepthstencil]
-float4 main(Input input) : SV_TARGET
+// Production NEE path. The emitter helper samples every finite source in a
+// measure that is also evaluable by the BSDF strategy. This removes the old
+// source-size-dependent estimator (rectangles were missing their area/Jacobian
+// and spherical point lights were jittered without a shape PDF).
+float3 EvaluateLightmapDirectMIS(
+	Surface receiver,
+	float3 diffuse_throughput,
+	float diffuse_bsdf_probability,
+	uint light_bounce,
+	float4 random_sample,
+	inout RNG rng)
 {
+	const uint light_count = lightmap_light_candidates[0];
+	uint selected_entity = ~0u;
+	float selected_weight = 0;
+	float total_weight = 0;
+
+	for (uint candidate = 0; candidate < light_count; ++candidate)
+	{
+		const uint entity_index = lightmap_light_candidates[1u + candidate];
+		ShaderEntity candidate_light = load_entity(entity_index);
+		if (!IsLightmapLightEligible(candidate_light, light_bounce))
+			continue;
+		total_weight += EstimateLightmapEmitter(candidate_light, receiver.P, receiver.N);
+	}
+
+	if (total_weight <= 0)
+		return 0;
+
+	const float target = random_sample.x * total_weight;
+	float accumulated = 0;
+	for (uint candidate = 0; candidate < light_count; ++candidate)
+	{
+		const uint entity_index = lightmap_light_candidates[1u + candidate];
+		ShaderEntity candidate_light = load_entity(entity_index);
+		if (!IsLightmapLightEligible(candidate_light, light_bounce))
+			continue;
+		const float weight = EstimateLightmapEmitter(candidate_light, receiver.P, receiver.N);
+		accumulated += weight;
+		if (weight > 0 && target < accumulated)
+		{
+			selected_entity = entity_index;
+			selected_weight = weight;
+			break;
+		}
+	}
+
+	if (selected_entity == ~0u || selected_weight <= 0)
+		return 0;
+
+	ShaderEntity light = load_entity(selected_entity);
+	LightmapLightSample light_sample = SampleLightmapEmitter(
+		light, selected_entity, receiver.P, receiver.N, random_sample.yzw);
+	const float NdotL = saturate(dot(light_sample.direction, receiver.N));
+	if (!light_sample.valid || NdotL <= 0 || light_sample.distance <= 0)
+		return 0;
+
+	float3 visibility = diffuse_throughput;
+	RayDesc shadow_ray;
+	shadow_ray.Origin = receiver.P + receiver.N * 0.001;
+	shadow_ray.TMin = 0.001;
+	shadow_ray.TMax = light_sample.distance == FLT_MAX ? FLT_MAX : max(0.001, light_sample.distance - 0.001);
+	shadow_ray.Direction = normalize(light_sample.direction + max3(receiver.sss));
+
+#ifdef RTAPI
+	uint flags = RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES | RAY_FLAG_CULL_FRONT_FACING_TRIANGLES;
+	if (light_bounce > ANYTHIT_CUTOFF_AFTER_BOUNCE_COUNT)
+		flags |= RAY_FLAG_FORCE_OPAQUE;
+	wiRayQuery shadow_query;
+	shadow_query.TraceRayInline(scene_acceleration_structure, flags, xTraceUserData.y, shadow_ray);
+	while (shadow_query.Proceed())
+	{
+		PrimitiveID prim;
+		prim.init();
+		prim.primitiveIndex = shadow_query.CandidatePrimitiveIndex();
+		prim.instanceIndex = shadow_query.CandidateInstanceID();
+		prim.subsetIndex = shadow_query.CandidateGeometryIndex();
+		Surface blocker;
+		blocker.init();
+		if (!blocker.load(prim, shadow_query.CandidateTriangleBarycentrics()))
+			break;
+		visibility *= lerp(1, blocker.albedo * blocker.transmission, blocker.opacity);
+		if (!any(visibility))
+			shadow_query.CommitNonOpaqueTriangleHit();
+	}
+	if (shadow_query.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
+		visibility = 0;
+#else
+	if (TraceRay_Any(shadow_ray, xTraceUserData.y, rng))
+		visibility = 0;
+#endif
+
+	const float pick_pdf = selected_weight / total_weight;
+	float mis_weight = 1;
+	if (!light_sample.delta && light_sample.supports_mis)
+	{
+		const float light_pdf = pick_pdf * light_sample.shape_pdf;
+		const float bsdf_pdf = diffuse_bsdf_probability * NdotL / PI;
+		mis_weight = LightmapPowerHeuristic(light_pdf, bsdf_pdf);
+	}
+	return light_sample.energy_over_shape_pdf * visibility * NdotL * mis_weight /
+		(PI * max(pick_pdf, 1e-8));
+}
+
+struct LightmapOutput
+{
+	float4 accumulated : SV_TARGET0;
+	float4 batch : SV_TARGET1;
+};
+
+[earlydepthstencil]
+LightmapOutput main(Input input)
+{
+	LightmapOutput output = (LightmapOutput)0;
 #ifdef DEBUG_CHARTS
-	return float4(random_color(input.primitiveID), 1);
+	output.accumulated = float4(random_color(input.primitiveID), 1);
+	output.batch = output.accumulated;
+	return output;
 #endif // DEBUG_CHARTS
+
+	if (lightmap_statistics[(uint2)input.pos.xy].w > 0.5)
+		return output;
 
 	float2 uv = input.pos.xy * xTraceResolution_rcp;
 
@@ -426,7 +755,7 @@ float4 main(Input input) : SV_TARGET
 	RNG rng;
 	rng.init((uint2)input.pos.xy, xTraceSampleIndex);
 	LightmapQmcSampler qmc;
-	qmc.init((uint2)input.pos.xy, xTraceSampleIndex);
+	qmc.init((uint2)input.pos.xy, xTraceSampleIndex, xTraceUserData.z);
 
 	float3 P = input.pos3D;
 
@@ -435,7 +764,21 @@ float4 main(Input input) : SV_TARGET
 	
 	RayDesc ray;
 	ray.Origin = P + surface.N * 0.001;
-	ray.Direction = normalize(lightmap_sample_hemisphere_cos(surface.N, qmc.sample4D(0).xy));
+	const uint2 lightmap_pixel = (uint2)input.pos.xy;
+	const float4 primary_sample = qmc.sample4D(0);
+	float primary_throughput = 1;
+	float previous_bsdf_pdf = 0;
+	if (xTraceUserData.w != 0)
+		ray.Direction = SampleLightmapGuidedPrimary(
+			lightmap_pixel, surface.N, primary_sample,
+			primary_throughput, previous_bsdf_pdf);
+	else
+	{
+		ray.Direction = normalize(lightmap_sample_hemisphere_cos(surface.N, primary_sample.xy));
+		previous_bsdf_pdf = saturate(dot(ray.Direction, surface.N)) / PI;
+	}
+	const float3 primary_direction = ray.Direction;
+	const float3 lightmap_normal = surface.N;
 	ray.TMin = 0.001;
 	ray.TMax = FLT_MAX;
 	// A baked lightmap contains traced static lights and sky/environment only.
@@ -443,11 +786,13 @@ float4 main(Input input) : SV_TARGET
 	// GI; seeding it here would inject the authored weather tint unoccluded into
 	// every valid texel and produce a uniform color cast in the baked result.
 	float3 result = 0;
-	float3 energy = 1;
+	float3 energy = primary_throughput;
 	surface.P = ray.Origin;
 	// Bounce zero is incident irradiance for the original lightmapped surface;
 	// its material response is applied later by the runtime lighting shader.
-	result += EvaluateLightmapDirect(surface, 1, 0, qmc.sample4D(1), rng);
+	const float3 original_direct = EvaluateLightmapDirectMIS(
+		surface, 1, 1, 0, qmc.sample4D(1), rng);
+	result += original_direct;
 
 	const uint bounces = xTraceUserData.x;
 	uint path_event_index = 0;
@@ -487,13 +832,24 @@ float4 main(Input input) : SV_TARGET
 			ray								// RayDesc Ray
 		);
 		while (q.Proceed());
-		if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT)
+		const float geometry_distance = q.CommittedStatus() == COMMITTED_TRIANGLE_HIT ?
+			q.CommittedRayT() : FLT_MAX;
 #else
 		RayHit hit = TraceRay_Closest(ray, xTraceUserData.y, rng);
-
-		if (hit.distance >= FLT_MAX - 1)
+		const float geometry_distance = hit.distance;
 #endif // RTAPI
 
+		const LightmapEmitterHit emitter_hit = TraceLightmapEmitterHit(
+			ray, surface.N, bounce, geometry_distance);
+		if (emitter_hit.valid)
+		{
+			const float mis_weight = LightmapPowerHeuristic(
+				previous_bsdf_pdf, emitter_hit.light_pdf);
+			result += max(0, energy * emitter_hit.radiance * mis_weight);
+			break;
+		}
+
+		if (geometry_distance >= FLT_MAX - 1)
 		{
 			float3 envColor;
 			[branch]
@@ -523,7 +879,7 @@ float4 main(Input input) : SV_TARGET
 		surface.SetBackface(!q.CommittedTriangleFrontFace());
 
 		if (!surface.load(prim, q.CommittedTriangleBarycentrics()))
-			return 0;
+			return output;
 
 #else
 		// ray origin updated for next bounce:
@@ -532,7 +888,7 @@ float4 main(Input input) : SV_TARGET
 		surface.SetBackface(hit.is_backface);
 
 		if (!surface.load(hit.primitiveID, hit.bary))
-			return 0;
+			return output;
 
 #endif // RTAPI
 
@@ -548,8 +904,11 @@ float4 main(Input input) : SV_TARGET
 		{
 			const float3 diffuse_throughput = energy * surface.albedo *
 				(1 - surface.F) * (1 - surface.transmission);
-			result += EvaluateLightmapDirect(
-				surface, diffuse_throughput, bounce + 1u, light_sample, rng);
+			const float diffuse_bsdf_probability = (1 - surface.transmission) *
+				(1 - dot(surface.F, 0.333));
+			result += EvaluateLightmapDirectMIS(
+				surface, diffuse_throughput, diffuse_bsdf_probability,
+				bounce + 1u, light_sample, rng);
 		}
 
 		if (bsdf_sample.x < surface.transmission)
@@ -562,6 +921,7 @@ float4 main(Input input) : SV_TARGET
 				lightmap_sample_hemisphere_cos(R, bsdf_sample.zw),
 				roughnessBRDF);
 			energy *= surface.albedo / max(0.001, surface.transmission);
+			previous_bsdf_pdf = 0; // no analytic emitter competitor for refraction
 
 			// Add a new bounce iteration, otherwise the transparent effect can disappear:
 			bounce--;
@@ -572,17 +932,22 @@ float4 main(Input input) : SV_TARGET
 			if (bsdf_sample.y < specular_chance)
 			{
 				// Specular reflection
-				ray.Direction = ReflectionDir_GGX(
+				const float4 reflection_sample = ReflectionDir_GGX(
 					-ray.Direction,
 					surface.N,
 					surface.roughness,
-					bsdf_sample.zw).xyz;
+					bsdf_sample.zw);
+				ray.Direction = reflection_sample.xyz;
+				previous_bsdf_pdf = (1 - surface.transmission) *
+					specular_chance * reflection_sample.w;
 				energy *= surface.F / max(0.001, specular_chance) / max(0.001, 1 - surface.transmission);
 			}
 			else
 			{
 				// Diffuse reflection
 				ray.Direction = lightmap_sample_hemisphere_cos(surface.N, bsdf_sample.zw);
+				previous_bsdf_pdf = (1 - surface.transmission) *
+					(1 - specular_chance) * saturate(dot(ray.Direction, surface.N)) / PI;
 				energy *= surface.albedo * (1 - surface.F) / max(0.001, 1 - specular_chance) / max(0.001, 1 - surface.transmission);
 			}
 			
@@ -600,6 +965,7 @@ float4 main(Input input) : SV_TARGET
 			break;
 		}
 		energy /= termination_chance;
+		previous_bsdf_pdf *= termination_chance;
 
 	}
 
@@ -607,11 +973,26 @@ float4 main(Input input) : SV_TARGET
 	//	result = float3(1,0,0);
 	
 	result = max(0, result);
+	if (xTraceSampleIndex < LIGHTMAP_GUIDING_TRAINING_SAMPLES)
+	{
+		// Train only from the primary-path component; original-surface NEE is
+		// independent of the primary direction and would flatten the guide.
+		const float3 path_component = max(0, result - original_direct);
+		const float luminance = dot(path_component, float3(0.2126, 0.7152, 0.0722));
+		const uint fixed_weight = min(uint(luminance * 4096.0 + 0.5), 0x00FFFFFFu);
+		if (fixed_weight > 0)
+		{
+			const uint bin = LightmapGuidingDirectionBin(primary_direction, lightmap_normal);
+			InterlockedAdd(
+				lightmap_guiding_histogram_write[LightmapGuidingTileOffset(lightmap_pixel) + bin],
+				fixed_weight);
+		}
+	}
 	if (any(isnan(result)) || any(isinf(result)))
 	{
 		// Alpha zero keeps an invalid path out of the running average and out
 		// of the persisted coverage mask.
-		return 0;
+		return output;
 	}
 	else
 	{
@@ -619,5 +1000,9 @@ float4 main(Input input) : SV_TARGET
 		result *= min(1.0, LIGHTMAP_SAMPLE_RADIANCE_MAX / max(peak, 1e-4));
 	}
 
-	return float4(result, xTraceAccumulationFactor);
+	output.accumulated = float4(result, xTraceAccumulationFactor);
+	const uint batch_size = max(xTraceUserData.z, 1u);
+	const uint batch_sample = xTraceSampleIndex % batch_size;
+	output.batch = float4(result, rcp(float(batch_sample + 1u)));
+	return output;
 }
