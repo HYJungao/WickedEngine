@@ -1297,7 +1297,7 @@ namespace wi
 					camera_reflection,
 					cmd
 				);
-				wi::renderer::RefreshLightmaps(*scene, cmd);
+				wi::renderer::RefreshLightmaps(*scene, cmd, getLightmapRefreshIterationsPerFrame());
 				wi::renderer::RefreshEnvProbes(visibility_main, cmd);
 				wi::renderer::PaintDecals(*scene, cmd);
 			});

@@ -59,6 +59,8 @@ void NewPipelineClientApp::CreateDebugUI()
     preview_buffer_combo.AddItem("Roughness", static_cast<uint64_t>(DebugPreviewMode::GBufferRoughness));
     preview_buffer_combo.AddItem("Local Lightmap Irradiance", static_cast<uint64_t>(DebugPreviewMode::LocalIndirectDiffuse));
     preview_buffer_combo.AddItem("Local Lightmap Validity", static_cast<uint64_t>(DebugPreviewMode::LocalLightmapValidity));
+    preview_buffer_combo.AddItem("Local Lightmap Coverage", static_cast<uint64_t>(DebugPreviewMode::LocalLightmapCoverage));
+    preview_buffer_combo.AddItem("Local Lightmap Raw", static_cast<uint64_t>(DebugPreviewMode::LocalLightmapRaw));
     preview_buffer_combo.AddItem("Local Indirect (Final Input)", static_cast<uint64_t>(DebugPreviewMode::LocalIndirectFinalInput));
     preview_buffer_combo.AddItem("Local AO", static_cast<uint64_t>(DebugPreviewMode::LocalAO));
     preview_buffer_combo.AddItem("Local Probe Specular", static_cast<uint64_t>(DebugPreviewMode::LocalSpecularIndirect));
@@ -260,8 +262,121 @@ void NewPipelineClientApp::CreateDebugUI()
     elastic_lighting_status_label.SetSize(XMFLOAT2(310.0f, 45.0f));
     elastic_lighting_window.AddWidget(&elastic_lighting_status_label);
 
+    const LightmapDiagnosticSettings initial_diagnostic_settings =
+        render_path.GetLightmapDiagnosticSettings();
+    lightmap_diagnostic_window.Create(
+        "Lightmap Diagnostics",
+        wi::gui::Window::WindowControls::MOVE | wi::gui::Window::WindowControls::COLLAPSE);
+    lightmap_diagnostic_window.SetPos(XMFLOAT2(720.0f, 80.0f));
+    lightmap_diagnostic_window.SetSize(XMFLOAT2(390.0f, 345.0f));
+
+    diagnostic_pick_center_button.Create("Pick Object at Screen Center");
+    diagnostic_pick_center_button.SetTooltip(
+        "Aim the camera center at the artifact mesh, then click. Diagnostic bakes affect only this object.");
+    diagnostic_pick_center_button.SetPos(XMFLOAT2(10.0f, 10.0f));
+    diagnostic_pick_center_button.SetSize(XMFLOAT2(360.0f, 24.0f));
+    diagnostic_pick_center_button.OnClick([this](const wi::gui::EventArgs&) {
+        render_path.PickLightmapDiagnosticObjectAtScreenCenter();
+    });
+    lightmap_diagnostic_window.AddWidget(&diagnostic_pick_center_button);
+
+    diagnostic_resolution_combo.Create("Target Long Edge: ");
+    diagnostic_resolution_combo.SetPos(XMFLOAT2(175.0f, 44.0f));
+    diagnostic_resolution_combo.SetSize(XMFLOAT2(190.0f, 20.0f));
+    for (uint32_t value : {128u, 256u, 512u, 1024u})
+        diagnostic_resolution_combo.AddItem(std::to_string(value), value);
+    diagnostic_resolution_combo.SetSelectedByUserdataWithoutCallback(initial_diagnostic_settings.resolution);
+    diagnostic_resolution_combo.OnSelect([this](const wi::gui::EventArgs& args) {
+        LightmapDiagnosticSettings settings = render_path.GetLightmapDiagnosticSettings();
+        settings.resolution = static_cast<uint32_t>(args.userdata);
+        render_path.SetLightmapDiagnosticSettings(settings);
+    });
+    lightmap_diagnostic_window.AddWidget(&diagnostic_resolution_combo);
+
+    diagnostic_samples_combo.Create("Samples: ");
+    diagnostic_samples_combo.SetPos(XMFLOAT2(175.0f, 74.0f));
+    diagnostic_samples_combo.SetSize(XMFLOAT2(190.0f, 20.0f));
+    for (uint32_t value : {128u, 512u, 2048u})
+        diagnostic_samples_combo.AddItem(std::to_string(value), value);
+    diagnostic_samples_combo.SetSelectedByUserdataWithoutCallback(initial_diagnostic_settings.sample_count);
+    diagnostic_samples_combo.OnSelect([this](const wi::gui::EventArgs& args) {
+        LightmapDiagnosticSettings settings = render_path.GetLightmapDiagnosticSettings();
+        settings.sample_count = static_cast<uint32_t>(args.userdata);
+        render_path.SetLightmapDiagnosticSettings(settings);
+    });
+    lightmap_diagnostic_window.AddWidget(&diagnostic_samples_combo);
+
+    diagnostic_bounces_combo.Create("Bounces: ");
+    diagnostic_bounces_combo.SetPos(XMFLOAT2(175.0f, 104.0f));
+    diagnostic_bounces_combo.SetSize(XMFLOAT2(190.0f, 20.0f));
+    diagnostic_bounces_combo.AddItem("1 (direct + sky)", 1);
+    diagnostic_bounces_combo.AddItem("2 (first indirect)", 2);
+    diagnostic_bounces_combo.AddItem("3 (full)", 3);
+    diagnostic_bounces_combo.SetSelectedByUserdataWithoutCallback(initial_diagnostic_settings.bounce_count);
+    diagnostic_bounces_combo.OnSelect([this](const wi::gui::EventArgs& args) {
+        LightmapDiagnosticSettings settings = render_path.GetLightmapDiagnosticSettings();
+        settings.bounce_count = static_cast<uint32_t>(args.userdata);
+        render_path.SetLightmapDiagnosticSettings(settings);
+    });
+    lightmap_diagnostic_window.AddWidget(&diagnostic_bounces_combo);
+
+    diagnostic_regenerate_atlas_checkbox.Create("Force Regenerate Atlas: ");
+    diagnostic_regenerate_atlas_checkbox.SetPos(XMFLOAT2(175.0f, 136.0f));
+    diagnostic_regenerate_atlas_checkbox.SetSize(XMFLOAT2(18.0f, 18.0f));
+    diagnostic_regenerate_atlas_checkbox.SetCheck(initial_diagnostic_settings.force_regenerate_atlas);
+    diagnostic_regenerate_atlas_checkbox.OnClick([this](const wi::gui::EventArgs& args) {
+        LightmapDiagnosticSettings settings = render_path.GetLightmapDiagnosticSettings();
+        settings.force_regenerate_atlas = args.bValue;
+        render_path.SetLightmapDiagnosticSettings(settings);
+    });
+    lightmap_diagnostic_window.AddWidget(&diagnostic_regenerate_atlas_checkbox);
+
+    diagnostic_pause_before_save_checkbox.Create("Pause Before Save: ");
+    diagnostic_pause_before_save_checkbox.SetPos(XMFLOAT2(175.0f, 164.0f));
+    diagnostic_pause_before_save_checkbox.SetSize(XMFLOAT2(18.0f, 18.0f));
+    diagnostic_pause_before_save_checkbox.SetCheck(initial_diagnostic_settings.pause_before_save);
+    diagnostic_pause_before_save_checkbox.OnClick([this](const wi::gui::EventArgs& args) {
+        LightmapDiagnosticSettings settings = render_path.GetLightmapDiagnosticSettings();
+        settings.pause_before_save = args.bValue;
+        render_path.SetLightmapDiagnosticSettings(settings);
+    });
+    lightmap_diagnostic_window.AddWidget(&diagnostic_pause_before_save_checkbox);
+
+    diagnostic_bake_button.Create("Bake Selected Diagnostic Object");
+    diagnostic_bake_button.SetPos(XMFLOAT2(10.0f, 194.0f));
+    diagnostic_bake_button.SetSize(XMFLOAT2(360.0f, 24.0f));
+    diagnostic_bake_button.OnClick([this](const wi::gui::EventArgs&) {
+        render_path.RequestLightmapDiagnosticBake();
+    });
+    lightmap_diagnostic_window.AddWidget(&diagnostic_bake_button);
+
+    diagnostic_resume_button.Create("Resume: Temporary Save Pipeline");
+    diagnostic_resume_button.SetTooltip(
+        "Runs SaveLightmap (optional OIDN, then BC6H) in memory. Production sidecars are not replaced.");
+    diagnostic_resume_button.SetPos(XMFLOAT2(10.0f, 224.0f));
+    diagnostic_resume_button.SetSize(XMFLOAT2(230.0f, 24.0f));
+    diagnostic_resume_button.OnClick([this](const wi::gui::EventArgs&) {
+        render_path.ResumeLightmapDiagnosticSave();
+    });
+    lightmap_diagnostic_window.AddWidget(&diagnostic_resume_button);
+
+    diagnostic_discard_button.Create("Discard / Restore");
+    diagnostic_discard_button.SetPos(XMFLOAT2(250.0f, 224.0f));
+    diagnostic_discard_button.SetSize(XMFLOAT2(120.0f, 24.0f));
+    diagnostic_discard_button.OnClick([this](const wi::gui::EventArgs&) {
+        render_path.DiscardLightmapDiagnosticBake();
+    });
+    lightmap_diagnostic_window.AddWidget(&diagnostic_discard_button);
+
+    diagnostic_status_label.Create("Lightmap Diagnostic Status");
+    diagnostic_status_label.SetText(render_path.GetLightmapDiagnosticStatus());
+    diagnostic_status_label.SetPos(XMFLOAT2(10.0f, 258.0f));
+    diagnostic_status_label.SetSize(XMFLOAT2(360.0f, 65.0f));
+    lightmap_diagnostic_window.AddWidget(&diagnostic_status_label);
+
     render_path.GetGUI().AddWidget(&debug_window);
     render_path.GetGUI().AddWidget(&elastic_lighting_window);
+    render_path.GetGUI().AddWidget(&lightmap_diagnostic_window);
     debug_ui_created = true;
 }
 
@@ -309,9 +424,12 @@ void NewPipelineClientApp::Update(float dt)
         lightmap_progress_label.SetText(render_path.GetLightmapBakeStatus());
         reflection_probe_progress_label.SetText(render_path.GetReflectionProbeBakeStatus());
         elastic_lighting_status_label.SetText(render_path.GetElasticLightingStatus());
+        diagnostic_status_label.SetText(render_path.GetLightmapDiagnosticStatus());
         const bool lightmap_active = render_path.IsLightmapBakeActive();
         const bool probe_active = render_path.IsReflectionProbeBakeActive();
         const bool static_lighting_active = render_path.IsStaticLightingBakeActive();
+        const bool diagnostic_active = render_path.IsLightmapDiagnosticSessionActive();
+        const bool diagnostic_controls_enabled = !lightmap_active && !probe_active;
         generate_static_lighting_button.SetEnabled(!static_lighting_active);
         generate_lightmaps_button.SetEnabled(!lightmap_active && !probe_active);
         cancel_lightmaps_button.SetEnabled(static_lighting_active);
@@ -323,6 +441,16 @@ void NewPipelineClientApp::Update(float dt)
         reflection_probe_mip_slider.SetRange(0.0f, float(mip_count > 1 ? mip_count - 1 : 1));
         reflection_probe_mip_slider.SetValue(int(render_path.GetReflectionProbeDebugMip()));
         reflection_probe_mip_slider.SetEnabled(mip_count > 1);
+        diagnostic_pick_center_button.SetEnabled(diagnostic_controls_enabled);
+        diagnostic_resolution_combo.SetEnabled(diagnostic_controls_enabled && !diagnostic_active);
+        diagnostic_samples_combo.SetEnabled(diagnostic_controls_enabled && !diagnostic_active);
+        diagnostic_bounces_combo.SetEnabled(diagnostic_controls_enabled && !diagnostic_active);
+        diagnostic_regenerate_atlas_checkbox.SetEnabled(diagnostic_controls_enabled && !diagnostic_active);
+        diagnostic_pause_before_save_checkbox.SetEnabled(diagnostic_controls_enabled && !diagnostic_active);
+        diagnostic_bake_button.SetEnabled(
+            diagnostic_controls_enabled && render_path.HasLightmapDiagnosticObject());
+        diagnostic_resume_button.SetEnabled(render_path.IsLightmapDiagnosticPaused());
+        diagnostic_discard_button.SetEnabled(diagnostic_active);
     }
     render_path.SetInputActive(is_window_active);
     wi::Application::Update(dt);
@@ -330,6 +458,7 @@ void NewPipelineClientApp::Update(float dt)
 
 std::string NewPipelineClientApp::GetWindowTitle() const
 {
-    return std::string{"NewPipeline_Wicked Client ["} + ToString(runtime_config.remote_source) + "]";
+    return std::string{"NewPipeline_Wicked Client ["} + ToString(runtime_config.remote_source) +
+        "] [LM-DIAG-R1]";
 }
 } // namespace wicked_newpipeline

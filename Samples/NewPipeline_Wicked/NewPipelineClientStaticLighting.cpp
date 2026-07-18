@@ -436,12 +436,15 @@ void ClientStaticLighting::DisableLightmaps(wi::scene::Scene& scene)
             saved.width = object.lightmapWidth;
             saved.height = object.lightmapHeight;
             saved.texture = object.lightmap;
+            saved.coverage_texture = object.lightmap_coverage;
             saved_lightmaps.push_back(std::move(saved));
         }
         object.SetLightmapRenderRequest(false);
         object.lightmap = {};
+        object.lightmap_coverage = {};
         object.lightmap_render = {};
         object.lightmapTextureData.clear();
+        object.lightmapCoverageData.clear();
     }
 }
 
@@ -455,7 +458,9 @@ void ClientStaticLighting::RestoreLightmaps(wi::scene::Scene& scene)
         object->lightmapWidth = saved.width;
         object->lightmapHeight = saved.height;
         object->lightmapTextureData.clear();
+        object->lightmapCoverageData.clear();
         object->lightmap = saved.texture;
+        object->lightmap_coverage = saved.coverage_texture;
         object->lightmap_render = {};
     }
     saved_lightmaps.clear();

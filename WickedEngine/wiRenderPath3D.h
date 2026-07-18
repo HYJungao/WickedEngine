@@ -51,6 +51,7 @@ namespace wi
 		float aoPower = 1.0f;
 		float chromaticAberrationAmount = 2.0f;
 		uint32_t screenSpaceShadowSampleCount = 16;
+		uint32_t lightmapRefreshIterationsPerFrame = 1;
 		float screenSpaceShadowRange = 1;
 		float eyeadaptionKey = 0.115f;
 		float eyeadaptionRate = 1;
@@ -277,6 +278,7 @@ namespace wi
 		constexpr wi::renderer::PostProcessQuality getRaytracedReflectionsQuality() const { return raytracedReflectionsQuality; }
 		constexpr wi::renderer::PostProcessQuality getSSRQuality() const { return ssrQuality; }
 		constexpr uint32_t getPlanarReflectionMSAASampleCount() const { return planarReflectionMSAASampleCount; }
+		constexpr uint32_t getLightmapRefreshIterationsPerFrame() const { return lightmapRefreshIterationsPerFrame; }
 		constexpr float getPlanarReflectionResolutionScale() const { return planarReflectionResolutionScale; }
 		constexpr DDGIOutputDebugPreview getDDGIOutputDebugPreview() const { return ddgiOutputDebugPreview; }
 		constexpr bool getRTAOFullResolution() const { return rtaoFullResolution; }
@@ -329,6 +331,10 @@ namespace wi
 		constexpr void setAOPower(float value) { aoPower = value; }
 		constexpr void setChromaticAberrationAmount(float value) { chromaticAberrationAmount = value; }
 		constexpr void setScreenSpaceShadowSampleCount(uint32_t value) { screenSpaceShadowSampleCount = value; }
+		constexpr void setLightmapRefreshIterationsPerFrame(uint32_t value)
+		{
+			lightmapRefreshIterationsPerFrame = value < 1u ? 1u : (value > 64u ? 64u : value);
+		}
 		constexpr void setScreenSpaceShadowRange(float value) { screenSpaceShadowRange = value; }
 		constexpr void setEyeAdaptionKey(float value) { eyeadaptionKey = value; }
 		constexpr void setEyeAdaptionRate(float value) { eyeadaptionRate = value; }

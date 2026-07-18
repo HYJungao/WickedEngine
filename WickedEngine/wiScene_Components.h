@@ -1185,6 +1185,8 @@ namespace wi::scene
 
 		wi::graphics::Texture lightmap_render;
 		wi::graphics::Texture lightmap;
+		wi::graphics::Texture lightmap_coverage;
+		wi::vector<uint8_t> lightmapCoverageData;
 		mutable uint32_t lightmapIterationCount = 0;
 		struct LightmapStatistics
 		{
@@ -1193,6 +1195,10 @@ namespace wi::scene
 			XMFLOAT3 irradiance_max = {};
 			uint64_t valid_texel_count = 0;
 			uint64_t missing_texel_count = 0;
+			uint64_t invalid_sample_texel_count = 0;
+			bool denoiser_available = false;
+			bool denoiser_applied = false;
+			bool denoiser_failed = false;
 		};
 		// Non-serialized validation data populated from the uncompressed bake in
 		// SaveLightmap(), before BC6H replaces lightmapTextureData.
@@ -1246,6 +1252,7 @@ namespace wi::scene
 		constexpr void SetUserStencilRef(uint8_t value) { userStencilRef = value & 0x0F; }
 
 		void ClearLightmap();
+		static bool IsLightmapDenoiserAvailable();
 		void SaveLightmap(); // not thread safe if LIGHTMAP_BLOCK_COMPRESSION is enabled!
 		void CompressLightmap(); // not thread safe if LIGHTMAP_BLOCK_COMPRESSION is enabled!
 

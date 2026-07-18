@@ -49,6 +49,8 @@
 #include "api/scoped_refptr.h"
 #include "api/set_local_description_observer_interface.h"
 #include "api/set_remote_description_observer_interface.h"
+#include "api/stats/rtc_stats_collector_callback.h"
+#include "api/stats/rtcstats_objects.h"
 #include "api/task_queue/default_task_queue_factory.h"
 #include "api/video/i420_buffer.h"
 #include "api/video/video_frame.h"
@@ -58,6 +60,7 @@
 #include "api/video_codecs/video_encoder_factory_template.h"
 #include "api/video_codecs/video_encoder_factory_template_libvpx_vp8_adapter.h"
 #include "media/base/adapted_video_track_source.h"
+#include "common_video/include/video_frame_buffer.h"
 #include "rtc_base/logging.h"
 #include "rtc_base/ssl_adapter.h"
 #include "rtc_base/thread.h"
@@ -613,7 +616,93 @@ struct ReceivedVideoFrame
 {
     uint32_t width = 0;
     uint32_t height = 0;
-    std::vector<uint8_t> i420;
+    int64_t timestamp_usec = 0;
+    webrtc::scoped_refptr<webrtc::I420BufferInterface> i420;
+};
+
+struct CodecTelemetry
+{
+    std::atomic<uint64_t> compressed_bytes_sent{0};
+    std::atomic<uint64_t> compressed_bytes_received{0};
+    std::atomic<uint64_t> total_encode_time_usec{0};
+    std::atomic<uint64_t> total_decode_time_usec{0};
+    std::atomic<uint64_t> frames_encoded{0};
+    std::atomic<uint64_t> frames_decoded{0};
+    std::atomic_bool power_efficient{false};
+    std::mutex text_mutex;
+    std::string codec_name = "unknown";
+    std::string implementation = "unknown";
+};
+
+class CodecStatsCallback : public webrtc::RTCStatsCollectorCallback
+{
+public:
+    explicit CodecStatsCallback(std::shared_ptr<CodecTelemetry> telemetry) : telemetry_(std::move(telemetry)) {}
+
+    void OnStatsDelivered(const webrtc::scoped_refptr<const webrtc::RTCStatsReport>& report) override
+    {
+        if (!report || !telemetry_)
+            return;
+        std::string codec_id;
+        std::string implementation;
+        bool power_efficient = false;
+        for (const webrtc::RTCOutboundRtpStreamStats* stats :
+            report->GetStatsOfType<webrtc::RTCOutboundRtpStreamStats>())
+        {
+            if (!stats->kind || *stats->kind != "video")
+                continue;
+            telemetry_->compressed_bytes_sent.store(stats->bytes_sent.value_or(0), std::memory_order_relaxed);
+            telemetry_->total_encode_time_usec.store(
+                static_cast<uint64_t>(stats->total_encode_time.value_or(0.0) * 1'000'000.0),
+                std::memory_order_relaxed);
+            telemetry_->frames_encoded.store(stats->frames_encoded.value_or(0), std::memory_order_relaxed);
+            if (stats->codec_id)
+                codec_id = *stats->codec_id;
+            if (stats->encoder_implementation)
+                implementation = *stats->encoder_implementation;
+            power_efficient = stats->power_efficient_encoder.value_or(false);
+        }
+        for (const webrtc::RTCInboundRtpStreamStats* stats :
+            report->GetStatsOfType<webrtc::RTCInboundRtpStreamStats>())
+        {
+            if (!stats->kind || *stats->kind != "video")
+                continue;
+            telemetry_->compressed_bytes_received.store(stats->bytes_received.value_or(0), std::memory_order_relaxed);
+            telemetry_->total_decode_time_usec.store(
+                static_cast<uint64_t>(stats->total_decode_time.value_or(0.0) * 1'000'000.0),
+                std::memory_order_relaxed);
+            telemetry_->frames_decoded.store(stats->frames_decoded.value_or(0), std::memory_order_relaxed);
+            if (stats->codec_id)
+                codec_id = *stats->codec_id;
+            if (stats->decoder_implementation)
+                implementation = *stats->decoder_implementation;
+            power_efficient = power_efficient || stats->power_efficient_decoder.value_or(false);
+        }
+        std::string codec_name;
+        if (!codec_id.empty())
+        {
+            for (const webrtc::RTCCodecStats* codec : report->GetStatsOfType<webrtc::RTCCodecStats>())
+            {
+                if (codec->id() == codec_id && codec->mime_type)
+                {
+                    codec_name = *codec->mime_type;
+                    break;
+                }
+            }
+        }
+        telemetry_->power_efficient.store(power_efficient, std::memory_order_relaxed);
+        if (!codec_name.empty() || !implementation.empty())
+        {
+            std::lock_guard lock(telemetry_->text_mutex);
+            if (!codec_name.empty())
+                telemetry_->codec_name = std::move(codec_name);
+            if (!implementation.empty())
+                telemetry_->implementation = std::move(implementation);
+        }
+    }
+
+private:
+    std::shared_ptr<CodecTelemetry> telemetry_;
 };
 
 class WebRTCSession final : public webrtc::PeerConnectionObserver
@@ -677,6 +766,59 @@ public:
         return true;
     }
 
+    bool SendI420Planes(
+        uint32_t width,
+        uint32_t height,
+        const uint8_t* y_plane,
+        uint32_t y_stride,
+        const uint8_t* u_plane,
+        uint32_t u_stride,
+        const uint8_t* v_plane,
+        uint32_t v_stride,
+        int64_t timestamp_usec,
+        std::function<void()> no_longer_used)
+    {
+        auto release_state = std::make_shared<std::function<void()>>(std::move(no_longer_used));
+        auto release_once = [release_state]() {
+            if (*release_state)
+            {
+                auto callback = std::move(*release_state);
+                callback();
+            }
+        };
+        if (!server_ || !IsReady() || !IsConnected() || !video_source_ ||
+            y_plane == nullptr || u_plane == nullptr || v_plane == nullptr ||
+            width == 0 || height == 0 || width > kMaxVideoDimension || height > kMaxVideoDimension ||
+            (width & 1u) || (height & 1u) || y_stride < width ||
+            u_stride < width / 2u || v_stride < width / 2u)
+        {
+            release_once();
+            return false;
+        }
+        auto buffer = webrtc::WrapI420Buffer(
+            static_cast<int>(width),
+            static_cast<int>(height),
+            y_plane,
+            static_cast<int>(y_stride),
+            u_plane,
+            static_cast<int>(u_stride),
+            v_plane,
+            static_cast<int>(v_stride),
+            release_once);
+        if (!buffer)
+        {
+            release_once();
+            return false;
+        }
+        webrtc::VideoFrame frame = webrtc::VideoFrame::Builder{}
+            .set_video_frame_buffer(buffer)
+            .set_timestamp_us(timestamp_usec)
+            .build();
+        video_source_->Push(frame);
+        sent_frames_.fetch_add(1);
+        return true;
+    }
+
     bool ReceiveI420(ReceivedVideoFrame& output)
     {
         if (server_)
@@ -722,13 +864,91 @@ public:
         return true;
     }
 
+    bool SendFrameMetadata(const uint8_t* data, size_t size)
+    {
+        if (!server_ || data == nullptr || size == 0 || size > kMaxControlBytes)
+            return false;
+        webrtc::scoped_refptr<webrtc::DataChannelInterface> channel;
+        {
+            std::lock_guard<std::mutex> lock(channel_mutex_);
+            channel = frame_metadata_channel_;
+        }
+        if (!channel || channel->state() != webrtc::DataChannelInterface::kOpen ||
+            channel->buffered_amount() > kMaxDataChannelBufferedBytes || !signaling_thread_)
+            return false;
+        webrtc::CopyOnWriteBuffer payload{data, size};
+        return signaling_thread_->BlockingCall([channel, payload = std::move(payload)]() mutable {
+            return channel->state() == webrtc::DataChannelInterface::kOpen &&
+                channel->Send(webrtc::DataBuffer{payload, true});
+        });
+    }
+
+    bool ReceiveFrameMetadata(std::vector<uint8_t>& output)
+    {
+        if (server_)
+            return false;
+        std::lock_guard<std::mutex> lock(frame_metadata_mutex_);
+        if (latest_frame_metadata_.empty())
+            return false;
+        output = std::move(latest_frame_metadata_);
+        latest_frame_metadata_.clear();
+        return true;
+    }
+
+    bool RequestKeyframe()
+    {
+        if (!server_ || !signaling_thread_ || !local_video_sender_)
+            return false;
+        const webrtc::scoped_refptr<webrtc::RtpSenderInterface> sender = local_video_sender_;
+        return signaling_thread_->BlockingCall([sender]() {
+            return sender->GenerateKeyFrame({}).ok();
+        });
+    }
+
     uint64_t SentFrames() const { return sent_frames_.load(); }
     uint64_t ReceivedFrames() const { return received_frames_.load(); }
     uint64_t DroppedFrames() const { return dropped_frames_.load(); }
+    uint32_t DecodedQueueDepth()
+    {
+        std::lock_guard<std::mutex> lock(video_mutex_);
+        return latest_video_.has_value() ? 1u : 0u;
+    }
     uint64_t SentControls() const { return sent_controls_.load(); }
     uint64_t ReceivedControls() const { return received_controls_.load(); }
 
+    void ReadCodecTelemetry(NPWebRTCBridgeStats& stats)
+    {
+        MaybeRequestCodecTelemetry();
+        stats.compressed_bytes_sent = codec_telemetry_->compressed_bytes_sent.load(std::memory_order_relaxed);
+        stats.compressed_bytes_received = codec_telemetry_->compressed_bytes_received.load(std::memory_order_relaxed);
+        stats.total_encode_time_usec = codec_telemetry_->total_encode_time_usec.load(std::memory_order_relaxed);
+        stats.total_decode_time_usec = codec_telemetry_->total_decode_time_usec.load(std::memory_order_relaxed);
+        stats.frames_encoded = codec_telemetry_->frames_encoded.load(std::memory_order_relaxed);
+        stats.frames_decoded = codec_telemetry_->frames_decoded.load(std::memory_order_relaxed);
+        stats.power_efficient_codec = codec_telemetry_->power_efficient.load(std::memory_order_relaxed) ? 1u : 0u;
+        std::lock_guard lock(codec_telemetry_->text_mutex);
+        const size_t codec_count = std::min(codec_telemetry_->codec_name.size(), sizeof(stats.codec_name) - 1u);
+        std::memcpy(stats.codec_name, codec_telemetry_->codec_name.data(), codec_count);
+        const size_t implementation_count =
+            std::min(codec_telemetry_->implementation.size(), sizeof(stats.codec_implementation) - 1u);
+        std::memcpy(stats.codec_implementation, codec_telemetry_->implementation.data(), implementation_count);
+    }
+
 private:
+    void MaybeRequestCodecTelemetry()
+    {
+        if (!peer_connection_ || !stats_callback_)
+            return;
+        const uint64_t now = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+        uint64_t previous = last_stats_request_usec_.load(std::memory_order_relaxed);
+        if (now < previous + 1'000'000ull ||
+            !last_stats_request_usec_.compare_exchange_strong(previous, now, std::memory_order_relaxed))
+            return;
+        peer_connection_->GetStats(stats_callback_.get());
+    }
+
     class VideoSource : public webrtc::AdaptedVideoTrackSource
     {
     public:
@@ -755,12 +975,21 @@ private:
     class ChannelObserver final : public webrtc::DataChannelObserver
     {
     public:
-        explicit ChannelObserver(WebRTCSession& owner) : owner_(&owner) {}
+        ChannelObserver(WebRTCSession& owner, bool frame_metadata) : owner_(&owner), frame_metadata_(frame_metadata) {}
         void OnStateChange() override { if (owner_) owner_->UpdateChannelStatus(); }
-        void OnMessage(const webrtc::DataBuffer& buffer) override { if (owner_) owner_->OnControlMessage(buffer); }
+        void OnMessage(const webrtc::DataBuffer& buffer) override
+        {
+            if (!owner_)
+                return;
+            if (frame_metadata_)
+                owner_->OnFrameMetadataMessage(buffer);
+            else
+                owner_->OnControlMessage(buffer);
+        }
         void OnBufferedAmountChange(uint64_t) override {}
     private:
         WebRTCSession* owner_ = nullptr;
+        bool frame_metadata_ = false;
     };
 
     class CreateDescriptionObserver : public webrtc::CreateSessionDescriptionObserver
@@ -845,6 +1074,14 @@ private:
         std::call_once(ssl_once_, [] { webrtc::InitializeSSL(); });
         webrtc::LogMessage::LogToDebug(webrtc::LS_WARNING);
         webrtc::LogMessage::SetLogToStderr(false);
+
+        // Connect signaling before constructing PeerConnection. If the relay
+        // is unavailable, the transport lifecycle will retry this session.
+        // Constructing and immediately closing a PeerConnection here races
+        // RtcEventLogImpl::StopLogging() on WebRTC's GCD task queue on macOS.
+        if (!websocket_.Connect(signaling_url_))
+            return Fail("Could not connect signaling WebSocket (only ws:// is supported)");
+
         network_thread_ = webrtc::Thread::CreateWithSocketServer().release();
         worker_thread_ = webrtc::Thread::Create().release();
         signaling_thread_ = webrtc::Thread::Create().release();
@@ -866,6 +1103,7 @@ private:
         task_queue_factory_ = webrtc::CreateDefaultTaskQueueFactory();
         if (!task_queue_factory_)
             return Fail("Could not create WebRTC task queue factory");
+        stats_callback_ = webrtc::make_ref_counted<CodecStatsCallback>(codec_telemetry_);
         auto encoder_factory = std::make_unique<webrtc::VideoEncoderFactoryTemplate<webrtc::LibvpxVp8EncoderTemplateAdapter>>();
         auto decoder_factory = std::make_unique<webrtc::VideoDecoderFactoryTemplate<webrtc::LibvpxVp8DecoderTemplateAdapter>>();
         peer_factory_ = webrtc::CreatePeerConnectionFactory(
@@ -890,10 +1128,9 @@ private:
         if (server_)
         {
             CreateControlChannel();
+            CreateFrameMetadataChannel();
             CreateLocalVideoTrack();
         }
-        if (!websocket_.Connect(signaling_url_))
-            return Fail("Could not connect signaling WebSocket (only ws:// is supported)");
         SendSignaling("join|" + room_id_ + "|" + Role());
         signaling_receive_thread_ = std::thread([this] { SignalingLoop(); });
         initialized_.store(true);
@@ -918,12 +1155,16 @@ private:
         auto release_peer_state = [this] {
             if (control_channel_ && channel_observer_)
                 control_channel_->UnregisterObserver();
+            if (frame_metadata_channel_ && frame_metadata_channel_observer_)
+                frame_metadata_channel_->UnregisterObserver();
             if (remote_video_track_ && video_sink_)
                 remote_video_track_->RemoveSink(video_sink_.get());
             if (peer_connection_)
                 peer_connection_->Close();
             control_channel_ = nullptr;
             channel_observer_.reset();
+            frame_metadata_channel_ = nullptr;
+            frame_metadata_channel_observer_.reset();
             remote_video_track_ = nullptr;
             video_sink_.reset();
             local_video_track_ = nullptr;
@@ -985,6 +1226,8 @@ private:
                 HandleSignaling(message);
         }
         peer_connected_.store(false);
+        if (!stop_requested_.load())
+            Fail("Signaling WebSocket disconnected");
     }
 
     void HandleSignaling(const std::string& message)
@@ -1053,6 +1296,19 @@ private:
             SetStatus(std::string{"Could not create control DataChannel: "} + channel_or_error.error().message());
     }
 
+    void CreateFrameMetadataChannel()
+    {
+        webrtc::DataChannelInit init = {};
+        init.ordered = false;
+        init.maxRetransmits = 0;
+        auto channel_or_error = peer_connection_->CreateDataChannelOrError("np.frame_meta", &init);
+        if (channel_or_error.ok())
+            AttachFrameMetadataChannel(channel_or_error.MoveValue());
+        else
+            SetStatus(std::string{"Could not create frame metadata DataChannel: "} +
+                channel_or_error.error().message());
+    }
+
     void CreateLocalVideoTrack()
     {
         video_source_ = webrtc::make_ref_counted<VideoSource>();
@@ -1103,8 +1359,24 @@ private:
             if (control_channel_ && channel_observer_)
                 control_channel_->UnregisterObserver();
             control_channel_ = std::move(channel);
-            channel_observer_ = std::make_unique<ChannelObserver>(*this);
+            channel_observer_ = std::make_unique<ChannelObserver>(*this, false);
             control_channel_->RegisterObserver(channel_observer_.get());
+        }
+        UpdateChannelStatus();
+    }
+
+
+    void AttachFrameMetadataChannel(webrtc::scoped_refptr<webrtc::DataChannelInterface> channel)
+    {
+        if (!channel || channel->label() != "np.frame_meta")
+            return;
+        {
+            std::lock_guard<std::mutex> lock(channel_mutex_);
+            if (frame_metadata_channel_ && frame_metadata_channel_observer_)
+                frame_metadata_channel_->UnregisterObserver();
+            frame_metadata_channel_ = std::move(channel);
+            frame_metadata_channel_observer_ = std::make_unique<ChannelObserver>(*this, true);
+            frame_metadata_channel_->RegisterObserver(frame_metadata_channel_observer_.get());
         }
         UpdateChannelStatus();
     }
@@ -1112,14 +1384,34 @@ private:
     void UpdateChannelStatus()
     {
         std::lock_guard<std::mutex> lock(channel_mutex_);
-        if (control_channel_ && control_channel_->state() == webrtc::DataChannelInterface::kOpen)
-            SetStatus(peer_connected_.load() ? "Video track connected; control DataChannel open" : "Control DataChannel open; ICE pending");
+        const bool control_open = control_channel_ &&
+            control_channel_->state() == webrtc::DataChannelInterface::kOpen;
+        const bool metadata_open = frame_metadata_channel_ &&
+            frame_metadata_channel_->state() == webrtc::DataChannelInterface::kOpen;
+        if (control_open || metadata_open)
+        {
+            std::string channels;
+            if (control_open)
+                channels = "control";
+            if (metadata_open)
+                channels += channels.empty() ? "frame metadata" : " + frame metadata";
+            SetStatus(peer_connected_.load()
+                ? "Video track connected; " + channels + " DataChannel open"
+                : channels + " DataChannel open; ICE pending");
+        }
+    }
+
+
+    void OnFrameMetadataMessage(const webrtc::DataBuffer& buffer)
+    {
+        if (server_ || !buffer.binary || buffer.size() == 0 || buffer.size() > kMaxControlBytes)
+            return;
+        std::lock_guard<std::mutex> lock(frame_metadata_mutex_);
+        latest_frame_metadata_.assign(buffer.data.data(), buffer.data.data() + buffer.size());
     }
 
     void OnControlMessage(const webrtc::DataBuffer& buffer)
     {
-        // Downstream DataChannel messages are intentionally ignored. Complete
-        // server-to-client frame information is carried only by the video track.
         if (!server_ || !buffer.binary || buffer.size() == 0 || buffer.size() > kMaxControlBytes)
             return;
         std::lock_guard<std::mutex> lock(control_mutex_);
@@ -1148,19 +1440,8 @@ private:
         ReceivedVideoFrame received;
         received.width = static_cast<uint32_t>(i420->width());
         received.height = static_cast<uint32_t>(i420->height());
-        const size_t y_size = static_cast<size_t>(received.width) * received.height;
-        const size_t uv_size = static_cast<size_t>(received.width / 2u) * (received.height / 2u);
-        received.i420.resize(y_size + uv_size * 2u);
-        uint8_t* destination_y = received.i420.data();
-        uint8_t* destination_u = destination_y + y_size;
-        uint8_t* destination_v = destination_u + uv_size;
-        for (uint32_t row = 0; row < received.height; ++row)
-            std::memcpy(destination_y + row * received.width, i420->DataY() + row * i420->StrideY(), received.width);
-        for (uint32_t row = 0; row < received.height / 2u; ++row)
-        {
-            std::memcpy(destination_u + row * (received.width / 2u), i420->DataU() + row * i420->StrideU(), received.width / 2u);
-            std::memcpy(destination_v + row * (received.width / 2u), i420->DataV() + row * i420->StrideV(), received.width / 2u);
-        }
+        received.timestamp_usec = frame.timestamp_us();
+        received.i420 = i420;
         {
             std::lock_guard<std::mutex> lock(video_mutex_);
             if (latest_video_.has_value())
@@ -1230,7 +1511,13 @@ private:
     void OnSignalingChange(webrtc::PeerConnectionInterface::SignalingState) override {}
     void OnAddStream(webrtc::scoped_refptr<webrtc::MediaStreamInterface>) override {}
     void OnRemoveStream(webrtc::scoped_refptr<webrtc::MediaStreamInterface>) override {}
-    void OnDataChannel(webrtc::scoped_refptr<webrtc::DataChannelInterface> channel) override { AttachControlChannel(std::move(channel)); }
+    void OnDataChannel(webrtc::scoped_refptr<webrtc::DataChannelInterface> channel) override
+    {
+        if (channel && channel->label() == "np.frame_meta")
+            AttachFrameMetadataChannel(std::move(channel));
+        else
+            AttachControlChannel(std::move(channel));
+    }
     void OnRenegotiationNeeded() override {}
     void OnIceConnectionChange(webrtc::PeerConnectionInterface::IceConnectionState state) override
     {
@@ -1290,6 +1577,9 @@ private:
     bool worker_thread_started_ = false;
     bool signaling_thread_started_ = false;
     std::unique_ptr<webrtc::TaskQueueFactory> task_queue_factory_;
+    std::shared_ptr<CodecTelemetry> codec_telemetry_ = std::make_shared<CodecTelemetry>();
+    webrtc::scoped_refptr<CodecStatsCallback> stats_callback_;
+    std::atomic<uint64_t> last_stats_request_usec_{0};
     webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> peer_factory_;
     webrtc::scoped_refptr<webrtc::PeerConnectionInterface> peer_connection_;
     webrtc::scoped_refptr<CreateDescriptionObserver> pending_create_observer_;
@@ -1304,8 +1594,12 @@ private:
     std::mutex channel_mutex_;
     webrtc::scoped_refptr<webrtc::DataChannelInterface> control_channel_;
     std::unique_ptr<ChannelObserver> channel_observer_;
+    webrtc::scoped_refptr<webrtc::DataChannelInterface> frame_metadata_channel_;
+    std::unique_ptr<ChannelObserver> frame_metadata_channel_observer_;
     std::mutex control_mutex_;
     std::vector<uint8_t> latest_control_;
+    std::mutex frame_metadata_mutex_;
+    std::vector<uint8_t> latest_frame_metadata_;
     std::mutex ice_mutex_;
     std::vector<PendingIce> pending_ice_;
     mutable std::mutex status_mutex_;
@@ -1326,6 +1620,12 @@ struct NPWebRTCBridge
     std::unique_ptr<WebRTCSession> session;
     std::optional<ReceivedVideoFrame> pending_video;
     std::vector<uint8_t> pending_control;
+    std::vector<uint8_t> pending_frame_metadata;
+};
+
+struct NPWebRTCVideoFrame
+{
+    ReceivedVideoFrame frame;
 };
 
 extern "C" NPWebRTCBridge* np_webrtc_bridge_create(
@@ -1349,6 +1649,34 @@ extern "C" int np_webrtc_bridge_send_i420(
     return bridge && bridge->session && bridge->session->SendI420(width, height, data, data_size, timestamp_usec) ? 1 : 0;
 }
 
+extern "C" int np_webrtc_bridge_send_i420_planes(
+    NPWebRTCBridge* bridge,
+    uint32_t width,
+    uint32_t height,
+    const uint8_t* y_plane,
+    uint32_t y_stride,
+    const uint8_t* u_plane,
+    uint32_t u_stride,
+    const uint8_t* v_plane,
+    uint32_t v_stride,
+    int64_t timestamp_usec,
+    NPWebRTCReleaseCallback release_callback,
+    void* release_context)
+{
+    auto release = [release_callback, release_context]() {
+        if (release_callback)
+            release_callback(release_context);
+    };
+    if (!bridge || !bridge->session)
+    {
+        release();
+        return 0;
+    }
+    return bridge->session->SendI420Planes(
+        width, height, y_plane, y_stride, u_plane, u_stride, v_plane, v_stride,
+        timestamp_usec, std::move(release)) ? 1 : 0;
+}
+
 extern "C" int np_webrtc_bridge_receive_i420(
     NPWebRTCBridge* bridge, uint32_t* width, uint32_t* height, uint8_t* destination,
     size_t destination_capacity, size_t* required_size)
@@ -1364,12 +1692,82 @@ extern "C" int np_webrtc_bridge_receive_i420(
     }
     *width = bridge->pending_video->width;
     *height = bridge->pending_video->height;
-    *required_size = bridge->pending_video->i420.size();
+    const ReceivedVideoFrame& frame = *bridge->pending_video;
+    if (!frame.i420)
+        return 0;
+    const size_t y_size = static_cast<size_t>(frame.width) * frame.height;
+    const size_t uv_size = static_cast<size_t>(frame.width / 2u) * (frame.height / 2u);
+    *required_size = y_size + uv_size * 2u;
     if (!destination || destination_capacity < *required_size)
         return -1;
-    std::memcpy(destination, bridge->pending_video->i420.data(), *required_size);
+    uint8_t* destination_y = destination;
+    uint8_t* destination_u = destination_y + y_size;
+    uint8_t* destination_v = destination_u + uv_size;
+    for (uint32_t row = 0; row < frame.height; ++row)
+        std::memcpy(destination_y + static_cast<size_t>(row) * frame.width,
+            frame.i420->DataY() + static_cast<size_t>(row) * frame.i420->StrideY(), frame.width);
+    for (uint32_t row = 0; row < frame.height / 2u; ++row)
+    {
+        std::memcpy(destination_u + static_cast<size_t>(row) * (frame.width / 2u),
+            frame.i420->DataU() + static_cast<size_t>(row) * frame.i420->StrideU(), frame.width / 2u);
+        std::memcpy(destination_v + static_cast<size_t>(row) * (frame.width / 2u),
+            frame.i420->DataV() + static_cast<size_t>(row) * frame.i420->StrideV(), frame.width / 2u);
+    }
     bridge->pending_video.reset();
     return 1;
+}
+
+extern "C" int np_webrtc_bridge_acquire_i420_frame(
+    NPWebRTCBridge* bridge, NPWebRTCVideoFrame** frame)
+{
+    if (!frame)
+        return 0;
+    *frame = nullptr;
+    if (!bridge || !bridge->session)
+        return 0;
+    ReceivedVideoFrame received;
+    if (!bridge->session->ReceiveI420(received) || !received.i420)
+        return 0;
+    auto retained = std::make_unique<NPWebRTCVideoFrame>();
+    retained->frame = std::move(received);
+    *frame = retained.release();
+    return 1;
+}
+
+extern "C" int np_webrtc_video_frame_get_i420(
+    NPWebRTCVideoFrame* retained,
+    uint32_t* width,
+    uint32_t* height,
+    const uint8_t** y_plane,
+    uint32_t* y_stride,
+    const uint8_t** u_plane,
+    uint32_t* u_stride,
+    const uint8_t** v_plane,
+    uint32_t* v_stride,
+    int64_t* timestamp_usec)
+{
+    if (!retained || !retained->frame.i420 || !width || !height ||
+        !y_plane || !y_stride || !u_plane || !u_stride || !v_plane || !v_stride)
+        return 0;
+    const auto& i420 = retained->frame.i420;
+    if (i420->StrideY() <= 0 || i420->StrideU() <= 0 || i420->StrideV() <= 0)
+        return 0;
+    *width = retained->frame.width;
+    *height = retained->frame.height;
+    *y_plane = i420->DataY();
+    *y_stride = static_cast<uint32_t>(i420->StrideY());
+    *u_plane = i420->DataU();
+    *u_stride = static_cast<uint32_t>(i420->StrideU());
+    *v_plane = i420->DataV();
+    *v_stride = static_cast<uint32_t>(i420->StrideV());
+    if (timestamp_usec)
+        *timestamp_usec = retained->frame.timestamp_usec;
+    return 1;
+}
+
+extern "C" void np_webrtc_video_frame_release(NPWebRTCVideoFrame* frame)
+{
+    delete frame;
 }
 
 extern "C" int np_webrtc_bridge_send_control(NPWebRTCBridge* bridge, const uint8_t* data, size_t size)
@@ -1392,11 +1790,40 @@ extern "C" int np_webrtc_bridge_receive_control(
     return 1;
 }
 
+extern "C" int np_webrtc_bridge_send_frame_metadata(
+    NPWebRTCBridge* bridge, const uint8_t* data, size_t size)
+{
+    return bridge && bridge->session && bridge->session->SendFrameMetadata(data, size) ? 1 : 0;
+}
+
+extern "C" int np_webrtc_bridge_request_keyframe(NPWebRTCBridge* bridge)
+{
+    return bridge && bridge->session && bridge->session->RequestKeyframe() ? 1 : 0;
+}
+
+extern "C" int np_webrtc_bridge_receive_frame_metadata(
+    NPWebRTCBridge* bridge, uint8_t* destination, size_t destination_capacity, size_t* required_size)
+{
+    if (!bridge || !bridge->session || !required_size)
+        return 0;
+    if (bridge->pending_frame_metadata.empty() &&
+        !bridge->session->ReceiveFrameMetadata(bridge->pending_frame_metadata))
+        return 0;
+    *required_size = bridge->pending_frame_metadata.size();
+    if (!destination || destination_capacity < *required_size)
+        return -1;
+    std::memcpy(destination, bridge->pending_frame_metadata.data(), *required_size);
+    bridge->pending_frame_metadata.clear();
+    return 1;
+}
+
 extern "C" void np_webrtc_bridge_get_stats(NPWebRTCBridge* bridge, NPWebRTCBridgeStats* stats)
 {
     if (!stats)
         return;
     std::memset(stats, 0, sizeof(*stats));
+    const char fallback[] = "native GPU codec backend unavailable; software I420 bridge selected";
+    std::memcpy(stats->codec_fallback_reason, fallback, sizeof(fallback));
     if (!bridge || !bridge->session)
     {
         stats->state = NP_WEBRTC_DISABLED;
@@ -1406,8 +1833,10 @@ extern "C" void np_webrtc_bridge_get_stats(NPWebRTCBridge* bridge, NPWebRTCBridg
     stats->sent_frames = bridge->session->SentFrames();
     stats->received_frames = bridge->session->ReceivedFrames();
     stats->dropped_frames = bridge->session->DroppedFrames();
+    stats->decoded_queue_depth = bridge->session->DecodedQueueDepth();
     stats->sent_controls = bridge->session->SentControls();
     stats->received_controls = bridge->session->ReceivedControls();
+    bridge->session->ReadCodecTelemetry(*stats);
     const std::string status = bridge->session->GetStatus();
     const size_t count = std::min(status.size(), sizeof(stats->status) - 1);
     std::memcpy(stats->status, status.data(), count);

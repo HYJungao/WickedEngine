@@ -4,6 +4,7 @@
 #include "NewPipelineTransport.h"
 
 #include <condition_variable>
+#include <atomic>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -51,9 +52,13 @@ private:
     bool EnsureShadowSliceTexture(uint32_t width, uint32_t height) const;
     const wi::graphics::Texture* GetDebugPreviewTexture() const;
     void ConsumeCompletedReadback();
+    void CapturePackedRemoteFrame(const std::array<const wi::graphics::Texture*,
+        static_cast<size_t>(RemoteBufferSemantic::Count)>& sources);
+    void ConsumeCompletedPackedReadback();
     void StartPublishWorker();
     void StopPublishWorker();
     void QueueFrameForPublish(RemoteRawFrame&& frame);
+    void QueueI420FrameForPublish(RetainedI420Frame&& frame, const RemoteVideoFrameLayout& layout);
     void DrawUnavailablePreview(wi::graphics::CommandList cmd) const;
 
     static constexpr size_t kReadbackRingSize = 3;
@@ -75,12 +80,32 @@ private:
     std::array<wi::graphics::Texture, static_cast<size_t>(RemoteBufferSemantic::Count)> transport_textures;
     std::array<ReadbackSlot, kReadbackRingSize> readback_ring;
     size_t readback_write_index = 0;
+    struct PackedReadbackStorage
+    {
+        wi::graphics::GPUBuffer buffer;
+    };
+    struct PackedReadbackSlot
+    {
+        wi::graphics::GPUBuffer metadata_upload;
+        wi::graphics::GPUBuffer packed_gpu;
+        std::shared_ptr<PackedReadbackStorage> readback;
+        RemoteVideoFrameLayout layout;
+        uint32_t y_stride = 0;
+        uint32_t uv_stride = 0;
+        uint32_t u_offset = 0;
+        uint32_t v_offset = 0;
+        uint64_t gpu_ready_frame = 0;
+        bool pending = false;
+    };
+    std::array<PackedReadbackSlot, kReadbackRingSize> packed_readback_ring;
+    size_t packed_readback_write_index = 0;
+    uint32_t packed_layout_width = 0;
+    uint32_t packed_layout_height = 0;
     mutable wi::graphics::Texture shadow_slice_texture;
     mutable wi::graphics::Texture local_ao_snapshot;
     DebugPreviewMode debug_preview_mode = DebugPreviewMode::Final;
     bool hardware_raytracing = false;
     float mock_publish_accumulator = 0.0f;
-    float webrtc_retry_accumulator = 0.0f;
     uint64_t last_applied_frame_id = 0;
     ClientControlPacket last_applied_control = {};
     ClientControlPacket ddgi_reset_reference_control = {};
@@ -102,9 +127,20 @@ private:
     mutable bool shadow_snapshot_valid = false;
     std::thread publish_worker;
     std::mutex publish_mutex;
-    std::mutex webrtc_mutex;
     std::condition_variable publish_cv;
     std::optional<RemoteRawFrame> pending_publish_frame;
+    struct PendingI420Publish
+    {
+        RetainedI420Frame frame;
+        RemoteVideoFrameLayout layout;
+    };
+    std::optional<PendingI420Publish> pending_i420_frame;
+    std::atomic<uint64_t> publish_queue_drops{0};
+    uint64_t remote_capture_count = 0;
+    uint64_t remote_capture_drops = 0;
+    uint64_t gpu_readback_bytes = 0;
+    uint64_t cpu_readback_copy_bytes = 0;
+    WebRTCTransportState previous_webrtc_state = WebRTCTransportState::Disabled;
     bool publish_worker_stop = false;
 };
 } // namespace wicked_newpipeline

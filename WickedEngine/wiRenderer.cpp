@@ -30,6 +30,7 @@
 #include "shaders/ShaderInterop_DDGI.h"
 #include "shaders/ShaderInterop_VXGI.h"
 #include "shaders/ShaderInterop_FSR2.h"
+#include "shaders/ShaderInterop_I420.h"
 #include "shaders/uvsphere.hlsli"
 #include "shaders/cone.hlsli"
 
@@ -1174,6 +1175,8 @@ void LoadShaders()
 	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::CS, shaders[CSTYPE_WIND], "windCS.cso"); });
 	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::CS, shaders[CSTYPE_YUV_TO_RGB], "yuv_to_rgbCS.cso"); });
 	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::CS, shaders[CSTYPE_YUV_TO_RGB_ARRAY], "yuv_to_rgbCS.cso", ShaderModel::SM_6_0, {"ARRAY"}); });
+	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::CS, shaders[CSTYPE_YUV_TO_RGB_REGION], "yuv_to_rgb_regionCS.cso"); });
+	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::CS, shaders[CSTYPE_RGB_TO_I420_ATLAS], "rgb_to_i420_atlasCS.cso"); });
 	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::CS, shaders[CSTYPE_WETMAP_UPDATE], "wetmap_updateCS.cso"); });
 	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::CS, shaders[CSTYPE_DEPTH_REPROJECT], "depth_reprojectCS.cso"); });
 	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::CS, shaders[CSTYPE_DEPTH_PYRAMID], "depth_pyramidCS.cso"); });
@@ -11158,7 +11161,7 @@ void RayTraceSceneBVH(const Scene& scene, CommandList cmd)
 	device->EventEnd(cmd);
 }
 
-void RefreshLightmaps(const Scene& scene, CommandList cmd)
+void RefreshLightmaps(const Scene& scene, CommandList cmd, uint32_t iterations_per_request)
 {
 	if (!scene.IsLightmapUpdateRequested())
 		return;
@@ -11167,6 +11170,8 @@ void RefreshLightmaps(const Scene& scene, CommandList cmd)
 
 	if (wi::jobsystem::IsBusy(raytracing_ctx))
 		return;
+
+	iterations_per_request = std::clamp(iterations_per_request, 1u, 64u);
 
 	const uint32_t lightmap_request_count = scene.lightmap_request_allocator.load();
 
@@ -11232,59 +11237,15 @@ void RefreshLightmaps(const Scene& scene, CommandList cmd)
 
 			const TextureDesc& desc = object.lightmap_render.GetDesc();
 
-			device->Barrier(GPUBarrier::Aliasing(&lightmap_color_tmp, &lightmap_depth_tmp), cmd);
-
-			// Note: depth is used to disallow overlapped pixel/primitive writes with conservative rasterization!
-			if (object.lightmapIterationCount == 0)
-			{
-				RenderPassImage rp[] = {
-					RenderPassImage::RenderTarget(&object.lightmap_render, RenderPassImage::LoadOp::CLEAR),
-					RenderPassImage::DepthStencil(&lightmap_depth_tmp, RenderPassImage::LoadOp::CLEAR),
-				};
-				device->RenderPassBegin(rp, arraysize(rp), cmd);
-			}
-			else
-			{
-				RenderPassImage rp[] = {
-					RenderPassImage::RenderTarget(&object.lightmap_render, RenderPassImage::LoadOp::LOAD),
-					RenderPassImage::DepthStencil(&lightmap_depth_tmp, RenderPassImage::LoadOp::CLEAR),
-				};
-				device->RenderPassBegin(rp, arraysize(rp), cmd);
-			}
-
 			Viewport vp;
 			vp.width = (float)desc.width;
 			vp.height = (float)desc.height;
-			device->BindViewports(1, &vp, cmd);
-
-			device->BindPipelineState(&PSO_renderlightmap, cmd);
-
-			device->BindIndexBuffer(&mesh.generalBuffer, mesh.GetIndexFormat(), mesh.ib.offset, cmd);
 
 			LightmapPushConstants push;
 			push.vb_pos_wind = mesh.vb_pos_wind.descriptor_srv;
 			push.vb_nor = mesh.vb_nor.descriptor_srv;
 			push.vb_atl = mesh.vb_atl.descriptor_srv;
 			push.instanceIndex = objectIndex;
-			device->PushConstants(&push, sizeof(push), cmd);
-
-			RaytracingCB cb = {};
-			cb.xTraceResolution.x = desc.width;
-			cb.xTraceResolution.y = desc.height;
-			cb.xTraceResolution_rcp.x = 1.0f / cb.xTraceResolution.x;
-			cb.xTraceResolution_rcp.y = 1.0f / cb.xTraceResolution.y;
-			cb.xTraceAccumulationFactor = 1.0f / (object.lightmapIterationCount + 1.0f); // accumulation factor (alpha)
-			cb.xTraceUserData.x = raytraceBounceCount;
-			XMFLOAT4 halton = wi::math::GetHaltonSequence(object.lightmapIterationCount); // for jittering the rasterization (good for eliminating atlas border artifacts)
-			cb.xTracePixelOffset.x = (halton.x * 2 - 1) * cb.xTraceResolution_rcp.x;
-			cb.xTracePixelOffset.y = (halton.y * 2 - 1) * cb.xTraceResolution_rcp.y;
-			cb.xTracePixelOffset.x *= 1.4f;	// boost the jitter by a bit
-			cb.xTracePixelOffset.y *= 1.4f;	// boost the jitter by a bit
-			uint8_t instanceInclusionMask = raytracing_inclusion_mask_lightmap;
-			cb.xTraceUserData.y = instanceInclusionMask;
-			cb.xTraceSampleIndex = object.lightmapIterationCount;
-			device->BindDynamicConstantBuffer(cb, CB_GETBINDSLOT(RaytracingCB), cmd);
-
 			uint32_t indexStart = ~0u;
 			uint32_t indexEnd = 0;
 
@@ -11300,14 +11261,54 @@ void RefreshLightmaps(const Scene& scene, CommandList cmd)
 				indexEnd = std::max(indexEnd, subset.indexOffset + subset.indexCount);
 			}
 
-			if (indexEnd > indexStart)
-			{
-				const uint32_t indexCount = indexEnd - indexStart;
-				device->DrawIndexed(indexCount, indexStart, 0, cmd);
-				object.lightmapIterationCount++;
-			}
+			device->Barrier(GPUBarrier::Aliasing(&lightmap_color_tmp, &lightmap_depth_tmp), cmd);
 
-			device->RenderPassEnd(cmd);
+			// One render pass is kept per accumulation iteration because the
+			// conservative-raster depth buffer must be cleared for every sample.
+			// The expanded lightmap is not an accumulation input, so expansion can
+			// safely run once after the whole work packet.
+			for (uint32_t iteration = 0; iteration < iterations_per_request; ++iteration)
+			{
+				RenderPassImage rp[] = {
+					RenderPassImage::RenderTarget(
+						&object.lightmap_render,
+						object.lightmapIterationCount == 0 ? RenderPassImage::LoadOp::CLEAR : RenderPassImage::LoadOp::LOAD
+					),
+					RenderPassImage::DepthStencil(&lightmap_depth_tmp, RenderPassImage::LoadOp::CLEAR),
+				};
+				device->RenderPassBegin(rp, arraysize(rp), cmd);
+
+				device->BindViewports(1, &vp, cmd);
+				device->BindPipelineState(&PSO_renderlightmap, cmd);
+				device->BindIndexBuffer(&mesh.generalBuffer, mesh.GetIndexFormat(), mesh.ib.offset, cmd);
+				device->PushConstants(&push, sizeof(push), cmd);
+
+				RaytracingCB cb = {};
+				cb.xTraceResolution.x = desc.width;
+				cb.xTraceResolution.y = desc.height;
+				cb.xTraceResolution_rcp.x = 1.0f / cb.xTraceResolution.x;
+				cb.xTraceResolution_rcp.y = 1.0f / cb.xTraceResolution.y;
+				cb.xTraceAccumulationFactor = 1.0f / (object.lightmapIterationCount + 1.0f); // accumulation factor (alpha)
+				cb.xTraceUserData.x = raytraceBounceCount;
+				XMFLOAT4 halton = wi::math::GetHaltonSequence(object.lightmapIterationCount); // for jittering the rasterization (good for eliminating atlas border artifacts)
+				cb.xTracePixelOffset.x = (halton.x * 2 - 1) * cb.xTraceResolution_rcp.x;
+				cb.xTracePixelOffset.y = (halton.y * 2 - 1) * cb.xTraceResolution_rcp.y;
+				cb.xTracePixelOffset.x *= 1.4f;	// boost the jitter by a bit
+				cb.xTracePixelOffset.y *= 1.4f;	// boost the jitter by a bit
+				uint8_t instanceInclusionMask = raytracing_inclusion_mask_lightmap;
+				cb.xTraceUserData.y = instanceInclusionMask;
+				cb.xTraceSampleIndex = object.lightmapIterationCount;
+				device->BindDynamicConstantBuffer(cb, CB_GETBINDSLOT(RaytracingCB), cmd);
+
+				if (indexEnd > indexStart)
+				{
+					const uint32_t indexCount = indexEnd - indexStart;
+					device->DrawIndexed(indexCount, indexStart, 0, cmd);
+					object.lightmapIterationCount++;
+				}
+
+				device->RenderPassEnd(cmd);
+			}
 
 			device->Barrier(GPUBarrier::Aliasing(&lightmap_depth_tmp, &lightmap_color_tmp), cmd);
 
@@ -11328,7 +11329,7 @@ void RefreshLightmaps(const Scene& scene, CommandList cmd)
 
 					device->Barrier(GPUBarrier::Image(&object.lightmap, ResourceState::UNORDERED_ACCESS, object.lightmap.desc.layout), cmd);
 				}
-				for (int repeat = 0; repeat < 2; ++repeat)
+				for (int repeat = 0; repeat < 4; ++repeat)
 				{
 					// lightmap -> temp
 					{
@@ -11336,6 +11337,11 @@ void RefreshLightmaps(const Scene& scene, CommandList cmd)
 						device->BindUAV(&lightmap_color_tmp, 0, cmd);
 
 						device->Barrier(GPUBarrier::Image(&lightmap_color_tmp, lightmap_color_tmp.desc.layout, ResourceState::UNORDERED_ACCESS), cmd);
+						// The scratch texture is shared by all objects and can be larger
+						// than the current atlas. Clear it so boundary reads can never
+						// import stale texels from a previously processed object.
+						device->ClearUAV(&lightmap_color_tmp, 0, cmd);
+						device->Barrier(GPUBarrier::Memory(&lightmap_color_tmp), cmd);
 
 						device->Dispatch((desc.width + POSTPROCESS_BLOCKSIZE - 1) / POSTPROCESS_BLOCKSIZE, (desc.height + POSTPROCESS_BLOCKSIZE - 1) / POSTPROCESS_BLOCKSIZE, 1, cmd);
 
@@ -12017,6 +12023,39 @@ void Visibility_Surface(
 		device->Barrier(GPUBarrier::Memory(res.texture_lightmap_validity), cmd);
 		lightmap_validity_uav = device->GetDescriptorIndex(res.texture_lightmap_validity, SubresourceType::UAV);
 	}
+	int lightmap_coverage_uav = -1;
+	if (res.texture_lightmap_coverage != nullptr && res.texture_lightmap_coverage->IsValid())
+	{
+		device->Barrier(GPUBarrier::Image(
+			res.texture_lightmap_coverage,
+			res.texture_lightmap_coverage->desc.layout,
+			ResourceState::UNORDERED_ACCESS), cmd);
+		device->ClearUAV(res.texture_lightmap_coverage, 0, cmd);
+		device->Barrier(GPUBarrier::Memory(res.texture_lightmap_coverage), cmd);
+		lightmap_coverage_uav = device->GetDescriptorIndex(res.texture_lightmap_coverage, SubresourceType::UAV);
+	}
+	int lightmap_raw_uav = -1;
+	if (res.texture_lightmap_raw != nullptr && res.texture_lightmap_raw->IsValid())
+	{
+		device->Barrier(GPUBarrier::Image(
+			res.texture_lightmap_raw,
+			res.texture_lightmap_raw->desc.layout,
+			ResourceState::UNORDERED_ACCESS), cmd);
+		device->ClearUAV(res.texture_lightmap_raw, 0, cmd);
+		device->Barrier(GPUBarrier::Memory(res.texture_lightmap_raw), cmd);
+		lightmap_raw_uav = device->GetDescriptorIndex(res.texture_lightmap_raw, SubresourceType::UAV);
+	}
+	int local_indirect_diffuse_uav = -1;
+	if (res.texture_local_indirect_diffuse != nullptr && res.texture_local_indirect_diffuse->IsValid())
+	{
+		device->Barrier(GPUBarrier::Image(
+			res.texture_local_indirect_diffuse,
+			res.texture_local_indirect_diffuse->desc.layout,
+			ResourceState::UNORDERED_ACCESS), cmd);
+		device->ClearUAV(res.texture_local_indirect_diffuse, 0, cmd);
+		device->Barrier(GPUBarrier::Memory(res.texture_local_indirect_diffuse), cmd);
+		local_indirect_diffuse_uav = device->GetDescriptorIndex(res.texture_local_indirect_diffuse, SubresourceType::UAV);
+	}
 
 	device->BindResource(&res.binned_tiles, 0, cmd);
 	device->BindUAV(&res.texture_normal_roughness, 0, cmd);
@@ -12027,11 +12066,18 @@ void Visibility_Surface(
 		uint32_t global_tile_offset;
 		int32_t lightmap_irradiance_uav;
 		int32_t lightmap_validity_uav;
+		int32_t lightmap_coverage_uav;
+		int32_t lightmap_raw_uav;
+		int32_t local_indirect_diffuse_uav;
 	};
 	VisibilitySurfacePushConstants push = {};
 	push.lightmap_irradiance_uav = lightmap_irradiance_uav;
 	push.lightmap_validity_uav = lightmap_validity_uav;
-	const bool surface_diagnostics_requested = lightmap_irradiance_uav >= 0 || lightmap_validity_uav >= 0;
+	push.lightmap_coverage_uav = lightmap_coverage_uav;
+	push.lightmap_raw_uav = lightmap_raw_uav;
+	push.local_indirect_diffuse_uav = local_indirect_diffuse_uav;
+	const bool surface_diagnostics_requested = lightmap_irradiance_uav >= 0 || lightmap_validity_uav >= 0 ||
+		lightmap_coverage_uav >= 0 || lightmap_raw_uav >= 0 || local_indirect_diffuse_uav >= 0;
 	uint64_t bins_offset = 0;
 
 	// surface dispatches per material type:
@@ -12081,6 +12127,27 @@ void Visibility_Surface(
 			res.texture_lightmap_validity,
 			ResourceState::UNORDERED_ACCESS,
 			res.texture_lightmap_validity->desc.layout), cmd);
+	}
+	if (res.texture_lightmap_coverage != nullptr && res.texture_lightmap_coverage->IsValid())
+	{
+		device->Barrier(GPUBarrier::Image(
+			res.texture_lightmap_coverage,
+			ResourceState::UNORDERED_ACCESS,
+			res.texture_lightmap_coverage->desc.layout), cmd);
+	}
+	if (res.texture_lightmap_raw != nullptr && res.texture_lightmap_raw->IsValid())
+	{
+		device->Barrier(GPUBarrier::Image(
+			res.texture_lightmap_raw,
+			ResourceState::UNORDERED_ACCESS,
+			res.texture_lightmap_raw->desc.layout), cmd);
+	}
+	if (res.texture_local_indirect_diffuse != nullptr && res.texture_local_indirect_diffuse->IsValid())
+	{
+		device->Barrier(GPUBarrier::Image(
+			res.texture_local_indirect_diffuse,
+			ResourceState::UNORDERED_ACCESS,
+			res.texture_local_indirect_diffuse->desc.layout), cmd);
 	}
 
 	wi::profiler::EndRange(range);
@@ -19210,6 +19277,94 @@ void YUV_to_RGB(
 
 	device->Barrier(GPUBarrier::Image(&output, ResourceState::UNORDERED_ACCESS, output.desc.layout), cmd);
 
+	device->EventEnd(cmd);
+}
+
+void YUV_to_RGB_Region(
+	const Texture& input_luminance,
+	const Texture& input_chrominance,
+	const Texture& output,
+	const XMUINT2& source_origin,
+	bool scalar_luma,
+	float log_hdr_maximum,
+	CommandList cmd
+)
+{
+	auto profiler_range = wi::profiler::BeginRangeGPU("Remote Video GPU Unpack", cmd);
+	device->EventBegin("YUV_to_RGB_Region", cmd);
+	device->BindComputeShader(&shaders[CSTYPE_YUV_TO_RGB_REGION], cmd);
+
+	const TextureDesc& output_desc = output.GetDesc();
+	PostProcess postprocess;
+	postprocess.resolution = XMUINT2(output_desc.width, output_desc.height);
+	postprocess.resolution_rcp = XMFLOAT2(1.0f / output_desc.width, 1.0f / output_desc.height);
+	postprocess.params0 = XMFLOAT4(
+		static_cast<float>(source_origin.x),
+		static_cast<float>(source_origin.y),
+		scalar_luma ? 1.0f : 0.0f,
+		log_hdr_maximum > 0.0f ? 1.0f : 0.0f);
+	postprocess.params1.x = std::max(0.0f, log_hdr_maximum);
+	device->PushConstants(&postprocess, sizeof(postprocess), cmd);
+
+	device->BindResource(&input_luminance, 0, cmd);
+	device->BindResource(&input_chrominance, 1, cmd);
+	device->BindUAV(&output, 0, cmd);
+
+	GPUBarrier barriers[] = {
+		GPUBarrier::Image(&input_luminance, input_luminance.desc.layout, ResourceState::SHADER_RESOURCE_COMPUTE),
+		GPUBarrier::Image(&input_chrominance, input_chrominance.desc.layout, ResourceState::SHADER_RESOURCE_COMPUTE),
+		GPUBarrier::Image(&output, output.desc.layout, ResourceState::UNORDERED_ACCESS),
+	};
+	device->Barrier(barriers, arraysize(barriers), cmd);
+	device->Dispatch(
+		(output_desc.width + POSTPROCESS_BLOCKSIZE - 1) / POSTPROCESS_BLOCKSIZE,
+		(output_desc.height + POSTPROCESS_BLOCKSIZE - 1) / POSTPROCESS_BLOCKSIZE,
+		1,
+		cmd);
+	for (GPUBarrier& barrier : barriers)
+		std::swap(barrier.image.layout_before, barrier.image.layout_after);
+	device->Barrier(barriers, arraysize(barriers), cmd);
+	device->EventEnd(cmd);
+}
+
+void RGB_to_I420_Atlas(
+	const Texture* const inputs[4],
+	const GPUBuffer& metadata_luma,
+	const GPUBuffer& output_i420,
+	const I420AtlasPackDesc& desc,
+	CommandList cmd
+)
+{
+	auto profiler_range = wi::profiler::BeginRangeGPU("Remote Video GPU I420 Pack", cmd);
+	device->EventBegin("RGB_to_I420_Atlas", cmd);
+	device->BindComputeShader(&shaders[CSTYPE_RGB_TO_I420_ATLAS], cmd);
+
+	I420AtlasPackPush push = {};
+	push.video_resolution = desc.video_resolution;
+	push.metadata_rows = desc.metadata_rows;
+	push.y_stride = desc.y_stride;
+	push.uv_stride = desc.uv_stride;
+	push.u_offset = desc.u_offset;
+	push.v_offset = desc.v_offset;
+	push.available_mask = desc.available_mask;
+	push.log_hdr_maximum = desc.log_hdr_maximum;
+	for (uint32_t index = 0; index < 4; ++index)
+		push.tile_rects[index] = desc.tile_rects[index];
+	device->PushConstants(&push, sizeof(push), cmd);
+
+	for (uint32_t index = 0; index < 4; ++index)
+		device->BindResource(inputs[index] != nullptr ? inputs[index] : wi::texturehelper::getBlack(), index, cmd);
+	device->BindResource(&metadata_luma, 4, cmd);
+	device->BindUAV(&output_i420, 0, cmd);
+
+	const uint32_t y_store_count = (desc.video_resolution.x + 3u) / 4u;
+	const uint32_t uv_store_count = (desc.uv_stride + 3u) / 4u;
+	device->Dispatch(
+		(std::max(y_store_count, uv_store_count) + 7u) / 8u,
+		(desc.video_resolution.y + 7u) / 8u,
+		2,
+		cmd);
+	device->Barrier(GPUBarrier::Memory(&output_i420), cmd);
 	device->EventEnd(cmd);
 }
 

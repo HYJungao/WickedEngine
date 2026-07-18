@@ -164,14 +164,20 @@ released after GPU upload.
 The Client debug window's recommended `Generate Client Lighting` entry point
 persists the Client probe placement, generates missing atlas UVs with xatlas, assigns stable object
 IDs, serializes a lightmap-free scene to a temporary file, and then bakes static
-opaque objects sequentially at 256-pixel target resolution, 512 samples, and
-three bounces. Completion writes BC6H data to a temporary package and commits
-only the two sidecars with rollback backups after the temporary pair passes the
-cold-start loader. The source hash is checked before preparation, before commit,
-and after reload. It then captures and reload-verifies the Reflection Probe. The
-individual Lightmap and Probe buttons remain available for diagnostics. `Cancel
-Bake` or any pre-commit failure preserves the previous sidecars and leaves the
-source byte-for-byte untouched.
+opaque objects at 256-pixel target resolution, 512 samples, and three bounces.
+The GPU scheduler advances multiple accumulation iterations per frame and keeps
+up to eight objects in flight, bounded by a 25% transient VRAM budget with a
+512-MiB/10% reserve. It adapts work toward a 100-ms bake frame, finalizes at most
+one synchronous readback/BC6H save per update, and never reduces bake quality to
+meet the frame target. The Client status reports active and pending objects,
+sample throughput, iterations per frame, and VRAM usage. Completion writes BC6H
+data to a temporary package and commits only the two sidecars with rollback
+backups after the temporary pair passes the cold-start loader. The source hash
+is checked before preparation, before commit, and after reload. It then captures
+and reload-verifies the Reflection Probe. The individual Lightmap and Probe
+buttons remain available for diagnostics. `Cancel Bake` or any pre-commit
+failure preserves the previous sidecars and leaves the source byte-for-byte
+untouched.
 
 ## Client reflection probe asset
 
@@ -201,10 +207,32 @@ All four buffers remain on the single `np.remote.video` WebRTC video track.
 DDGI and reflection are GPU-packed with a Log2 mapping for linear HDR values in
 the `[0,16]` range, then restored to `RGBA16F` by the Client. AO and Shadow use
 full-resolution I420 Y only with neutral chroma. Every tile has 16 pixels of
-padding to isolate chroma and codec block filtering. The Server uses a three-slot
-asynchronous GPU readback ring and a latest-frame encoding worker.
+padding to isolate chroma and codec block filtering.
+
+The live software-codec path performs one GPU atlas-to-I420 pass and one packed
+readback through a three-slot ring. WebRTC wraps the mapped planes and returns the
+slot through its release callback, so there is no second full-frame CPU copy or CPU
+RGB-to-YUV conversion. The Client retains the decoded WebRTC frame, uploads Y/U/V
+once through a buffered ring, and extracts all semantic textures with a GPU compute
+pass. Semantic output textures are persistent at a stable generation/resolution.
+
+Frame metadata is dual-written to the legacy luma band and the unordered,
+unreliable `np.frame_meta` DataChannel. After the metadata channel becomes active,
+the Client accepts a decoded frame only when its timestamp has a matching validated
+metadata packet; loss affects only that frame. The legacy band remains for migration
+agreement checks.
+
+Session creation, teardown and retry run on a lifecycle service thread with bounded
+backoff. When signaling is unavailable, render updates only poll an atomic state and
+the Server does not capture or pack remote frames. Status panels report actual codec
+telemetry, compressed bytes, copy/upload bytes, queue drops and metadata matches.
+`power-efficient` and `native-surface` are separate modes: the bundled bridge still
+uses the software-I420 codec surface path until a custom Windows DX12 H.264/NV12
+encoder/decoder backend is integrated.
 
 The Server panel and Client remote status report DDGI frame/convergence state.
 Scene-generation and significant authoritative-sun changes clear Server DDGI
 history and publish the reset reason in the video metadata. `--transport_selftest`
-runs the CPU V2 LogHDR/luma/padding round-trip test without opening a window.
+runs the CPU V2 LogHDR/luma/padding round-trip plus downstream metadata/checksum
+tests without opening a window. See `REMOTE_VIDEO_LOW_COPY_ROADMAP.md` for the
+native DX12 completion and validation matrix.

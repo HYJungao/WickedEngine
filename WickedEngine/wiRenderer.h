@@ -373,8 +373,14 @@ namespace wi::renderer
 	void RefreshEnvProbes(const Visibility& vis, wi::graphics::CommandList cmd);
 	// Call once per frame to re-render out of date impostors
 	void RefreshImpostors(const wi::scene::Scene& scene, wi::graphics::CommandList cmd);
-	// Call once per frame to render lightmaps
-	void RefreshLightmaps(const wi::scene::Scene& scene, wi::graphics::CommandList cmd);
+	// Call once per frame to render lightmaps. Each requested object can advance
+	// multiple accumulation iterations in the same command list. The default
+	// preserves the historical one-iteration-per-frame behavior.
+	void RefreshLightmaps(
+		const wi::scene::Scene& scene,
+		wi::graphics::CommandList cmd,
+		uint32_t iterations_per_request = 1
+	);
 	// Call once per frame to render wetmaps
 	void RefreshWetmaps(const Visibility& vis, wi::graphics::CommandList cmd);
 	// Call once per frame to render PaintDecalIntoMeshSpaceTexture requests
@@ -443,6 +449,8 @@ namespace wi::renderer
 		wi::graphics::Texture texture_normal_roughness;
 		const wi::graphics::Texture* texture_lightmap_irradiance = nullptr; // optional material-independent lightmap irradiance output
 		const wi::graphics::Texture* texture_lightmap_validity = nullptr; // optional: green=baked, magenta=geometry without lightmap, black=sky
+		const wi::graphics::Texture* texture_lightmap_coverage = nullptr; // optional: green=covered texel, red=lightmap hole, magenta=no lightmap
+		const wi::graphics::Texture* texture_lightmap_raw = nullptr; // optional raw Lambert-divided lightmap RGB
 		const wi::graphics::Texture* texture_local_indirect_diffuse = nullptr; // optional local Final GI input before remote blending (RGB includes PI)
 		const wi::graphics::Texture* texture_specular_indirect = nullptr; // optional final indirect-specular contribution for debugging
 		// Optional elastic-rendering inputs. These are screen-space results from
@@ -472,6 +480,8 @@ namespace wi::renderer
 			texture_normal_roughness = {};
 			texture_lightmap_irradiance = nullptr;
 			texture_lightmap_validity = nullptr;
+			texture_lightmap_coverage = nullptr;
+			texture_lightmap_raw = nullptr;
 			texture_local_indirect_diffuse = nullptr;
 			texture_specular_indirect = nullptr;
 			texture_remote_indirect_diffuse = nullptr;
@@ -1113,6 +1123,34 @@ namespace wi::renderer
 		int input_subresource_luminance,
 		int input_subresource_chrominance,
 		const wi::graphics::Texture& output,
+		wi::graphics::CommandList cmd
+	);
+	void YUV_to_RGB_Region(
+		const wi::graphics::Texture& input_luminance,
+		const wi::graphics::Texture& input_chrominance,
+		const wi::graphics::Texture& output,
+		const XMUINT2& source_origin,
+		bool scalar_luma,
+		float log_hdr_maximum,
+		wi::graphics::CommandList cmd
+	);
+	struct I420AtlasPackDesc
+	{
+		XMUINT2 video_resolution = {};
+		uint32_t metadata_rows = 0;
+		uint32_t y_stride = 0;
+		uint32_t uv_stride = 0;
+		uint32_t u_offset = 0;
+		uint32_t v_offset = 0;
+		uint32_t available_mask = 0;
+		float log_hdr_maximum = 16.0f;
+		XMUINT4 tile_rects[4] = {};
+	};
+	void RGB_to_I420_Atlas(
+		const wi::graphics::Texture* const inputs[4],
+		const wi::graphics::GPUBuffer& metadata_luma,
+		const wi::graphics::GPUBuffer& output_i420,
+		const I420AtlasPackDesc& desc,
 		wi::graphics::CommandList cmd
 	);
 

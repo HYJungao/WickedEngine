@@ -100,6 +100,7 @@ private:
         uint32_t width = 0;
         uint32_t height = 0;
         wi::graphics::Texture texture;
+        wi::graphics::Texture coverage_texture;
     };
 
     ClientLightmapPackage lightmap_package;

@@ -240,10 +240,11 @@ void ApplyDefaultWeather(wi::scene::Scene& scene)
     if (scene.weathers.GetCount() > 0)
         return;
 
-    // Match the Editor's empty-scene fallback instead of forcing the previous
-    // dim gray weather, which made an unbaked Sponza almost black.
+    // Use Wicked's neutral physical default. Visibility of unbaked/dynamic
+    // content is handled by the runtime fallback and must not require a nearly
+    // white ambient term that can contaminate authored lighting.
     wi::scene::WeatherComponent& weather = scene.weathers.Create(wi::ecs::CreateEntity());
-    weather.ambient = XMFLOAT3(0.9f, 0.9f, 0.9f);
+    weather.ambient = XMFLOAT3(0.2f, 0.2f, 0.2f);
     weather.horizon = XMFLOAT3(10.0f / 255.0f, 10.0f / 255.0f, 20.0f / 255.0f);
     weather.zenith = XMFLOAT3(30.0f / 255.0f, 40.0f / 255.0f, 60.0f / 255.0f);
     weather.fogStart = std::numeric_limits<float>::max();

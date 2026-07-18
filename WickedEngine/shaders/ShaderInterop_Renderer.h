@@ -722,7 +722,8 @@ struct alignas(32) ShaderMeshInstance
 	ShaderTransform transformPrev; // Note: this could contain quantization remapping from UNORM -> FLOAT depending on vertex position format
 	ShaderTransform transformRaw; // Note: this is the world matrix without any quantization remapping
 
-	float4 padding;
+	float3 padding;
+	int lightmap_coverage;
 
 	inline void init()
 	{
@@ -735,6 +736,7 @@ struct alignas(32) ShaderMeshInstance
 		color = pack_half4(1, 1, 1, 1);
 		emissive = uint2(0, 0);
 		lightmap = -1;
+		lightmap_coverage = -1;
 		geometryOffset = 0;
 		geometryCount = 0;
 		baseGeometryOffset = 0;
@@ -750,7 +752,7 @@ struct alignas(32) ShaderMeshInstance
 		transform.init();
 		transformPrev.init();
 		transformRaw.init();
-		padding = float4(0, 0, 0, 0);
+		padding = float3(0, 0, 0);
 	}
 	static ShaderMeshInstance get_null()
 	{

@@ -35,15 +35,23 @@ constexpr uint32_t kMobileShadowCubeResolution = 512;
 constexpr uint32_t kMobileLightmapResolution = 256;
 constexpr uint32_t kClientReflectionProbeResolution = 128;
 constexpr const char* kLightmapBakeModeMetadataKey = "newpipeline.lightmap_bake_mode";
+constexpr size_t kMaxLightmapsInFlight = 8;
+constexpr uint32_t kMaxClientLightmapIterationsPerFrame = 32;
+constexpr uint64_t kLightmapTransientBytesPerTexel = 24;
+constexpr uint64_t kLightmapMinimumVRAMReserve = 512ull * 1024ull * 1024ull;
+constexpr float kLightmapFrameTimeEMAWeight = 0.2f;
+constexpr float kLightmapFrameTimeRampUp = 0.075f;
+constexpr float kLightmapFrameTimeRampDown = 0.110f;
+constexpr float kLightmapFrameTimeEmergency = 0.200f;
+constexpr uint32_t kLightmapAdaptationIntervalFrames = 4;
+constexpr uint64_t kLightmapNoProgressTimeoutUsec = 30'000'000;
 
-uint32_t NormalizeLightmapBakeDimension(uint32_t dimension)
+uint64_t EstimateLightmapTransientBytes(const XMUINT2& dimensions)
 {
-    // Scene::Update applies this normalization when the render request creates
-    // the accumulation textures. Do it before serializing the derived scene so
-    // the sidecar dimensions already match the final BC6H package dimensions.
-    dimension = wi::math::GetNextPowerOfTwo(dimension + 1u) / 2u;
-    dimension = (dimension + 3u) & ~3u;
-    return std::clamp(dimension, 16u, 16384u);
+    const uint64_t texels = uint64_t(dimensions.x) * uint64_t(dimensions.y);
+    // R32G32B32A32 accumulation (16 B) + R16G16B16A16 expanded result
+    // (8 B), plus a 25% allocator/deferred-destruction safety margin.
+    return texels * kLightmapTransientBytesPerTexel * 5ull / 4ull;
 }
 
 enum class LightmapBakeEligibility : uint8_t
@@ -143,6 +151,25 @@ std::string FormatLightmapBakeCoverage(const LightmapBakeCoverage& coverage, siz
         " skipped_transparent=" + std::to_string(coverage.transparent) +
         " skipped_unsupported=" + std::to_string(coverage.unsupported) +
         " atlas_failures=" + std::to_string(coverage.atlas_failures);
+}
+
+std::string FormatLightmapStatistics(
+    const wi::scene::ObjectComponent::LightmapStatistics& statistics)
+{
+    std::ostringstream stream;
+    stream << "valid=" << statistics.valid_texel_count <<
+        " missing=" << statistics.missing_texel_count <<
+        " invalid=" << statistics.invalid_sample_texel_count <<
+        " irradiance[min=" << statistics.irradiance_min.x << "," <<
+            statistics.irradiance_min.y << "," << statistics.irradiance_min.z <<
+        " avg=" << statistics.irradiance_average.x << "," <<
+            statistics.irradiance_average.y << "," << statistics.irradiance_average.z <<
+        " max=" << statistics.irradiance_max.x << "," <<
+            statistics.irradiance_max.y << "," << statistics.irradiance_max.z << "]" <<
+        " denoiser=" << (statistics.denoiser_applied ? "applied" :
+            statistics.denoiser_failed ? "failed" :
+            statistics.denoiser_available ? "available-not-applied" : "unavailable");
+    return stream.str();
 }
 
 uint64_t NowUsec()
@@ -277,7 +304,28 @@ std::string NewPipelineClientRenderPath::GetEffectiveAlgorithmSummary() const
 
 std::string NewPipelineClientRenderPath::GetDebugStatusSummary() const
 {
-    return GetEffectiveAlgorithmSummary() + "\n" + client_static_lighting.GetStatusSummary() +
+    const WebRTCTransportStats transport = webrtc_transport.GetStats();
+    const std::string transport_status = config.remote_source == RemoteSourceMode::WebRTC
+        ? "\nWebRTC: " + std::string{ToString(transport.state)} + " " + transport.codec_name +
+            (transport.native_codec ? " native-surface" :
+                (transport.power_efficient_codec ? " power-efficient" : " software-surface")) +
+            " retained=" + std::to_string(transport.retained_frame_acquires) +
+            " decode-q=" + std::to_string(transport.decoded_queue_depth) +
+            " impl=" + transport.codec_implementation +
+            " decode=" + std::to_string(transport.total_decode_time_usec / 1000u) + " ms" +
+            " net=" + std::to_string(transport.compressed_bytes_received / 1024u) + " KiB" +
+            " I420=" + std::to_string(transport.retained_i420_bytes / 1024u) + " KiB" +
+            " cpu-copy=" + std::to_string(transport.cpu_full_frame_copy_bytes / 1024u) + " KiB" +
+            " convert=" + std::to_string(transport.cpu_conversion_usec / 1000u) + " ms" +
+            " upload=" + std::to_string(remote_gpu_upload_bytes / 1024u) + " KiB" +
+            " tex-create=" + std::to_string(remote_texture_creation_count) +
+            " meta=" + std::to_string(downstream_metadata_matches) + "/" +
+                std::to_string(downstream_metadata_misses) + "/" +
+                std::to_string(downstream_metadata_mismatches) +
+            (transport.native_codec || transport.codec_fallback_reason.empty()
+                ? std::string{} : " fallback=" + transport.codec_fallback_reason)
+        : std::string{};
+    return GetEffectiveAlgorithmSummary() + "\n" + client_static_lighting.GetStatusSummary() + transport_status +
         "\nRemote decoded: " +
         (remote_consume.accepted_valid ? std::string{"available"} : std::string{"unavailable"}) +
         "\nRemote DDGI: frame " + std::to_string(remote_ddgi_frame_index) +
@@ -341,7 +389,7 @@ void NewPipelineClientRenderPath::Start()
     if (config.remote_source == RemoteSourceMode::WebRTC)
     {
         std::string error;
-        if (!webrtc_transport.Start(false, config, &error))
+        if (!webrtc_transport.RequestStart(false, config, &error))
             wi::backlog::post("Client WebRTC start failed: " + error);
     }
 
@@ -362,12 +410,16 @@ void NewPipelineClientRenderPath::ResizeBuffers()
     local_ao_snapshot = {};
     local_lightmap_irradiance = {};
     local_lightmap_validity = {};
+    local_lightmap_coverage = {};
+    local_lightmap_raw = {};
     local_indirect_final_input = {};
     local_specular_indirect = {};
     elastic_indirect_diffuse = {};
     elastic_ao = {};
     visibilityResources.texture_lightmap_irradiance = nullptr;
     visibilityResources.texture_lightmap_validity = nullptr;
+    visibilityResources.texture_lightmap_coverage = nullptr;
+    visibilityResources.texture_lightmap_raw = nullptr;
     visibilityResources.texture_local_indirect_diffuse = nullptr;
     visibilityResources.texture_specular_indirect = nullptr;
     visibilityResources.texture_elastic_indirect_diffuse = nullptr;
@@ -413,6 +465,27 @@ void NewPipelineClientRenderPath::ResizeBuffers()
                 std::to_string(internal_resolution.x) + "x" + std::to_string(internal_resolution.y));
         }
 
+        if (wi::graphics::GetDevice()->CreateTexture(&validity_desc, nullptr, &local_lightmap_coverage))
+        {
+            wi::graphics::GetDevice()->SetName(&local_lightmap_coverage, "newpipeline.client.local_lightmap_coverage");
+            visibilityResources.texture_lightmap_coverage = &local_lightmap_coverage;
+        }
+        else
+        {
+            wi::backlog::post("Client Local Lightmap Coverage texture creation failed: " +
+                std::to_string(internal_resolution.x) + "x" + std::to_string(internal_resolution.y));
+        }
+
+        if (wi::graphics::GetDevice()->CreateTexture(&desc, nullptr, &local_lightmap_raw))
+        {
+            wi::graphics::GetDevice()->SetName(&local_lightmap_raw, "newpipeline.client.local_lightmap_raw");
+            visibilityResources.texture_lightmap_raw = &local_lightmap_raw;
+        }
+        else
+        {
+            wi::backlog::post("Client Local Lightmap Raw texture creation failed: " +
+                std::to_string(internal_resolution.x) + "x" + std::to_string(internal_resolution.y));
+        }
         if (wi::graphics::GetDevice()->CreateTexture(&desc, nullptr, &local_indirect_final_input))
         {
             wi::graphics::GetDevice()->SetName(&local_indirect_final_input, "newpipeline.client.local_indirect_final_input");
@@ -498,12 +571,13 @@ void NewPipelineClientRenderPath::Update(float dt)
 {
     InitializeSceneIfNeeded();
     UpdateReflectionProbeBake();
-    UpdateLightmapBake();
+    UpdateLightmapBake(dt);
     UpdateLocalCamera(dt);
     MaintainWebRTC(dt);
     PublishControlPacket(dt);
 
     wi::RenderPath3D::Update(dt);
+    PollRemoteFrameMetadata();
     AcquireRemoteVideoFrame(dt);
     UpdateElasticLighting(dt);
 
@@ -521,24 +595,43 @@ void NewPipelineClientRenderPath::Update(float dt)
 
 void NewPipelineClientRenderPath::MaintainWebRTC(float dt)
 {
+    (void)dt;
     webrtc_transport.Tick();
     if (config.remote_source != RemoteSourceMode::WebRTC)
         return;
     const WebRTCTransportStats stats = webrtc_transport.GetStats();
-    if (stats.state != WebRTCTransportState::Failed)
+    if (stats.state == previous_webrtc_state)
+        return;
+    wi::backlog::post("Client WebRTC " + std::string{ToString(previous_webrtc_state)} + " -> " +
+        ToString(stats.state) + (stats.status.empty() ? std::string{} : ": " + stats.status));
+    if (previous_webrtc_state == WebRTCTransportState::Connected &&
+        stats.state != WebRTCTransportState::Connected)
     {
-        webrtc_retry_accumulator = 0.0f;
-        return;
+        downstream_metadata_cache.clear();
+        downstream_metadata_active = false;
     }
-    webrtc_retry_accumulator += dt;
-    if (webrtc_retry_accumulator < 2.0f)
+    previous_webrtc_state = stats.state;
+}
+
+void NewPipelineClientRenderPath::PollRemoteFrameMetadata()
+{
+    if (config.remote_source != RemoteSourceMode::WebRTC)
         return;
-    webrtc_retry_accumulator = 0.0f;
-    std::string error;
-    if (!webrtc_transport.Start(false, config, &error))
-        wi::backlog::post("Client WebRTC retry failed: " + error);
-    else
-        wi::backlog::post("Client WebRTC retrying signaling: " + config.signaling_url);
+    RemoteVideoFrameLayout layout;
+    if (!webrtc_transport.TryReceiveFrameMetadata(layout))
+        return;
+    downstream_metadata_active = true;
+    for (auto iterator = downstream_metadata_cache.begin(); iterator != downstream_metadata_cache.end();)
+    {
+        if (iterator->metadata.frame_id == layout.metadata.frame_id &&
+            iterator->metadata.source_generation == layout.metadata.source_generation)
+            iterator = downstream_metadata_cache.erase(iterator);
+        else
+            ++iterator;
+    }
+    downstream_metadata_cache.push_back(std::move(layout));
+    while (downstream_metadata_cache.size() > 8)
+        downstream_metadata_cache.pop_front();
 }
 
 void NewPipelineClientRenderPath::InitializeSceneIfNeeded()
@@ -993,6 +1086,32 @@ void NewPipelineClientRenderPath::RequestLightmapBake()
         wi::backlog::post("Client lightmap bake request ignored: reflection probe bake is active");
         return;
     }
+
+    lightmap_bake_denoiser_available =
+        wi::scene::ObjectComponent::IsLightmapDenoiserAvailable();
+    lightmap_bake_denoiser_required = false;
+    if (!lightmap_diagnostic_session_active)
+    {
+        if (lightmap_bake_denoiser_available)
+        {
+            lightmap_bake_settings.sample_count = std::max(
+                lightmap_bake_settings.sample_count,
+                kClientLightmapDenoisedSamples);
+            lightmap_bake_denoiser_required =
+                lightmap_bake_settings.sample_count < kClientLightmapUnfilteredSamples;
+        }
+        else
+        {
+            lightmap_bake_settings.sample_count = std::max(
+                lightmap_bake_settings.sample_count,
+                kClientLightmapUnfilteredSamples);
+        }
+        wi::backlog::post(
+            "Client lightmap production quality: sampler=owen-scrambled-sobol4"
+            " light_selection=contribution-cdf denoiser=" +
+            std::string{lightmap_bake_denoiser_available ? "OIDN-required" : "unavailable-raw-fallback"} +
+            " samples=" + std::to_string(lightmap_bake_settings.sample_count));
+    }
     if (!scene_initialized || scene_asset_path.empty())
     {
         render_settings.lightmap_bake_requested = false;
@@ -1207,12 +1326,124 @@ bool NewPipelineClientRenderPath::IsLightmapBakeActive() const
 {
     return lightmap_bake_state == LightmapBakeState::Preparing ||
         lightmap_bake_state == LightmapBakeState::Baking ||
-        lightmap_bake_state == LightmapBakeState::Saving;
+        lightmap_bake_state == LightmapBakeState::Saving ||
+        lightmap_bake_state == LightmapBakeState::DiagnosticPaused ||
+        lightmap_bake_state == LightmapBakeState::DiagnosticCompressed;
 }
 
 std::string NewPipelineClientRenderPath::GetLightmapBakeStatus() const
 {
     return lightmap_bake_status;
+}
+
+bool NewPipelineClientRenderPath::PickLightmapDiagnosticObjectAtScreenCenter()
+{
+    if (!scene_initialized || IsLightmapBakeActive())
+    {
+        lightmap_diagnostic_status = "Diagnostic: object pick unavailable while scene/bake is inactive";
+        return false;
+    }
+
+    const long center_x = static_cast<long>(GetLogicalWidth() * 0.5f);
+    const long center_y = static_cast<long>(GetLogicalHeight() * 0.5f);
+    const wi::primitive::Ray ray = wi::renderer::GetPickRay(center_x, center_y, *this, local_camera);
+    const wi::scene::PickResult pick = wi::scene::Pick(
+        ray, wi::enums::FILTER_OBJECT_ALL, ~0u, local_scene);
+    if (pick.entity == wi::ecs::INVALID_ENTITY || local_scene.objects.GetComponent(pick.entity) == nullptr)
+    {
+        lightmap_diagnostic_entity = wi::ecs::INVALID_ENTITY;
+        lightmap_diagnostic_object_name.clear();
+        lightmap_diagnostic_status = "Diagnostic: screen center did not hit a mesh object";
+        return false;
+    }
+
+    lightmap_diagnostic_entity = pick.entity;
+    const wi::scene::NameComponent* name = local_scene.names.GetComponent(pick.entity);
+    lightmap_diagnostic_object_name = name != nullptr && !name->name.empty()
+        ? name->name : std::to_string(pick.entity);
+    lightmap_diagnostic_status = "Diagnostic target: " + lightmap_diagnostic_object_name +
+        " entity=" + std::to_string(pick.entity) + " (ready)";
+    wi::backlog::post(lightmap_diagnostic_status);
+    return true;
+}
+
+bool NewPipelineClientRenderPath::HasLightmapDiagnosticObject() const
+{
+    return lightmap_diagnostic_entity != wi::ecs::INVALID_ENTITY &&
+        local_scene.objects.GetComponent(lightmap_diagnostic_entity) != nullptr;
+}
+
+void NewPipelineClientRenderPath::SetLightmapDiagnosticSettings(
+    const LightmapDiagnosticSettings& settings)
+{
+    if (lightmap_diagnostic_session_active)
+        return;
+    lightmap_diagnostic_settings = settings;
+    lightmap_diagnostic_settings.resolution = std::clamp(settings.resolution, 64u, 1024u);
+    lightmap_diagnostic_settings.sample_count = std::clamp(settings.sample_count, 1u, 8192u);
+    lightmap_diagnostic_settings.bounce_count = std::clamp(settings.bounce_count, 1u, 8u);
+}
+
+void NewPipelineClientRenderPath::RequestLightmapDiagnosticBake()
+{
+    if (IsLightmapBakeActive() || IsReflectionProbeBakeActive())
+    {
+        lightmap_diagnostic_status = "Diagnostic: another lighting operation is active";
+        return;
+    }
+    if (!HasLightmapDiagnosticObject())
+    {
+        lightmap_diagnostic_status = "Diagnostic: pick an object at screen center first";
+        return;
+    }
+
+    lightmap_bake_settings_before_diagnostic = lightmap_bake_settings;
+    lightmap_bake_settings.resolution = lightmap_diagnostic_settings.resolution;
+    lightmap_bake_settings.sample_count = lightmap_diagnostic_settings.sample_count;
+    lightmap_bake_settings.bounce_count = lightmap_diagnostic_settings.bounce_count;
+    lightmap_diagnostic_session_active = true;
+    lightmap_diagnostic_resume_requested = false;
+    lightmap_diagnostic_atlas_regenerated = false;
+    lightmap_diagnostic_atlas_audit = {};
+    lightmap_diagnostic_status = "Diagnostic: preparing selected object " +
+        lightmap_diagnostic_object_name;
+    RequestLightmapBake();
+    if (lightmap_bake_state == LightmapBakeState::Failed)
+        EndLightmapDiagnosticSession(lightmap_bake_status);
+}
+
+void NewPipelineClientRenderPath::ResumeLightmapDiagnosticSave()
+{
+    if (!lightmap_diagnostic_session_active ||
+        lightmap_bake_state != LightmapBakeState::DiagnosticPaused)
+        return;
+    lightmap_diagnostic_resume_requested = true;
+    lightmap_diagnostic_status = "Diagnostic: running temporary SaveLightmap/OIDN+BC6H pipeline";
+}
+
+void NewPipelineClientRenderPath::DiscardLightmapDiagnosticBake()
+{
+    if (!lightmap_diagnostic_session_active)
+        return;
+    CancelLightmapBake();
+    lightmap_diagnostic_status = "Diagnostic: discarding temporary result and restoring production sidecars";
+}
+
+bool NewPipelineClientRenderPath::IsLightmapDiagnosticPaused() const
+{
+    return lightmap_diagnostic_session_active &&
+        lightmap_bake_state == LightmapBakeState::DiagnosticPaused;
+}
+
+bool NewPipelineClientRenderPath::IsLightmapDiagnosticCompressed() const
+{
+    return lightmap_diagnostic_session_active &&
+        lightmap_bake_state == LightmapBakeState::DiagnosticCompressed;
+}
+
+std::string NewPipelineClientRenderPath::GetLightmapDiagnosticStatus() const
+{
+    return lightmap_diagnostic_status;
 }
 
 bool NewPipelineClientRenderPath::SavePreparedScene(const std::string& path, std::string& error)
@@ -1287,10 +1518,10 @@ bool NewPipelineClientRenderPath::PrepareLightmapBake()
 
     lightmap_bake_queue.clear();
     lightmap_bake_completed.clear();
+    ResetLightmapBakeScheduling();
     lightmap_bake_dimensions.clear();
     lightmap_bake_next_index = 0;
     lightmap_bake_skipped = 0;
-    active_lightmap_bake_entity = wi::ecs::INVALID_ENTITY;
     prepared_derived_scene_hash = 0;
     const float max_float = std::numeric_limits<float>::max();
     lightmap_irradiance_min = XMFLOAT3(max_float, max_float, max_float);
@@ -1298,16 +1529,20 @@ bool NewPipelineClientRenderPath::PrepareLightmapBake()
     lightmap_irradiance_max = {};
     lightmap_valid_texel_count = 0;
     lightmap_missing_texel_count = 0;
+    lightmap_invalid_texel_count = 0;
 
     std::unordered_map<wi::ecs::Entity, XMUINT2> mesh_dimensions;
     std::unordered_set<std::string> object_ids;
     LightmapBakeCoverage coverage;
-    coverage.total = static_cast<uint32_t>(local_scene.objects.GetCount());
+    coverage.total = lightmap_diagnostic_session_active
+        ? 1u : static_cast<uint32_t>(local_scene.objects.GetCount());
     uint32_t skipped_logged = 0;
     for (size_t i = 0; i < local_scene.objects.GetCount(); ++i)
     {
         wi::scene::ObjectComponent& object = local_scene.objects[i];
         const wi::ecs::Entity entity = local_scene.objects.GetEntity(i);
+        if (lightmap_diagnostic_session_active && entity != lightmap_diagnostic_entity)
+            continue;
         const LightmapBakeEligibility eligibility =
             ClassifyLightmapBakeEligibility(local_scene, entity, object);
         AccumulateCoverage(coverage, eligibility);
@@ -1325,7 +1560,10 @@ bool NewPipelineClientRenderPath::PrepareLightmapBake()
         {
             dimensions = known_dimensions->second;
         }
-        else if (mesh != nullptr && mesh->vertex_atlas.empty())
+        else if (mesh != nullptr &&
+            (mesh->vertex_atlas.empty() ||
+                (lightmap_diagnostic_session_active &&
+                    lightmap_diagnostic_settings.force_regenerate_atlas)))
         {
             std::string atlas_error;
             if (!GenerateClientLightmapAtlas(
@@ -1342,6 +1580,8 @@ bool NewPipelineClientRenderPath::PrepareLightmapBake()
                     wi::backlog::post("Client lightmap atlas skipped object " + std::to_string(entity) + ": " + atlas_error);
                 continue;
             }
+            if (lightmap_diagnostic_session_active)
+                lightmap_diagnostic_atlas_regenerated = true;
         }
         else
         {
@@ -1349,8 +1589,116 @@ bool NewPipelineClientRenderPath::PrepareLightmapBake()
                 dimensions = {object.lightmapWidth, object.lightmapHeight};
         }
 
-        dimensions.x = NormalizeLightmapBakeDimension(dimensions.x);
-        dimensions.y = NormalizeLightmapBakeDimension(dimensions.y);
+        // A reused atlas stores normalized UVs, so it can be tested at a
+        // different density without regenerating topology. Preserve its
+        // aspect ratio and interpret the diagnostic resolution as long edge.
+        if (lightmap_diagnostic_session_active && !lightmap_diagnostic_atlas_regenerated)
+        {
+            const uint32_t source_long_edge = std::max(dimensions.x, dimensions.y);
+            if (source_long_edge > 0)
+            {
+                const float scale = float(lightmap_bake_settings.resolution) /
+                    float(source_long_edge);
+                dimensions.x = std::max(16u, static_cast<uint32_t>(
+                    std::round(float(dimensions.x) * scale)));
+                dimensions.y = std::max(16u, static_cast<uint32_t>(
+                    std::round(float(dimensions.y) * scale)));
+            }
+        }
+
+        dimensions.x = FinalizeClientLightmapDimension(dimensions.x);
+        dimensions.y = FinalizeClientLightmapDimension(dimensions.y);
+        if (dimensions.x == 0 || dimensions.y == 0)
+        {
+            FailLightmapBake("lightmap dimensions exceed the supported 16384 texel limit");
+            return false;
+        }
+
+        if (lightmap_diagnostic_session_active && mesh != nullptr)
+        {
+            lightmap_diagnostic_atlas_audit = AuditClientLightmapAtlas(
+                *mesh, dimensions.x, dimensions.y);
+            const std::string audit = lightmap_diagnostic_atlas_audit.Summary(
+                dimensions.x, dimensions.y);
+            lightmap_diagnostic_status = "Diagnostic atlas " +
+                std::string{lightmap_diagnostic_atlas_audit.HasStructuralFailure() ? "FAIL" : "PASS"} +
+                " (" +
+                std::string{lightmap_diagnostic_atlas_regenerated ? "regenerated" : "reused"} +
+                "): " + audit;
+            wi::backlog::post(lightmap_diagnostic_status);
+
+            uint32_t static_lights = 0;
+            uint32_t dynamic_lights = 0;
+            uint32_t logged_lights = 0;
+            for (size_t light_index = 0; light_index < local_scene.lights.GetCount(); ++light_index)
+            {
+                const wi::scene::LightComponent& light = local_scene.lights[light_index];
+                if (light.IsInactive())
+                    continue;
+                if (light.IsStatic())
+                    ++static_lights;
+                else
+                    ++dynamic_lights;
+
+                // Keep the diagnostic self-contained: color casts cannot be
+                // attributed reliably from a light count alone.  Log authored
+                // color/intensity and placement for a bounded number of active
+                // lights so a 1/2/3-bounce comparison identifies the source.
+                if (logged_lights < 16)
+                {
+                    const wi::ecs::Entity light_entity = local_scene.lights.GetEntity(light_index);
+                    const wi::scene::NameComponent* light_name = local_scene.names.GetComponent(light_entity);
+                    const char* light_type = "unknown";
+                    switch (light.GetType())
+                    {
+                    case wi::scene::LightComponent::DIRECTIONAL: light_type = "directional"; break;
+                    case wi::scene::LightComponent::POINT: light_type = "point"; break;
+                    case wi::scene::LightComponent::SPOT: light_type = "spot"; break;
+                    case wi::scene::LightComponent::RECTANGLE: light_type = "rectangle"; break;
+                    default: break;
+                    }
+                    std::ostringstream stream;
+                    stream << "Client lightmap diagnostic light[" << logged_lights << "]: entity="
+                        << light_entity << " name="
+                        << (light_name != nullptr ? light_name->name : "<unnamed>")
+                        << " type=" << light_type
+                        << " static=" << (light.IsStatic() ? 1 : 0)
+                        << " color=" << light.color.x << ',' << light.color.y << ',' << light.color.z
+                        << " intensity=" << light.intensity
+                        << " authored_rgb=" << light.color.x * light.intensity << ','
+                        << light.color.y * light.intensity << ','
+                        << light.color.z * light.intensity
+                        << " range=" << light.GetRange()
+                        << " radius=" << light.radius
+                        << " position=" << light.position.x << ',' << light.position.y << ',' << light.position.z
+                        << " direction=" << light.direction.x << ',' << light.direction.y << ',' << light.direction.z;
+                    wi::backlog::post(stream.str());
+                    ++logged_lights;
+                }
+            }
+            if (static_lights + dynamic_lights > logged_lights)
+            {
+                wi::backlog::post(
+                    "Client lightmap diagnostic lights: " +
+                    std::to_string(static_lights + dynamic_lights - logged_lights) +
+                    " additional active lights omitted");
+            }
+            wi::backlog::post(
+                "Client lightmap diagnostic config: object=" + lightmap_diagnostic_object_name +
+                " entity=" + std::to_string(lightmap_diagnostic_entity) +
+                " dimensions=" + std::to_string(dimensions.x) + "x" + std::to_string(dimensions.y) +
+                " samples=" + std::to_string(lightmap_bake_settings.sample_count) +
+                " bounces=" + std::to_string(lightmap_bake_settings.bounce_count) +
+                " static_lights=" + std::to_string(static_lights) +
+                " dynamic_lights=" + std::to_string(dynamic_lights) +
+                " integrator=vertex-nee-v2" +
+                " sampler=owen-scrambled-sobol4" +
+                " light_selection=contribution-cdf" +
+                " denoiser=" + std::string{
+                    lightmap_bake_denoiser_available ? "OIDN" : "unavailable"} +
+                " pause_before_save=" +
+                    std::string{lightmap_diagnostic_settings.pause_before_save ? "1" : "0"});
+        }
         mesh_dimensions[object.meshID] = dimensions;
 
         std::string id = ClientLightmapPackage::EnsureObjectId(local_scene, entity);
@@ -1399,99 +1747,181 @@ bool NewPipelineClientRenderPath::PrepareLightmapBake()
     wi::renderer::SetRaytraceBounceCount(lightmap_bake_settings.bounce_count);
     local_scene.SetAccelerationStructureUpdateRequested(true);
     lightmap_bake_state = LightmapBakeState::Baking;
+    lightmap_bake_rate_time_usec = NowUsec();
     wi::backlog::post("Client lightmap bake prepared: objects=" + std::to_string(lightmap_bake_queue.size()) +
         " skipped=" + std::to_string(lightmap_bake_skipped) +
         " samples=" + std::to_string(lightmap_bake_settings.sample_count) +
         " bounces=" + std::to_string(lightmap_bake_settings.bounce_count));
-    return StartNextLightmapBake();
+    if (!FillLightmapBakeBatch())
+    {
+        FailLightmapBake("eligible lightmap objects disappeared during preparation");
+        return false;
+    }
+    UpdateLightmapBakeProgress();
+    return true;
 }
 
-bool NewPipelineClientRenderPath::StartNextLightmapBake()
+uint64_t NewPipelineClientRenderPath::GetActiveLightmapTexelCount() const
 {
-    while (lightmap_bake_next_index < lightmap_bake_queue.size())
+    uint64_t texels = 0;
+    for (const wi::ecs::Entity entity : lightmap_bake_active)
     {
-        const wi::ecs::Entity entity = lightmap_bake_queue[lightmap_bake_next_index++];
+        const auto dimensions = lightmap_bake_dimensions.find(entity);
+        if (dimensions != lightmap_bake_dimensions.end())
+            texels += uint64_t(dimensions->second.x) * uint64_t(dimensions->second.y);
+    }
+    return texels;
+}
+
+uint64_t NewPipelineClientRenderPath::GetLightmapBakeTotalSamples() const
+{
+    uint64_t samples = uint64_t(lightmap_bake_completed.size() + lightmap_bake_pending_save.size()) *
+        uint64_t(lightmap_bake_settings.sample_count);
+    for (const wi::ecs::Entity entity : lightmap_bake_active)
+    {
+        const wi::scene::ObjectComponent* object = local_scene.objects.GetComponent(entity);
+        if (object != nullptr)
+        {
+            samples += std::min(object->lightmapIterationCount, lightmap_bake_settings.sample_count);
+        }
+    }
+    return samples;
+}
+
+bool NewPipelineClientRenderPath::FillLightmapBakeBatch()
+{
+    const wi::graphics::GraphicsDevice::MemoryUsage memory = wi::graphics::GetDevice()->GetMemoryUsage();
+    const uint64_t reserve = std::max(kLightmapMinimumVRAMReserve, memory.budget / uint64_t(10));
+    const uint64_t transient_cap = memory.budget / 4ull;
+    uint64_t estimated_inflight_bytes = 0;
+    uint64_t newly_planned_bytes = 0;
+
+    const auto accumulate_estimate = [&](const wi::vector<wi::ecs::Entity>& entities) {
+        for (const wi::ecs::Entity entity : entities)
+        {
+            const auto dimensions = lightmap_bake_dimensions.find(entity);
+            if (dimensions != lightmap_bake_dimensions.end())
+                estimated_inflight_bytes += EstimateLightmapTransientBytes(dimensions->second);
+        }
+    };
+    accumulate_estimate(lightmap_bake_active);
+    accumulate_estimate(lightmap_bake_pending_save);
+
+    bool changed = false;
+    while (lightmap_bake_next_index < lightmap_bake_queue.size() &&
+        lightmap_bake_active.size() + lightmap_bake_pending_save.size() < kMaxLightmapsInFlight)
+    {
+        const wi::ecs::Entity entity = lightmap_bake_queue[lightmap_bake_next_index];
         wi::scene::ObjectComponent* object = local_scene.objects.GetComponent(entity);
         const auto dimensions = lightmap_bake_dimensions.find(entity);
         if (object == nullptr || dimensions == lightmap_bake_dimensions.end())
+        {
+            ++lightmap_bake_next_index;
             continue;
+        }
 
+        const uint64_t candidate_bytes = EstimateLightmapTransientBytes(dimensions->second);
+        const bool no_inflight = lightmap_bake_active.empty() && lightmap_bake_pending_save.empty();
+        bool within_budget = false;
+        if (memory.budget > 0)
+        {
+            const uint64_t usable_budget = memory.budget > reserve ? memory.budget - reserve : 0;
+            const bool within_transient_cap =
+                candidate_bytes <= transient_cap &&
+                estimated_inflight_bytes <= transient_cap - candidate_bytes;
+            const bool within_device_headroom =
+                memory.usage < usable_budget &&
+                newly_planned_bytes <= usable_budget - memory.usage &&
+                candidate_bytes <= usable_budget - memory.usage - newly_planned_bytes;
+            within_budget = within_transient_cap && within_device_headroom;
+        }
+
+        // Always admit one object so low/unknown reported budgets make
+        // progress. Subsequent allocations remain strictly budget controlled.
+        if (!within_budget && !no_inflight)
+            break;
+
+        ++lightmap_bake_next_index;
         object->ClearLightmap();
         object->lightmapWidth = dimensions->second.x;
         object->lightmapHeight = dimensions->second.y;
         object->SetLightmapDisableBlockCompression(false);
         object->SetLightmapRenderRequest(true);
-        active_lightmap_bake_entity = entity;
-
-        const wi::scene::NameComponent* name = local_scene.names.GetComponent(entity);
-        const std::string object_name = name != nullptr && !name->name.empty() ? name->name : std::to_string(entity);
-        lightmap_bake_status = "Lightmap: " + std::to_string(lightmap_bake_completed.size()) + "/" +
-            std::to_string(lightmap_bake_queue.size()) + " baking " + object_name + " (0/" +
-            std::to_string(lightmap_bake_settings.sample_count) + ")";
-        return true;
+        lightmap_bake_active.push_back(entity);
+        estimated_inflight_bytes += candidate_bytes;
+        newly_planned_bytes += candidate_bytes;
+        changed = true;
     }
 
-    FinishLightmapBake();
-    return lightmap_bake_state == LightmapBakeState::Completed;
+    if (changed)
+    {
+        lightmap_bake_last_progress_time_usec = NowUsec();
+        lightmap_bake_last_progress_sample_total = GetLightmapBakeTotalSamples();
+        wi::backlog::post(
+            "Client lightmap batch: active=" + std::to_string(lightmap_bake_active.size()) +
+            " pending_save=" + std::to_string(lightmap_bake_pending_save.size()) +
+            " estimated_transient_mb=" + std::to_string(estimated_inflight_bytes / (1024ull * 1024ull)) +
+            " vram_mb=" + std::to_string(memory.usage / (1024ull * 1024ull)) + "/" +
+                std::to_string(memory.budget / (1024ull * 1024ull)));
+    }
+
+    return !lightmap_bake_active.empty();
 }
 
-void NewPipelineClientRenderPath::UpdateLightmapBake()
+bool NewPipelineClientRenderPath::FinalizeOnePendingLightmap()
 {
-    if (!IsLightmapBakeActive())
-        return;
-    if (lightmap_cancel_requested)
-    {
-        if (wi::scene::ObjectComponent* object = local_scene.objects.GetComponent(active_lightmap_bake_entity))
-            object->ClearLightmap();
-        wi::renderer::SetRaytraceBounceCount(previous_raytrace_bounce_count);
-        CleanupLightmapBakeTemps();
-        ReloadSceneAfterLightmapBakeAbort();
-        std::string source_error;
-        const bool source_unchanged = VerifySourceSceneUnchanged(source_error);
-        LogLightmapSceneParity("cancelled");
-        active_lightmap_bake_entity = wi::ecs::INVALID_ENTITY;
-        lightmap_bake_state = LightmapBakeState::Cancelled;
-        lightmap_bake_status = source_unchanged
-            ? "Lightmap: cancelled; source and previous sidecars preserved"
-            : "Lightmap: cancelled; previous sidecars preserved, but " + source_error;
-        static_lighting_bake_requested = false;
-        lightmap_cancel_requested = false;
-        wi::backlog::post(lightmap_bake_status);
-        return;
-    }
-    if (lightmap_bake_state == LightmapBakeState::Preparing)
-    {
-        PrepareLightmapBake();
-        return;
-    }
-    if (lightmap_bake_state != LightmapBakeState::Baking)
-        return;
+    if (lightmap_bake_pending_save.empty())
+        return true;
 
-    wi::scene::ObjectComponent* object = local_scene.objects.GetComponent(active_lightmap_bake_entity);
+    const wi::ecs::Entity entity = lightmap_bake_pending_save.front();
+    wi::scene::ObjectComponent* object = local_scene.objects.GetComponent(entity);
+    const wi::scene::NameComponent* name = local_scene.names.GetComponent(entity);
+    const std::string object_name = name != nullptr && !name->name.empty() ? name->name : std::to_string(entity);
     if (object == nullptr)
     {
-        FailLightmapBake("active lightmap object disappeared");
-        return;
+        FailLightmapBake("pending lightmap object disappeared: " + object_name);
+        return false;
     }
-    const uint32_t samples = object->lightmapIterationCount;
-    const wi::scene::NameComponent* name = local_scene.names.GetComponent(active_lightmap_bake_entity);
-    const std::string object_name = name != nullptr && !name->name.empty() ? name->name : std::to_string(active_lightmap_bake_entity);
-    lightmap_bake_status = "Lightmap: " + std::to_string(lightmap_bake_completed.size()) + "/" +
-        std::to_string(lightmap_bake_queue.size()) + " baking " + object_name + " (" +
-        std::to_string(std::min(samples, lightmap_bake_settings.sample_count)) + "/" +
-        std::to_string(lightmap_bake_settings.sample_count) + ")";
-    if (samples < lightmap_bake_settings.sample_count)
-        return;
 
-    object->SetLightmapRenderRequest(false);
     object->SaveLightmap();
     if (!object->lightmap.IsValid() || object->lightmapTextureData.empty() ||
         object->lightmap.GetDesc().format != wi::graphics::Format::BC6H_UF16)
     {
         FailLightmapBake("BC6H compression failed for object " + object_name);
-        return;
+        return false;
     }
+
+    const auto dimensions = lightmap_bake_dimensions.find(entity);
+    const wi::graphics::TextureDesc& texture_desc = object->lightmap.GetDesc();
+    if (dimensions == lightmap_bake_dimensions.end() ||
+        texture_desc.width != object->lightmapWidth || texture_desc.height != object->lightmapHeight ||
+        texture_desc.width != dimensions->second.x || texture_desc.height != dimensions->second.y ||
+        object->lightmapCoverageData.size() != uint64_t(texture_desc.width) * texture_desc.height)
+    {
+        FailLightmapBake("lightmap dimension/coverage validation failed for object " + object_name);
+        return false;
+    }
+    if (!object->lightmap_coverage.IsValid())
+    {
+        FailLightmapBake("lightmap coverage texture creation failed for object " + object_name);
+        return false;
+    }
+    const wi::graphics::TextureDesc& coverage_desc = object->lightmap_coverage.GetDesc();
+    if (coverage_desc.format != wi::graphics::Format::R8_UNORM ||
+        coverage_desc.width != texture_desc.width || coverage_desc.height != texture_desc.height)
+    {
+        FailLightmapBake("lightmap coverage texture dimensions mismatch for object " + object_name);
+        return false;
+    }
+
     const wi::scene::ObjectComponent::LightmapStatistics& statistics = object->lightmapStatistics;
+    if (lightmap_bake_denoiser_required && !statistics.denoiser_applied)
+    {
+        FailLightmapBake(
+            "production denoiser did not complete for object " + object_name +
+            "; previous lightmap package was preserved");
+        return false;
+    }
     if (statistics.valid_texel_count > 0)
     {
         lightmap_irradiance_min.x = std::min(lightmap_irradiance_min.x, statistics.irradiance_min.x);
@@ -1507,9 +1937,316 @@ void NewPipelineClientRenderPath::UpdateLightmapBake()
         lightmap_valid_texel_count += statistics.valid_texel_count;
     }
     lightmap_missing_texel_count += statistics.missing_texel_count;
-    lightmap_bake_completed.push_back(active_lightmap_bake_entity);
-    active_lightmap_bake_entity = wi::ecs::INVALID_ENTITY;
-    StartNextLightmapBake();
+    lightmap_invalid_texel_count += statistics.invalid_sample_texel_count;
+    if (lightmap_diagnostic_session_active)
+    {
+        wi::backlog::post(
+            "Client lightmap diagnostic pre-compression statistics: " +
+            FormatLightmapStatistics(statistics));
+    }
+    lightmap_bake_completed.push_back(entity);
+    lightmap_bake_pending_save.erase(lightmap_bake_pending_save.begin());
+    return true;
+}
+
+void NewPipelineClientRenderPath::UpdateLightmapBakeWorkload(float dt)
+{
+    const uint64_t active_texels = GetActiveLightmapTexelCount();
+    if (active_texels != lightmap_bake_scheduled_active_texels)
+    {
+        if (active_texels == 0 || lightmap_bake_scheduled_active_texels == 0)
+        {
+            lightmap_bake_iterations_per_frame = 1;
+        }
+        else
+        {
+            const uint64_t scaled =
+                (uint64_t(lightmap_bake_iterations_per_frame) * lightmap_bake_scheduled_active_texels +
+                    active_texels / 2ull) /
+                active_texels;
+            lightmap_bake_iterations_per_frame = std::clamp(
+                static_cast<uint32_t>(std::max<uint64_t>(scaled, 1ull)),
+                1u,
+                kMaxClientLightmapIterationsPerFrame);
+        }
+        lightmap_bake_scheduled_active_texels = active_texels;
+        lightmap_bake_adaptation_frames = 0;
+    }
+
+    if (lightmap_bake_active.empty())
+    {
+        lightmap_bake_effective_iterations_per_frame = 1;
+        setLightmapRefreshIterationsPerFrame(1);
+        return;
+    }
+
+    const float frame_time = std::clamp(dt, 0.0f, 0.5f);
+    if (lightmap_bake_frame_time_ema <= 0.0f)
+        lightmap_bake_frame_time_ema = frame_time;
+    else
+        lightmap_bake_frame_time_ema +=
+            (frame_time - lightmap_bake_frame_time_ema) * kLightmapFrameTimeEMAWeight;
+
+    if (frame_time > kLightmapFrameTimeEmergency)
+    {
+        lightmap_bake_iterations_per_frame = 1;
+        lightmap_bake_adaptation_frames = 0;
+    }
+    else if (++lightmap_bake_adaptation_frames >= kLightmapAdaptationIntervalFrames)
+    {
+        lightmap_bake_adaptation_frames = 0;
+        if (lightmap_bake_frame_time_ema < kLightmapFrameTimeRampUp)
+        {
+            lightmap_bake_iterations_per_frame = std::min(
+                lightmap_bake_iterations_per_frame * 2u,
+                kMaxClientLightmapIterationsPerFrame);
+        }
+        else if (lightmap_bake_frame_time_ema > kLightmapFrameTimeRampDown)
+        {
+            lightmap_bake_iterations_per_frame = std::max(lightmap_bake_iterations_per_frame / 2u, 1u);
+        }
+    }
+
+    uint32_t minimum_remaining = lightmap_bake_settings.sample_count;
+    for (const wi::ecs::Entity entity : lightmap_bake_active)
+    {
+        const wi::scene::ObjectComponent* object = local_scene.objects.GetComponent(entity);
+        if (object != nullptr)
+        {
+            const uint32_t completed = std::min(object->lightmapIterationCount, lightmap_bake_settings.sample_count);
+            minimum_remaining = std::min(minimum_remaining, lightmap_bake_settings.sample_count - completed);
+        }
+    }
+    lightmap_bake_effective_iterations_per_frame = std::clamp(
+        std::min(lightmap_bake_iterations_per_frame, std::max(minimum_remaining, 1u)),
+        1u,
+        kMaxClientLightmapIterationsPerFrame);
+    setLightmapRefreshIterationsPerFrame(lightmap_bake_effective_iterations_per_frame);
+}
+
+void NewPipelineClientRenderPath::UpdateLightmapBakeProgress()
+{
+    const uint64_t now = NowUsec();
+    const uint64_t total_samples = GetLightmapBakeTotalSamples();
+    const uint64_t elapsed = now >= lightmap_bake_rate_time_usec ? now - lightmap_bake_rate_time_usec : 0;
+    if (lightmap_bake_rate_time_usec == 0)
+    {
+        lightmap_bake_rate_time_usec = now;
+        lightmap_bake_rate_sample_total = total_samples;
+    }
+    else if (elapsed >= 500'000)
+    {
+        const uint64_t sample_delta = total_samples >= lightmap_bake_rate_sample_total
+            ? total_samples - lightmap_bake_rate_sample_total
+            : 0;
+        lightmap_bake_samples_per_second = elapsed > 0
+            ? static_cast<float>(double(sample_delta) * 1'000'000.0 / double(elapsed))
+            : 0.0f;
+        lightmap_bake_rate_time_usec = now;
+        lightmap_bake_rate_sample_total = total_samples;
+    }
+
+    uint32_t minimum_samples = lightmap_bake_settings.sample_count;
+    uint32_t maximum_samples = 0;
+    for (const wi::ecs::Entity entity : lightmap_bake_active)
+    {
+        const wi::scene::ObjectComponent* object = local_scene.objects.GetComponent(entity);
+        if (object == nullptr)
+            continue;
+        const uint32_t samples = std::min(object->lightmapIterationCount, lightmap_bake_settings.sample_count);
+        minimum_samples = std::min(minimum_samples, samples);
+        maximum_samples = std::max(maximum_samples, samples);
+    }
+    if (lightmap_bake_active.empty())
+        minimum_samples = lightmap_bake_pending_save.empty() ? 0u : lightmap_bake_settings.sample_count;
+
+    const wi::graphics::GraphicsDevice::MemoryUsage memory = wi::graphics::GetDevice()->GetMemoryUsage();
+    lightmap_bake_status =
+        "Lightmap: " + std::to_string(lightmap_bake_completed.size()) + "/" +
+        std::to_string(lightmap_bake_queue.size()) +
+        " active=" + std::to_string(lightmap_bake_active.size()) +
+        " pending=" + std::to_string(lightmap_bake_pending_save.size()) +
+        " samples=" + std::to_string(minimum_samples) +
+        (maximum_samples > minimum_samples ? "-" + std::to_string(maximum_samples) : std::string{}) +
+        "/" + std::to_string(lightmap_bake_settings.sample_count) +
+        " iter/frame=" + std::to_string(lightmap_bake_effective_iterations_per_frame) +
+        " rate=" + std::to_string(static_cast<uint32_t>(std::round(lightmap_bake_samples_per_second))) + " samples/s" +
+        " VRAM=" + std::to_string(memory.usage / (1024ull * 1024ull)) + "/" +
+            std::to_string(memory.budget / (1024ull * 1024ull)) + "MB";
+}
+
+void NewPipelineClientRenderPath::ClearLightmapBakeRequests(bool clear_lightmaps)
+{
+    const auto clear_entities = [&](const wi::vector<wi::ecs::Entity>& entities) {
+        for (const wi::ecs::Entity entity : entities)
+        {
+            if (wi::scene::ObjectComponent* object = local_scene.objects.GetComponent(entity))
+            {
+                if (clear_lightmaps)
+                    object->ClearLightmap();
+                else
+                    object->SetLightmapRenderRequest(false);
+            }
+        }
+    };
+    clear_entities(lightmap_bake_active);
+    clear_entities(lightmap_bake_pending_save);
+}
+
+void NewPipelineClientRenderPath::ResetLightmapBakeScheduling()
+{
+    setLightmapRefreshIterationsPerFrame(1);
+    lightmap_bake_active.clear();
+    lightmap_bake_pending_save.clear();
+    lightmap_bake_iterations_per_frame = 1;
+    lightmap_bake_effective_iterations_per_frame = 1;
+    lightmap_bake_adaptation_frames = 0;
+    lightmap_bake_scheduled_active_texels = 0;
+    lightmap_bake_last_progress_time_usec = 0;
+    lightmap_bake_last_progress_sample_total = 0;
+    lightmap_bake_frame_time_ema = 0.0f;
+    lightmap_bake_samples_per_second = 0.0f;
+    lightmap_bake_rate_time_usec = 0;
+    lightmap_bake_rate_sample_total = 0;
+}
+
+void NewPipelineClientRenderPath::UpdateLightmapBake(float dt)
+{
+    if (!IsLightmapBakeActive())
+        return;
+    if (lightmap_cancel_requested)
+    {
+        const bool was_diagnostic = lightmap_diagnostic_session_active;
+        ClearLightmapBakeRequests(true);
+        wi::renderer::SetRaytraceBounceCount(previous_raytrace_bounce_count);
+        ResetLightmapBakeScheduling();
+        CleanupLightmapBakeTemps();
+        ReloadSceneAfterLightmapBakeAbort();
+        std::string source_error;
+        const bool source_unchanged = VerifySourceSceneUnchanged(source_error);
+        LogLightmapSceneParity("cancelled");
+        lightmap_bake_state = LightmapBakeState::Cancelled;
+        lightmap_bake_status = source_unchanged
+            ? "Lightmap: cancelled; source and previous sidecars preserved"
+            : "Lightmap: cancelled; previous sidecars preserved, but " + source_error;
+        static_lighting_bake_requested = false;
+        lightmap_cancel_requested = false;
+        wi::backlog::post(lightmap_bake_status);
+        if (was_diagnostic)
+            EndLightmapDiagnosticSession("Diagnostic: discarded; production lightmaps restored (repick target)");
+        return;
+    }
+    if (lightmap_bake_state == LightmapBakeState::DiagnosticCompressed)
+        return;
+    if (lightmap_bake_state == LightmapBakeState::DiagnosticPaused)
+    {
+        if (!lightmap_diagnostic_resume_requested)
+            return;
+        lightmap_diagnostic_resume_requested = false;
+        if (!FinalizeOnePendingLightmap())
+            return;
+        wi::renderer::SetRaytraceBounceCount(previous_raytrace_bounce_count);
+        ResetLightmapBakeScheduling();
+        CleanupLightmapBakeTemps();
+        render_settings.lightmap_bake_requested = false;
+        lightmap_bake_state = LightmapBakeState::DiagnosticCompressed;
+        lightmap_bake_status = "Lightmap diagnostic: temporary SaveLightmap result ready; Discard restores production package";
+        lightmap_diagnostic_status = "Diagnostic: SaveLightmap/OIDN+BC6H result ready in Local Lightmap Raw; "
+            "compare with the paused R16F capture, then Discard";
+        wi::backlog::post(lightmap_diagnostic_status);
+        return;
+    }
+    if (lightmap_bake_state == LightmapBakeState::Preparing)
+    {
+        PrepareLightmapBake();
+        return;
+    }
+    if (lightmap_bake_state != LightmapBakeState::Baking)
+        return;
+
+    for (size_t i = 0; i < lightmap_bake_active.size();)
+    {
+        const wi::ecs::Entity entity = lightmap_bake_active[i];
+        wi::scene::ObjectComponent* object = local_scene.objects.GetComponent(entity);
+        if (object == nullptr)
+        {
+            FailLightmapBake("active lightmap object disappeared: " + std::to_string(entity));
+            return;
+        }
+        if (object->lightmapIterationCount >= lightmap_bake_settings.sample_count)
+        {
+            object->SetLightmapRenderRequest(false);
+            lightmap_bake_pending_save.push_back(entity);
+            lightmap_bake_active.erase(lightmap_bake_active.begin() + i);
+            continue;
+        }
+        ++i;
+    }
+
+    if (lightmap_diagnostic_session_active &&
+        lightmap_diagnostic_settings.pause_before_save &&
+        !lightmap_bake_pending_save.empty())
+    {
+        setLightmapRefreshIterationsPerFrame(1);
+        wi::renderer::SetRaytraceBounceCount(previous_raytrace_bounce_count);
+        lightmap_bake_state = LightmapBakeState::DiagnosticPaused;
+        lightmap_bake_status = "Lightmap diagnostic: paused before SaveLightmap (live R16F Raw)";
+        lightmap_diagnostic_status = "Diagnostic: live R16F result ready in Local Lightmap Raw; atlas=" +
+            std::string{lightmap_diagnostic_atlas_audit.HasStructuralFailure() ? "FAIL" : "PASS"} +
+            " overlaps=" + std::to_string(lightmap_diagnostic_atlas_audit.overlapping_triangle_pair_count) +
+            " degenerate=" + std::to_string(lightmap_diagnostic_atlas_audit.degenerate_triangle_count) +
+            "; capture it, then Resume Save or Discard";
+        SetDebugPreviewMode(DebugPreviewMode::LocalLightmapRaw);
+        wi::backlog::post(lightmap_diagnostic_status);
+        return;
+    }
+
+    // SaveLightmap performs a synchronous GPU readback and BC6H readback. Keep
+    // it to one object per update while the next active batch keeps sampling.
+    if (!FinalizeOnePendingLightmap())
+        return;
+
+    if (lightmap_diagnostic_session_active &&
+        lightmap_bake_active.empty() && lightmap_bake_pending_save.empty() &&
+        lightmap_bake_next_index >= lightmap_bake_queue.size())
+    {
+        wi::renderer::SetRaytraceBounceCount(previous_raytrace_bounce_count);
+        ResetLightmapBakeScheduling();
+        CleanupLightmapBakeTemps();
+        render_settings.lightmap_bake_requested = false;
+        lightmap_bake_state = LightmapBakeState::DiagnosticCompressed;
+        lightmap_bake_status = "Lightmap diagnostic: temporary SaveLightmap result ready; Discard restores production package";
+        lightmap_diagnostic_status = "Diagnostic: SaveLightmap/OIDN+BC6H result ready in Local Lightmap Raw; Discard when captured";
+        SetDebugPreviewMode(DebugPreviewMode::LocalLightmapRaw);
+        wi::backlog::post(lightmap_diagnostic_status);
+        return;
+    }
+
+    FillLightmapBakeBatch();
+    if (lightmap_bake_active.empty() && lightmap_bake_pending_save.empty() &&
+        lightmap_bake_next_index >= lightmap_bake_queue.size())
+    {
+        FinishLightmapBake();
+        return;
+    }
+
+    const uint64_t progress_now = NowUsec();
+    const uint64_t progress_samples = GetLightmapBakeTotalSamples();
+    if (lightmap_bake_last_progress_time_usec == 0 ||
+        progress_samples > lightmap_bake_last_progress_sample_total)
+    {
+        lightmap_bake_last_progress_time_usec = progress_now;
+        lightmap_bake_last_progress_sample_total = progress_samples;
+    }
+    else if (!lightmap_bake_active.empty() &&
+        progress_now - lightmap_bake_last_progress_time_usec > kLightmapNoProgressTimeoutUsec)
+    {
+        FailLightmapBake("GPU lightmap work made no progress for 30 seconds; check texture allocation and ray tracing support");
+        return;
+    }
+
+    UpdateLightmapBakeWorkload(dt);
+    UpdateLightmapBakeProgress();
 }
 
 bool NewPipelineClientRenderPath::CommitLightmapBakeFiles(std::string& error)
@@ -1626,6 +2363,7 @@ bool NewPipelineClientRenderPath::VerifySourceSceneUnchanged(std::string& error)
 
 void NewPipelineClientRenderPath::FinishLightmapBake()
 {
+    ResetLightmapBakeScheduling();
     lightmap_bake_state = LightmapBakeState::Saving;
     lightmap_bake_status = "Lightmap: saving external package";
     const float reciprocal_valid = lightmap_valid_texel_count > 0
@@ -1636,6 +2374,7 @@ void NewPipelineClientRenderPath::FinishLightmapBake()
     wi::backlog::post(
         "Client lightmap irradiance statistics: valid_texels=" + std::to_string(lightmap_valid_texel_count) +
         " missing_texels=" + std::to_string(lightmap_missing_texel_count) +
+        " invalid_texels=" + std::to_string(lightmap_invalid_texel_count) +
         " min=" + std::to_string(lightmap_irradiance_min.x) + "," +
             std::to_string(lightmap_irradiance_min.y) + "," + std::to_string(lightmap_irradiance_min.z) +
         " average=" + std::to_string(lightmap_irradiance_sum.x * reciprocal_valid) + "," +
@@ -1702,7 +2441,7 @@ void NewPipelineClientRenderPath::FinishLightmapBake()
         wi::backlog::post("Client lightmap package diagnostics: save_failures=0 load_failures=1");
         wi::renderer::SetRaytraceBounceCount(previous_raytrace_bounce_count);
         render_settings.lightmap_bake_requested = false;
-        active_lightmap_bake_entity = wi::ecs::INVALID_ENTITY;
+        ResetLightmapBakeScheduling();
         lightmap_bake_state = LightmapBakeState::Failed;
         lightmap_bake_status = "Lightmap: committed but reload verification failed - " + load_result.diagnostic;
         client_static_lighting.SetLightmapStatus(ClientLightingAssetState::Corrupt, lightmap_bake_status);
@@ -1720,7 +2459,7 @@ void NewPipelineClientRenderPath::FinishLightmapBake()
     {
         wi::renderer::SetRaytraceBounceCount(previous_raytrace_bounce_count);
         render_settings.lightmap_bake_requested = false;
-        active_lightmap_bake_entity = wi::ecs::INVALID_ENTITY;
+        ResetLightmapBakeScheduling();
         lightmap_bake_state = LightmapBakeState::Failed;
         lightmap_bake_status = "Lightmap: sidecars committed but " + error;
         client_static_lighting.SetLightmapStatus(ClientLightingAssetState::Stale, lightmap_bake_status);
@@ -1765,22 +2504,33 @@ void NewPipelineClientRenderPath::FinishLightmapBake()
 
 void NewPipelineClientRenderPath::FailLightmapBake(const std::string& reason)
 {
-    if (wi::scene::ObjectComponent* object = local_scene.objects.GetComponent(active_lightmap_bake_entity))
-        object->SetLightmapRenderRequest(false);
+    const bool was_diagnostic = lightmap_diagnostic_session_active;
+    ClearLightmapBakeRequests(true);
     wi::renderer::SetRaytraceBounceCount(previous_raytrace_bounce_count);
+    ResetLightmapBakeScheduling();
     CleanupLightmapBakeTemps();
     ReloadSceneAfterLightmapBakeAbort();
     std::string source_error;
     const bool source_unchanged = VerifySourceSceneUnchanged(source_error);
     LogLightmapSceneParity("failed");
     render_settings.lightmap_bake_requested = false;
-    active_lightmap_bake_entity = wi::ecs::INVALID_ENTITY;
     lightmap_bake_state = LightmapBakeState::Failed;
     lightmap_bake_status = "Lightmap: failed - " + reason;
     if (!source_unchanged)
         lightmap_bake_status += "; " + source_error;
     static_lighting_bake_requested = false;
     wi::backlog::post(lightmap_bake_status);
+    if (was_diagnostic)
+        EndLightmapDiagnosticSession("Diagnostic failed: " + reason + " (repick target)");
+}
+
+void NewPipelineClientRenderPath::EndLightmapDiagnosticSession(const std::string& status)
+{
+    lightmap_bake_settings = lightmap_bake_settings_before_diagnostic;
+    lightmap_diagnostic_session_active = false;
+    lightmap_diagnostic_resume_requested = false;
+    lightmap_diagnostic_entity = wi::ecs::INVALID_ENTITY;
+    lightmap_diagnostic_status = status;
 }
 
 void NewPipelineClientRenderPath::CleanupLightmapBakeTemps()
@@ -2021,6 +2771,10 @@ bool NewPipelineClientRenderPath::UploadRemoteTextures(const RemoteRawFrame& fra
         wi::graphics::CreateTextureSubresourceDatas(desc, texture_data, subresources);
         if (!wi::graphics::GetDevice()->CreateTexture(&desc, subresources.data(), &uploaded[index]))
             return false;
+        ++remote_texture_creation_count;
+        remote_gpu_upload_bytes += hdr
+            ? buffer.payload_rgba16f.size() * sizeof(uint16_t)
+            : buffer.payload_rgba8.size();
         const std::string name = std::string{"newpipeline.client."} + ToString(buffer.semantic) +
             (hdr ? ".rgba16f" : ".rgba8");
         wi::graphics::GetDevice()->SetName(&uploaded[index], name.c_str());
@@ -2029,6 +2783,152 @@ bool NewPipelineClientRenderPath::UploadRemoteTextures(const RemoteRawFrame& fra
     if ((uploaded_mask & static_cast<uint32_t>(RemoteBufferKind::IndirectDiffuse)) == 0)
         return false;
     accepted_remote_textures = std::move(uploaded);
+    accepted_remote_buffer_mask = uploaded_mask;
+    return true;
+}
+
+bool NewPipelineClientRenderPath::UploadRemoteVideoTextures(
+    const RetainedI420Frame& frame, const RemoteVideoFrameLayout& layout)
+{
+    if (!frame.IsValid() || !layout.metadata.valid ||
+        frame.width != layout.video_width || frame.height != layout.video_height)
+        return false;
+
+    wi::graphics::GraphicsDevice* device = wi::graphics::GetDevice();
+    RemoteVideoUploadSlot& slot = remote_video_upload_ring[device->GetBufferIndex()];
+    if (slot.width != frame.width || slot.height != frame.height ||
+        !slot.upload_y.IsValid() || !slot.upload_uv.IsValid() || !slot.gpu_y.IsValid() || !slot.gpu_uv.IsValid())
+    {
+        slot = {};
+        wi::graphics::TextureDesc y_desc;
+        y_desc.width = frame.width;
+        y_desc.height = frame.height;
+        y_desc.format = wi::graphics::Format::R8_UNORM;
+        y_desc.usage = wi::graphics::Usage::UPLOAD;
+        y_desc.bind_flags = wi::graphics::BindFlag::NONE;
+        y_desc.layout = wi::graphics::ResourceState::COPY_SRC;
+        if (!device->CreateTexture(&y_desc, nullptr, &slot.upload_y))
+            return false;
+        y_desc.usage = wi::graphics::Usage::DEFAULT;
+        y_desc.bind_flags = wi::graphics::BindFlag::SHADER_RESOURCE;
+        y_desc.layout = wi::graphics::ResourceState::SHADER_RESOURCE_COMPUTE;
+        if (!device->CreateTexture(&y_desc, nullptr, &slot.gpu_y))
+            return false;
+
+        wi::graphics::TextureDesc uv_desc;
+        uv_desc.width = frame.width / 2u;
+        uv_desc.height = frame.height / 2u;
+        uv_desc.format = wi::graphics::Format::R8G8_UNORM;
+        uv_desc.usage = wi::graphics::Usage::UPLOAD;
+        uv_desc.bind_flags = wi::graphics::BindFlag::NONE;
+        uv_desc.layout = wi::graphics::ResourceState::COPY_SRC;
+        if (!device->CreateTexture(&uv_desc, nullptr, &slot.upload_uv))
+            return false;
+        uv_desc.usage = wi::graphics::Usage::DEFAULT;
+        uv_desc.bind_flags = wi::graphics::BindFlag::SHADER_RESOURCE;
+        uv_desc.layout = wi::graphics::ResourceState::SHADER_RESOURCE_COMPUTE;
+        if (!device->CreateTexture(&uv_desc, nullptr, &slot.gpu_uv))
+            return false;
+
+        slot.width = frame.width;
+        slot.height = frame.height;
+        device->SetName(&slot.upload_y, "newpipeline.client.remote.upload_y");
+        device->SetName(&slot.upload_uv, "newpipeline.client.remote.upload_uv");
+        device->SetName(&slot.gpu_y, "newpipeline.client.remote.gpu_y");
+        device->SetName(&slot.gpu_uv, "newpipeline.client.remote.gpu_uv");
+    }
+
+    if (slot.upload_y.mapped_subresources == nullptr || slot.upload_y.mapped_subresource_count == 0 ||
+        slot.upload_uv.mapped_subresources == nullptr || slot.upload_uv.mapped_subresource_count == 0)
+        return false;
+    const wi::graphics::SubresourceData& upload_y = slot.upload_y.mapped_subresources[0];
+    const wi::graphics::SubresourceData& upload_uv = slot.upload_uv.mapped_subresources[0];
+    for (uint32_t row = 0; row < frame.height; ++row)
+    {
+        std::memcpy(static_cast<uint8_t*>(const_cast<void*>(upload_y.data_ptr)) +
+                static_cast<size_t>(row) * upload_y.row_pitch,
+            frame.y_plane + static_cast<size_t>(row) * frame.y_stride, frame.width);
+    }
+    for (uint32_t row = 0; row < frame.height / 2u; ++row)
+    {
+        uint8_t* destination = static_cast<uint8_t*>(const_cast<void*>(upload_uv.data_ptr)) +
+            static_cast<size_t>(row) * upload_uv.row_pitch;
+        const uint8_t* source_u = frame.u_plane + static_cast<size_t>(row) * frame.u_stride;
+        const uint8_t* source_v = frame.v_plane + static_cast<size_t>(row) * frame.v_stride;
+        for (uint32_t x = 0; x < frame.width / 2u; ++x)
+        {
+            destination[x * 2u + 0u] = source_u[x];
+            destination[x * 2u + 1u] = source_v[x];
+        }
+    }
+    remote_gpu_upload_bytes += static_cast<uint64_t>(frame.width) * frame.height * 3u / 2u;
+
+    uint32_t uploaded_mask = 0;
+    for (size_t index = 0; index < layout.tiles.size(); ++index)
+    {
+        const RemoteVideoTileLayout& tile = layout.tiles[index];
+        if (!tile.available)
+            continue;
+        const bool hdr = tile.encoding == RemoteBufferEncoding::LogHDR16F;
+        const wi::graphics::Format format = hdr
+            ? wi::graphics::Format::R16G16B16A16_FLOAT
+            : wi::graphics::Format::R8G8B8A8_UNORM;
+        wi::graphics::Texture& output = slot.semantic_outputs[index];
+        if (!output.IsValid() || output.GetDesc().width != tile.width ||
+            output.GetDesc().height != tile.height || output.GetDesc().format != format)
+        {
+            wi::graphics::TextureDesc desc;
+            desc.width = tile.width;
+            desc.height = tile.height;
+            desc.format = format;
+            desc.bind_flags = wi::graphics::BindFlag::SHADER_RESOURCE | wi::graphics::BindFlag::UNORDERED_ACCESS;
+            desc.layout = wi::graphics::ResourceState::SHADER_RESOURCE_COMPUTE;
+            output = {};
+            if (!device->CreateTexture(&desc, nullptr, &output))
+                return false;
+            const std::string name = std::string{"newpipeline.client."} + ToString(tile.semantic) +
+                (hdr ? ".gpu.rgba16f" : ".gpu.rgba8");
+            device->SetName(&output, name.c_str());
+            ++remote_texture_creation_count;
+        }
+        uploaded_mask |= RemoteBufferKindMask(tile.semantic);
+    }
+    if ((uploaded_mask & static_cast<uint32_t>(RemoteBufferKind::IndirectDiffuse)) == 0)
+        return false;
+
+    wi::graphics::CommandList cmd = device->BeginCommandList();
+    wi::graphics::GPUBarrier copy_barriers[] = {
+        wi::graphics::GPUBarrier::Image(
+            &slot.gpu_y, slot.gpu_y.GetDesc().layout, wi::graphics::ResourceState::COPY_DST),
+        wi::graphics::GPUBarrier::Image(
+            &slot.gpu_uv, slot.gpu_uv.GetDesc().layout, wi::graphics::ResourceState::COPY_DST),
+    };
+    device->Barrier(copy_barriers, arraysize(copy_barriers), cmd);
+    device->CopyResource(&slot.gpu_y, &slot.upload_y, cmd);
+    device->CopyResource(&slot.gpu_uv, &slot.upload_uv, cmd);
+    for (wi::graphics::GPUBarrier& barrier : copy_barriers)
+        std::swap(barrier.image.layout_before, barrier.image.layout_after);
+    device->Barrier(copy_barriers, arraysize(copy_barriers), cmd);
+
+    for (size_t index = 0; index < layout.tiles.size(); ++index)
+    {
+        const RemoteVideoTileLayout& tile = layout.tiles[index];
+        if (!tile.available)
+            continue;
+        wi::renderer::YUV_to_RGB_Region(
+            slot.gpu_y,
+            slot.gpu_uv,
+            slot.semantic_outputs[index],
+            XMUINT2(tile.origin_x, tile.origin_y),
+            tile.encoding == RemoteBufferEncoding::ScalarLuma8,
+            tile.encoding == RemoteBufferEncoding::LogHDR16F ? 16.0f : 0.0f,
+            cmd);
+    }
+    device->SubmitCommandLists();
+    // Publish a retained handle set only after the upload and unpack commands
+    // have been submitted.  Each buffered-frame slot owns its outputs, so they
+    // cannot be overwritten until Wicked has waited for that slot's GPU fence.
+    accepted_remote_textures = slot.semantic_outputs;
     accepted_remote_buffer_mask = uploaded_mask;
     return true;
 }
@@ -2098,6 +2998,64 @@ bool NewPipelineClientRenderPath::ValidateRemoteFrame(const RemoteRawFrame& fram
     return true;
 }
 
+bool NewPipelineClientRenderPath::ValidateRemoteVideoLayout(
+    const RemoteVideoFrameLayout& layout, std::string& reason) const
+{
+    const RemoteFrameMetadata& metadata = layout.metadata;
+    if (metadata.source_stream_id != kRemoteFrameStreamId)
+    {
+        reason = "unexpected stream id";
+        return false;
+    }
+    if (!metadata.valid || metadata.width == 0 || metadata.height == 0)
+    {
+        reason = "metadata invalid or empty resolution";
+        return false;
+    }
+    if (metadata.dynamic_range != RemoteDynamicRange::HDR)
+    {
+        reason = "unexpected dynamic range";
+        return false;
+    }
+    if ((metadata.continuity_mask & static_cast<uint32_t>(RemoteBufferKind::IndirectDiffuse)) == 0)
+    {
+        reason = "missing GI continuity bit";
+        return false;
+    }
+    const uint64_t now = NowUsec();
+    if (metadata.local_receive_timestamp_usec == 0 ||
+        metadata.local_receive_timestamp_usec + kMaxRemoteFrameAgeUsec < now)
+    {
+        reason = "stale locally received video frame";
+        return false;
+    }
+    const RemoteVideoTileLayout& indirect =
+        layout.tiles[static_cast<size_t>(RemoteBufferSemantic::RemoteIndirectDiffuse)];
+    if (!indirect.available || indirect.width == 0 || indirect.height == 0)
+    {
+        reason = "missing indirect diffuse video tile";
+        return false;
+    }
+    for (const RemoteVideoTileLayout& tile : layout.tiles)
+    {
+        if (!tile.available)
+            continue;
+        if (tile.width == 0 || tile.height == 0 ||
+            tile.origin_x + tile.width > layout.video_width ||
+            tile.origin_y + tile.height > layout.video_height)
+        {
+            reason = std::string{"invalid video tile for "} + ToString(tile.semantic);
+            return false;
+        }
+    }
+    if (metadata.confidence < 0.5f)
+    {
+        reason = "placeholder confidence";
+        return false;
+    }
+    return true;
+}
+
 void NewPipelineClientRenderPath::InvalidateRemote(const std::string& reason)
 {
     if (remote_consume.accepted_valid || remote_consume.fallback_reason != reason)
@@ -2117,7 +3075,23 @@ void NewPipelineClientRenderPath::AcceptRemoteFrame(const RemoteRawFrame& frame)
         return;
     }
 
-    const RemoteFrameMetadata& metadata = frame.metadata;
+    CommitAcceptedRemoteMetadata(frame.metadata);
+}
+
+void NewPipelineClientRenderPath::AcceptRemoteVideoFrame(
+    const RetainedI420Frame& frame, const RemoteVideoFrameLayout& layout)
+{
+    if (!UploadRemoteVideoTextures(frame, layout))
+    {
+        InvalidateRemote("GPU video upload/unpack failed");
+        return;
+    }
+    CommitAcceptedRemoteMetadata(layout.metadata);
+}
+
+void NewPipelineClientRenderPath::CommitAcceptedRemoteMetadata(const RemoteFrameMetadata& metadata)
+{
+
     if (remote_consume.accepted_valid && remote_consume.accepted_generation == metadata.source_generation)
     {
         remote_consume.history_frame_id = remote_consume.accepted_frame_id;
@@ -2155,15 +3129,24 @@ void NewPipelineClientRenderPath::AcquireRemoteVideoFrame(float dt)
     {
         wi::backlog::post(config.remote_source == RemoteSourceMode::Mock
             ? "Client mock packed-video acquire active: " + mock_remote_mailbox.GetRootDirectory()
-            : "Client WebRTC video-track acquire active: frame pixels and metadata are video-only");
+            : "Client WebRTC video acquire active: retained I420 plus paired np.frame_meta validation");
         remote_acquire_logged = true;
     }
 
+    const bool gpu_video_path = config.remote_source == RemoteSourceMode::WebRTC;
     RemoteRawFrame frame;
+    RetainedI420Frame retained_frame;
+    RemoteVideoFrameLayout video_layout;
     std::string error;
-    const bool received = config.remote_source == RemoteSourceMode::Mock
-        ? mock_remote_mailbox.TryReadLatest(frame, &error)
-        : webrtc_transport.TryReceiveFrame(frame);
+    bool received = false;
+    if (gpu_video_path)
+    {
+        received = webrtc_transport.TryAcquireI420Frame(retained_frame);
+    }
+    else
+    {
+        received = mock_remote_mailbox.TryReadLatest(frame, &error);
+    }
     if (!received)
     {
         if (!error.empty())
@@ -2193,9 +3176,69 @@ void NewPipelineClientRenderPath::AcquireRemoteVideoFrame(float dt)
         return;
     }
 
-    const bool same_latest =
-        frame.metadata.frame_id == remote_consume.latest_frame_id &&
-        frame.metadata.source_generation == remote_consume.latest_generation;
+    if (gpu_video_path)
+    {
+        auto match = std::find_if(downstream_metadata_cache.begin(), downstream_metadata_cache.end(),
+            [&retained_frame](const RemoteVideoFrameLayout& candidate) {
+                return candidate.metadata.timestamp_usec == retained_frame.timestamp_usec;
+            });
+        if (match == downstream_metadata_cache.end())
+        {
+            ++downstream_metadata_misses;
+            if (downstream_metadata_active)
+            {
+                // The unordered metadata channel can legitimately lose a
+                // packet. Drop only this decoded frame and retain the previous
+                // accepted lighting until its normal stale timeout.
+                if (remote_consume.accepted_valid)
+                    remote_consume.stale_timer += dt;
+                return;
+            }
+            // Transitional compatibility before the first np.frame_meta
+            // packet arrives: recover identity from the legacy pixel band.
+            if (!DecodeRemoteVideoFrameLayout(retained_frame, video_layout, &error))
+            {
+                InvalidateRemote(error.empty() ? "legacy video metadata decode failed" : error);
+                return;
+            }
+        }
+        else
+        {
+            RemoteVideoFrameLayout pixel_layout;
+            bool agrees = DecodeRemoteVideoFrameLayout(retained_frame, pixel_layout, &error) &&
+                match->video_width == pixel_layout.video_width &&
+                match->video_height == pixel_layout.video_height &&
+                match->metadata.frame_id == pixel_layout.metadata.frame_id &&
+                match->metadata.source_generation == pixel_layout.metadata.source_generation &&
+                match->metadata.timestamp_usec == pixel_layout.metadata.timestamp_usec &&
+                match->metadata.available_buffer_mask == pixel_layout.metadata.available_buffer_mask &&
+                match->metadata.continuity_mask == pixel_layout.metadata.continuity_mask;
+            for (size_t index = 0; agrees && index < pixel_layout.tiles.size(); ++index)
+            {
+                const RemoteVideoTileLayout& pixel = pixel_layout.tiles[index];
+                const RemoteVideoTileLayout& channel = match->tiles[index];
+                agrees = pixel.semantic == channel.semantic && pixel.width == channel.width &&
+                    pixel.height == channel.height && pixel.origin_x == channel.origin_x &&
+                    pixel.origin_y == channel.origin_y && pixel.available == channel.available &&
+                    pixel.encoding == channel.encoding;
+            }
+            if (!agrees)
+            {
+                ++downstream_metadata_mismatches;
+                downstream_metadata_cache.erase(match);
+                InvalidateRemote("pixel-band/frame-metadata mismatch");
+                return;
+            }
+            ++downstream_metadata_matches;
+            video_layout = *match;
+            video_layout.metadata.local_receive_timestamp_usec = NowUsec();
+            downstream_metadata_cache.erase(downstream_metadata_cache.begin(), std::next(match));
+        }
+    }
+
+    const RemoteFrameMetadata& metadata = gpu_video_path ? video_layout.metadata : frame.metadata;
+    const bool same_latest = metadata.frame_id == remote_consume.latest_frame_id &&
+        metadata.source_generation == remote_consume.latest_generation;
     if (same_latest)
     {
         if (!remote_unchanged_skip_logged)
@@ -2215,56 +3258,69 @@ void NewPipelineClientRenderPath::AcquireRemoteVideoFrame(float dt)
         return;
     }
 
-    if (remote_consume.latest_generation == frame.metadata.source_generation &&
-        remote_consume.latest_frame_id != 0 && frame.metadata.frame_id <= remote_consume.latest_frame_id)
+    if (remote_consume.latest_generation == metadata.source_generation &&
+        remote_consume.latest_frame_id != 0 && metadata.frame_id <= remote_consume.latest_frame_id)
     {
         InvalidateRemote("out-of-order remote video frame");
         return;
     }
 
     const bool generation_reset =
-        frame.metadata.reset_this_frame ||
-        (remote_consume.latest_generation != 0 && frame.metadata.source_generation != remote_consume.latest_generation);
+        metadata.reset_this_frame ||
+        (remote_consume.latest_generation != 0 && metadata.source_generation != remote_consume.latest_generation);
     if (generation_reset)
     {
         remote_consume.history_frame_id = 0;
         remote_consume.history_valid = false;
         remote_consume.accepted_valid = false;
         wi::backlog::post("Client remote generation reset: generation " +
-            std::to_string(frame.metadata.source_generation) +
-            " frame " + std::to_string(frame.metadata.frame_id));
+            std::to_string(metadata.source_generation) +
+            " frame " + std::to_string(metadata.frame_id));
     }
 
-    remote_consume.latest_frame_id = frame.metadata.frame_id;
-    remote_consume.latest_generation = frame.metadata.source_generation;
+    remote_consume.latest_frame_id = metadata.frame_id;
+    remote_consume.latest_generation = metadata.source_generation;
     remote_consume.stale_timer = 0.0f;
     remote_consume.no_remote_logged = false;
 
     std::string validation_reason;
     if (!remote_payload_read_logged)
     {
-        size_t payload_bytes = 0;
-        for (const RemoteRawBuffer& buffer : frame.buffers)
-            payload_bytes += buffer.payload_rgba8.size() + buffer.payload_rgba16f.size() * sizeof(uint16_t);
-        wi::backlog::post(std::string{config.remote_source == RemoteSourceMode::Mock
-                ? "Client mock packed-video frame decoded: "
-                : "Client WebRTC video-track frame decoded: "} +
-            std::to_string(payload_bytes) + " RGBA bytes");
+        if (gpu_video_path)
+        {
+            const uint64_t i420_bytes = static_cast<uint64_t>(retained_frame.width) * retained_frame.height * 3u / 2u;
+            wi::backlog::post("Client WebRTC retained I420 frame: " + std::to_string(i420_bytes) +
+                " bytes, zero bridge copy, GPU semantic unpack");
+        }
+        else
+        {
+            size_t payload_bytes = 0;
+            for (const RemoteRawBuffer& buffer : frame.buffers)
+                payload_bytes += buffer.payload_rgba8.size() + buffer.payload_rgba16f.size() * sizeof(uint16_t);
+            wi::backlog::post("Client mock packed-video frame decoded: " +
+                std::to_string(payload_bytes) + " RGBA bytes");
+        }
         remote_payload_read_logged = true;
     }
 
-    if (!ValidateRemoteFrame(frame, validation_reason))
+    const bool valid = gpu_video_path
+        ? ValidateRemoteVideoLayout(video_layout, validation_reason)
+        : ValidateRemoteFrame(frame, validation_reason);
+    if (!valid)
     {
         remote_consume.placeholder = validation_reason == "placeholder confidence";
-        remote_consume.confidence = frame.metadata.confidence;
-        wi::backlog::post("Client remote rejected payload frame " + std::to_string(frame.metadata.frame_id) +
+        remote_consume.confidence = metadata.confidence;
+        wi::backlog::post("Client remote rejected payload frame " + std::to_string(metadata.frame_id) +
             ": " + validation_reason);
         InvalidateRemote(validation_reason);
         return;
     }
 
     remote_consume.placeholder_logged = false;
-    AcceptRemoteFrame(frame);
+    if (gpu_video_path)
+        AcceptRemoteVideoFrame(retained_frame, video_layout);
+    else
+        AcceptRemoteFrame(frame);
 }
 
 const wi::graphics::Texture* NewPipelineClientRenderPath::GetDebugPreviewTexture() const
@@ -2281,6 +3337,10 @@ const wi::graphics::Texture* NewPipelineClientRenderPath::GetDebugPreviewTexture
         return local_lightmap_irradiance.IsValid() ? &local_lightmap_irradiance : nullptr;
     case DebugPreviewMode::LocalLightmapValidity:
         return local_lightmap_validity.IsValid() ? &local_lightmap_validity : nullptr;
+    case DebugPreviewMode::LocalLightmapCoverage:
+        return local_lightmap_coverage.IsValid() ? &local_lightmap_coverage : nullptr;
+    case DebugPreviewMode::LocalLightmapRaw:
+        return local_lightmap_raw.IsValid() ? &local_lightmap_raw : nullptr;
     case DebugPreviewMode::LocalIndirectFinalInput:
         return local_indirect_final_input.IsValid() ? &local_indirect_final_input : nullptr;
     case DebugPreviewMode::LocalAO:
@@ -2385,6 +3445,7 @@ void NewPipelineClientRenderPath::Compose(wi::graphics::CommandList cmd) const
         else if (debug_preview_mode == DebugPreviewMode::GBufferRoughness)
             fx.color = XMFLOAT4(0.0f, 0.0f, 4.0f, 1.0f);
         else if (debug_preview_mode == DebugPreviewMode::LocalIndirectDiffuse ||
+            debug_preview_mode == DebugPreviewMode::LocalLightmapRaw ||
             debug_preview_mode == DebugPreviewMode::LocalIndirectFinalInput ||
             debug_preview_mode == DebugPreviewMode::LocalSpecularIndirect ||
             debug_preview_mode == DebugPreviewMode::LocalReflectionProbe ||

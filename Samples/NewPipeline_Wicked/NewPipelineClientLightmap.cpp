@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <iomanip>
 #include <limits>
+#include <numeric>
 #include <random>
 #include <sstream>
 #include <type_traits>
@@ -103,9 +104,381 @@ struct PackageEntry
     uint64_t offset = 0;
     uint64_t size = 0;
     uint32_t crc = 0;
+    uint64_t coverage_offset = 0;
+    uint64_t coverage_size = 0;
+    uint32_t coverage_crc = 0;
     const wi::vector<uint8_t>* payload = nullptr;
+    const wi::vector<uint8_t>* coverage_payload = nullptr;
+};
+
+struct AtlasPoint
+{
+    float x = 0;
+    float y = 0;
+};
+
+struct AtlasTriangle
+{
+    AtlasPoint points[3];
+    uint32_t indices[3] = {};
+    float pixel_area = 0;
+    float world_area = 0;
+    bool valid = false;
+};
+
+float Cross2D(const AtlasPoint& a, const AtlasPoint& b, const AtlasPoint& c)
+{
+    return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+}
+
+bool SharesVertex(const AtlasTriangle& a, const AtlasTriangle& b)
+{
+    for (uint32_t ai : a.indices)
+    {
+        for (uint32_t bi : b.indices)
+        {
+            if (ai == bi)
+                return true;
+        }
+    }
+    return false;
+}
+
+bool HasStrictProjectionOverlap(
+    const AtlasTriangle& a,
+    const AtlasTriangle& b,
+    float axis_x,
+    float axis_y)
+{
+    const float axis_length_sq = axis_x * axis_x + axis_y * axis_y;
+    if (axis_length_sq <= 1e-10f)
+        return true;
+
+    float a_min = std::numeric_limits<float>::max();
+    float a_max = -std::numeric_limits<float>::max();
+    float b_min = std::numeric_limits<float>::max();
+    float b_max = -std::numeric_limits<float>::max();
+    for (const AtlasPoint& point : a.points)
+    {
+        const float projection = point.x * axis_x + point.y * axis_y;
+        a_min = std::min(a_min, projection);
+        a_max = std::max(a_max, projection);
+    }
+    for (const AtlasPoint& point : b.points)
+    {
+        const float projection = point.x * axis_x + point.y * axis_y;
+        b_min = std::min(b_min, projection);
+        b_max = std::max(b_max, projection);
+    }
+
+    // Work in atlas pixel space and require positive-area overlap. This keeps
+    // ordinary shared chart borders from being reported as collisions.
+    const float epsilon = 1e-3f * std::sqrt(axis_length_sq);
+    return std::min(a_max, b_max) - std::max(a_min, b_min) > epsilon;
+}
+
+bool TrianglesOverlapWithPositiveArea(const AtlasTriangle& a, const AtlasTriangle& b)
+{
+    for (uint32_t triangle = 0; triangle < 2; ++triangle)
+    {
+        const AtlasTriangle& source = triangle == 0 ? a : b;
+        for (uint32_t edge = 0; edge < 3; ++edge)
+        {
+            const AtlasPoint& p0 = source.points[edge];
+            const AtlasPoint& p1 = source.points[(edge + 1u) % 3u];
+            const float edge_x = p1.x - p0.x;
+            const float edge_y = p1.y - p0.y;
+            if (!HasStrictProjectionOverlap(a, b, -edge_y, edge_x))
+                return false;
+        }
+    }
+    return true;
+}
+
+float Percentile05(wi::vector<float> values)
+{
+    if (values.empty())
+        return 0;
+    std::sort(values.begin(), values.end());
+    const size_t index = std::min(values.size() - 1, (values.size() - 1) / 20);
+    return values[index];
+}
+
+struct DisjointSet
+{
+    wi::vector<uint32_t> parent;
+    wi::vector<uint8_t> rank;
+
+    explicit DisjointSet(size_t size) : parent(size), rank(size, 0)
+    {
+        std::iota(parent.begin(), parent.end(), 0u);
+    }
+
+    uint32_t Find(uint32_t value)
+    {
+        if (parent[value] != value)
+            parent[value] = Find(parent[value]);
+        return parent[value];
+    }
+
+    void Unite(uint32_t a, uint32_t b)
+    {
+        a = Find(a);
+        b = Find(b);
+        if (a == b)
+            return;
+        if (rank[a] < rank[b])
+            std::swap(a, b);
+        parent[b] = a;
+        if (rank[a] == rank[b])
+            ++rank[a];
+    }
 };
 } // namespace
+
+uint32_t FinalizeClientLightmapDimension(uint32_t dimension)
+{
+    if (dimension == 0 || dimension > 16384u)
+        return 0;
+    const uint32_t power_of_two = wi::math::GetNextPowerOfTwo(dimension);
+    const uint32_t block_aligned = (power_of_two + 3u) & ~3u;
+    return std::clamp(block_aligned, 16u, 16384u);
+}
+
+std::string ClientLightmapAtlasAudit::Summary(uint32_t width, uint32_t height) const
+{
+    std::ostringstream stream;
+    stream << "atlas=" << width << "x" << height <<
+        " hash=" << std::hex << atlas_hash << std::dec <<
+        " verts=" << vertex_count <<
+        " tris=" << triangle_count <<
+        " charts=" << chart_count <<
+        " uv_nonfinite=" << non_finite_vertex_count <<
+        " uv_oob=" << out_of_range_vertex_count <<
+        " bad_indices=" << invalid_index_triangle_count <<
+        " degenerate=" << degenerate_triangle_count <<
+        " overlaps=" << overlapping_triangle_pair_count;
+    if (overlap_test_truncated)
+        stream << "+";
+    stream << " tri_texels[min/p05/avg]=" << min_triangle_texels << "/" <<
+        p05_triangle_texels << "/" << average_triangle_texels <<
+        " chart_texels[min/p05/avg]=" << min_chart_texels << "/" <<
+        p05_chart_texels << "/" << average_chart_texels <<
+        " texels_per_world_unit=" << texels_per_world_unit;
+    return stream.str();
+}
+
+ClientLightmapAtlasAudit AuditClientLightmapAtlas(
+    const wi::scene::MeshComponent& mesh,
+    uint32_t width,
+    uint32_t height)
+{
+    ClientLightmapAtlasAudit audit;
+    audit.vertex_count = static_cast<uint32_t>(mesh.vertex_atlas.size());
+    audit.triangle_count = static_cast<uint32_t>(mesh.indices.size() / 3u);
+    if (width == 0 || height == 0 || mesh.vertex_atlas.empty() || mesh.indices.empty())
+        return audit;
+
+    audit.atlas_hash = FNV1a64(
+        reinterpret_cast<const uint8_t*>(mesh.vertex_atlas.data()),
+        mesh.vertex_atlas.size() * sizeof(mesh.vertex_atlas[0]));
+    if (!mesh.indices.empty())
+    {
+        const uint64_t index_hash = FNV1a64(
+            reinterpret_cast<const uint8_t*>(mesh.indices.data()),
+            mesh.indices.size() * sizeof(mesh.indices[0]));
+        audit.atlas_hash ^= index_hash + 0x9e3779b97f4a7c15ull +
+            (audit.atlas_hash << 6u) + (audit.atlas_hash >> 2u);
+    }
+
+    for (const XMFLOAT2& uv : mesh.vertex_atlas)
+    {
+        if (!std::isfinite(uv.x) || !std::isfinite(uv.y))
+        {
+            ++audit.non_finite_vertex_count;
+            continue;
+        }
+        constexpr float range_epsilon = 1e-5f;
+        if (uv.x < -range_epsilon || uv.y < -range_epsilon ||
+            uv.x > 1.0f + range_epsilon || uv.y > 1.0f + range_epsilon)
+        {
+            ++audit.out_of_range_vertex_count;
+        }
+    }
+
+    wi::vector<AtlasTriangle> triangles(audit.triangle_count);
+    wi::vector<float> triangle_areas;
+    triangle_areas.reserve(audit.triangle_count);
+    double total_pixel_area = 0;
+    double total_world_area = 0;
+    DisjointSet charts(audit.triangle_count);
+    std::unordered_map<uint32_t, uint32_t> first_triangle_for_vertex;
+    first_triangle_for_vertex.reserve(mesh.indices.size());
+
+    for (uint32_t triangle_index = 0; triangle_index < audit.triangle_count; ++triangle_index)
+    {
+        AtlasTriangle& triangle = triangles[triangle_index];
+        bool valid = true;
+        for (uint32_t corner = 0; corner < 3; ++corner)
+        {
+            const uint32_t index = mesh.indices[triangle_index * 3u + corner];
+            triangle.indices[corner] = index;
+            if (index >= mesh.vertex_atlas.size())
+            {
+                valid = false;
+                continue;
+            }
+            const XMFLOAT2& uv = mesh.vertex_atlas[index];
+            triangle.points[corner] = {uv.x * float(width), uv.y * float(height)};
+            if (!std::isfinite(triangle.points[corner].x) || !std::isfinite(triangle.points[corner].y))
+                valid = false;
+        }
+        if (!valid)
+        {
+            ++audit.invalid_index_triangle_count;
+            continue;
+        }
+
+        triangle.pixel_area = std::abs(Cross2D(
+            triangle.points[0], triangle.points[1], triangle.points[2])) * 0.5f;
+        if (triangle.pixel_area <= 1e-6f)
+        {
+            ++audit.degenerate_triangle_count;
+            continue;
+        }
+        triangle.valid = true;
+        triangle_areas.push_back(triangle.pixel_area);
+        total_pixel_area += triangle.pixel_area;
+
+        if (triangle.indices[0] < mesh.vertex_positions.size() &&
+            triangle.indices[1] < mesh.vertex_positions.size() &&
+            triangle.indices[2] < mesh.vertex_positions.size())
+        {
+            const XMFLOAT3& p0 = mesh.vertex_positions[triangle.indices[0]];
+            const XMFLOAT3& p1 = mesh.vertex_positions[triangle.indices[1]];
+            const XMFLOAT3& p2 = mesh.vertex_positions[triangle.indices[2]];
+            const float ax = p1.x - p0.x;
+            const float ay = p1.y - p0.y;
+            const float az = p1.z - p0.z;
+            const float bx = p2.x - p0.x;
+            const float by = p2.y - p0.y;
+            const float bz = p2.z - p0.z;
+            const float cx = ay * bz - az * by;
+            const float cy = az * bx - ax * bz;
+            const float cz = ax * by - ay * bx;
+            triangle.world_area = 0.5f * std::sqrt(cx * cx + cy * cy + cz * cz);
+            total_world_area += triangle.world_area;
+        }
+
+        for (uint32_t vertex : triangle.indices)
+        {
+            const auto [iterator, inserted] = first_triangle_for_vertex.emplace(vertex, triangle_index);
+            if (!inserted)
+                charts.Unite(triangle_index, iterator->second);
+        }
+    }
+
+    if (!triangle_areas.empty())
+    {
+        audit.min_triangle_texels = *std::min_element(triangle_areas.begin(), triangle_areas.end());
+        audit.p05_triangle_texels = Percentile05(triangle_areas);
+        audit.average_triangle_texels = static_cast<float>(
+            total_pixel_area / double(triangle_areas.size()));
+    }
+    if (total_world_area > 1e-12)
+        audit.texels_per_world_unit = static_cast<float>(std::sqrt(total_pixel_area / total_world_area));
+
+    std::unordered_map<uint32_t, float> chart_areas_by_root;
+    for (uint32_t triangle_index = 0; triangle_index < triangles.size(); ++triangle_index)
+    {
+        if (triangles[triangle_index].valid)
+            chart_areas_by_root[charts.Find(triangle_index)] += triangles[triangle_index].pixel_area;
+    }
+    wi::vector<float> chart_areas;
+    chart_areas.reserve(chart_areas_by_root.size());
+    double total_chart_area = 0;
+    for (const auto& item : chart_areas_by_root)
+    {
+        chart_areas.push_back(item.second);
+        total_chart_area += item.second;
+    }
+    audit.chart_count = static_cast<uint32_t>(chart_areas.size());
+    if (!chart_areas.empty())
+    {
+        audit.min_chart_texels = *std::min_element(chart_areas.begin(), chart_areas.end());
+        audit.p05_chart_texels = Percentile05(chart_areas);
+        audit.average_chart_texels = static_cast<float>(total_chart_area / double(chart_areas.size()));
+    }
+
+    // Broad phase in a fixed 64x64 atlas grid, followed by a strict separating
+    // axis test. Pair de-duplication is required because large triangles can
+    // occupy many grid cells.
+    constexpr uint32_t grid_resolution = 64;
+    constexpr size_t max_tested_pairs = 2'000'000;
+    std::unordered_map<uint32_t, wi::vector<uint32_t>> grid;
+    std::unordered_set<uint64_t> tested_pairs;
+    tested_pairs.reserve(std::min<size_t>(triangles.size() * 8ull, max_tested_pairs));
+    for (uint32_t triangle_index = 0; triangle_index < triangles.size(); ++triangle_index)
+    {
+        const AtlasTriangle& triangle = triangles[triangle_index];
+        if (!triangle.valid)
+            continue;
+        float min_x = triangle.points[0].x;
+        float max_x = triangle.points[0].x;
+        float min_y = triangle.points[0].y;
+        float max_y = triangle.points[0].y;
+        for (uint32_t corner = 1; corner < 3; ++corner)
+        {
+            min_x = std::min(min_x, triangle.points[corner].x);
+            max_x = std::max(max_x, triangle.points[corner].x);
+            min_y = std::min(min_y, triangle.points[corner].y);
+            max_y = std::max(max_y, triangle.points[corner].y);
+        }
+        const uint32_t cell_min_x = std::min<uint32_t>(grid_resolution - 1u,
+            static_cast<uint32_t>(std::max(0.0f, min_x) / float(width) * grid_resolution));
+        const uint32_t cell_max_x = std::min<uint32_t>(grid_resolution - 1u,
+            static_cast<uint32_t>(std::max(0.0f, max_x) / float(width) * grid_resolution));
+        const uint32_t cell_min_y = std::min<uint32_t>(grid_resolution - 1u,
+            static_cast<uint32_t>(std::max(0.0f, min_y) / float(height) * grid_resolution));
+        const uint32_t cell_max_y = std::min<uint32_t>(grid_resolution - 1u,
+            static_cast<uint32_t>(std::max(0.0f, max_y) / float(height) * grid_resolution));
+        for (uint32_t cell_y = cell_min_y; cell_y <= cell_max_y; ++cell_y)
+        {
+            for (uint32_t cell_x = cell_min_x; cell_x <= cell_max_x; ++cell_x)
+            {
+                wi::vector<uint32_t>& occupants = grid[cell_y * grid_resolution + cell_x];
+                for (uint32_t other_index : occupants)
+                {
+                    const uint32_t first = std::min(triangle_index, other_index);
+                    const uint32_t second = std::max(triangle_index, other_index);
+                    const uint64_t pair_key = (uint64_t(first) << 32u) | second;
+                    if (!tested_pairs.insert(pair_key).second)
+                        continue;
+                    if (tested_pairs.size() > max_tested_pairs)
+                    {
+                        audit.overlap_test_truncated = true;
+                        break;
+                    }
+                    const AtlasTriangle& other = triangles[other_index];
+                    if (!SharesVertex(triangle, other) &&
+                        TrianglesOverlapWithPositiveArea(triangle, other))
+                    {
+                        ++audit.overlapping_triangle_pair_count;
+                    }
+                }
+                occupants.push_back(triangle_index);
+                if (audit.overlap_test_truncated)
+                    break;
+            }
+            if (audit.overlap_test_truncated)
+                break;
+        }
+        if (audit.overlap_test_truncated)
+            break;
+    }
+
+    return audit;
+}
 
 std::string ClientLightmapPackage::DerivedScenePathForScene(const std::string& scene_path)
 {
@@ -310,7 +683,10 @@ ClientLightmapPackageResult ClientLightmapPackage::LoadFromPaths(
         }
         if (!Read(bytes, cursor, entry.width) || !Read(bytes, cursor, entry.height) ||
             !Read(bytes, cursor, entry.format) || !Read(bytes, cursor, entry.offset) ||
-            !Read(bytes, cursor, entry.size) || !Read(bytes, cursor, entry.crc))
+            !Read(bytes, cursor, entry.size) || !Read(bytes, cursor, entry.crc) ||
+            !Read(bytes, cursor, entry.coverage_offset) ||
+            !Read(bytes, cursor, entry.coverage_size) ||
+            !Read(bytes, cursor, entry.coverage_crc))
         {
             result.diagnostic = "Client Lightmap package truncated entry table";
             return result;
@@ -318,7 +694,10 @@ ClientLightmapPackageResult ClientLightmapPackage::LoadFromPaths(
         if (entry.format != kFormatBC6H || entry.width == 0 || entry.height == 0 ||
             entry.width % 4 != 0 || entry.height % 4 != 0 ||
             entry.size != ExpectedBC6HSize(entry.width, entry.height) ||
-            entry.offset > bytes.size() || entry.size > bytes.size() - entry.offset)
+            entry.coverage_size != static_cast<uint64_t>(entry.width) * entry.height ||
+            entry.offset > bytes.size() || entry.size > bytes.size() - entry.offset ||
+            entry.coverage_offset > bytes.size() ||
+            entry.coverage_size > bytes.size() - entry.coverage_offset)
         {
             result.diagnostic = "Client Lightmap package invalid BC6H entry: " + entry.id;
             return result;
@@ -328,11 +707,15 @@ ClientLightmapPackageResult ClientLightmapPackage::LoadFromPaths(
             result.diagnostic = "Client Lightmap package CRC mismatch: " + entry.id;
             return result;
         }
+        if (CRC32(bytes.data() + entry.coverage_offset, static_cast<size_t>(entry.coverage_size)) != entry.coverage_crc)
+        {
+            result.diagnostic = "Client Lightmap package coverage CRC mismatch: " + entry.id;
+            return result;
+        }
         entries.push_back(std::move(entry));
     }
 
     uint64_t expected_payload_offset = cursor;
-    uint32_t reconciled_dimension_count = 0;
     for (const PackageEntry& entry : entries)
     {
         if (entry.offset != expected_payload_offset)
@@ -341,6 +724,12 @@ ClientLightmapPackageResult ClientLightmapPackage::LoadFromPaths(
             return result;
         }
         expected_payload_offset += entry.size;
+        if (entry.coverage_offset != expected_payload_offset)
+        {
+            result.diagnostic = "Client Lightmap package contains non-canonical coverage offsets";
+            return result;
+        }
+        expected_payload_offset += entry.coverage_size;
     }
     if (expected_payload_offset != bytes.size())
     {
@@ -364,11 +753,10 @@ ClientLightmapPackageResult ClientLightmapPackage::LoadFromPaths(
         }
         if (object.lightmapWidth != entry.width || object.lightmapHeight != entry.height)
         {
-            // The package dimensions describe the texture that was actually
-            // baked and CRC-validated. Reconcile older v2 derived scenes that
-            // captured xatlas' pre-normalized dimensions before Scene::Update
-            // applied power-of-two and BC6H block alignment.
-            ++reconciled_dimension_count;
+            result.diagnostic = "Client Lightmap derived dimensions mismatch: " + entry.id;
+            ClearSceneLightmaps(derived_scene);
+            result.loaded_count = 0;
+            return result;
         }
         wi::graphics::Texture texture;
         if (!wi::texturehelper::CreateTexture(
@@ -383,10 +771,25 @@ ClientLightmapPackageResult ClientLightmapPackage::LoadFromPaths(
             return result;
         }
         wi::graphics::GetDevice()->SetName(&texture, "newpipeline.client.lightmap");
+        wi::graphics::Texture coverage_texture;
+        if (!wi::texturehelper::CreateTexture(
+            coverage_texture,
+            bytes.data() + entry.coverage_offset,
+            entry.width,
+            entry.height,
+            wi::graphics::Format::R8_UNORM))
+        {
+            result.diagnostic = "Client Lightmap package coverage texture creation failed: " + entry.id;
+            ClearSceneLightmaps(derived_scene);
+            return result;
+        }
+        wi::graphics::GetDevice()->SetName(&coverage_texture, "newpipeline.client.lightmap_coverage");
         object.lightmapWidth = entry.width;
         object.lightmapHeight = entry.height;
         object.lightmap = std::move(texture);
+        object.lightmap_coverage = std::move(coverage_texture);
         object.lightmapTextureData.clear();
+        object.lightmapCoverageData.clear();
         ++result.loaded_count;
     }
 
@@ -412,11 +815,6 @@ ClientLightmapPackageResult ClientLightmapPackage::LoadFromPaths(
         "/" + std::to_string(entry_count) + " objects, resolution=" + std::to_string(resolution) +
         " samples=" + std::to_string(sample_count) +
         " bounces=" + std::to_string(bounce_count);
-    if (reconciled_dimension_count > 0)
-    {
-        result.diagnostic += " dimensions_reconciled=" +
-            std::to_string(reconciled_dimension_count);
-    }
     return result;
 }
 
@@ -450,6 +848,8 @@ bool ClientLightmapPackage::Save(
         entry.height = object->lightmapHeight;
         entry.size = object->lightmapTextureData.size();
         entry.payload = &object->lightmapTextureData;
+        entry.coverage_size = object->lightmapCoverageData.size();
+        entry.coverage_payload = &object->lightmapCoverageData;
         if (entry.id.empty() || !ids.insert(entry.id).second)
         {
             error = "missing or duplicate client lightmap object id";
@@ -460,13 +860,24 @@ bool ClientLightmapPackage::Save(
             error = "object " + entry.id + " does not contain BC6H data";
             return false;
         }
+        if (entry.coverage_size != static_cast<uint64_t>(entry.width) * entry.height)
+        {
+            error = "object " + entry.id + " does not contain complete coverage data";
+            return false;
+        }
         entry.crc = CRC32(entry.payload->data(), entry.payload->size());
-        table_size += 4 + entry.id.size() + 4 + 4 + 4 + 8 + 8 + 4;
+        entry.coverage_crc = CRC32(entry.coverage_payload->data(), entry.coverage_payload->size());
+        table_size += 4 + entry.id.size() + 4 + 4 + 4 + 8 + 8 + 4 + 8 + 8 + 4;
         entries.push_back(std::move(entry));
     }
     if (entries.empty())
     {
         error = "no completed lightmaps to save";
+        return false;
+    }
+    if (entries.size() != entities.size())
+    {
+        error = "one or more completed lightmaps were unavailable while saving";
         return false;
     }
 
@@ -475,6 +886,8 @@ bool ClientLightmapPackage::Save(
     {
         entry.offset = payload_offset;
         payload_offset += entry.size;
+        entry.coverage_offset = payload_offset;
+        payload_offset += entry.coverage_size;
     }
     if (payload_offset > std::numeric_limits<size_t>::max())
     {
@@ -505,9 +918,15 @@ bool ClientLightmapPackage::Save(
         Append(bytes, entry.offset);
         Append(bytes, entry.size);
         Append(bytes, entry.crc);
+        Append(bytes, entry.coverage_offset);
+        Append(bytes, entry.coverage_size);
+        Append(bytes, entry.coverage_crc);
     }
     for (const PackageEntry& entry : entries)
+    {
         bytes.insert(bytes.end(), entry.payload->begin(), entry.payload->end());
+        bytes.insert(bytes.end(), entry.coverage_payload->begin(), entry.coverage_payload->end());
+    }
 
     if (!wi::helper::FileWrite(package_path, bytes.data(), bytes.size()))
     {
@@ -579,7 +998,9 @@ bool GenerateClientLightmapAtlas(
     xatlas::PackOptions pack_options;
     pack_options.resolution = std::clamp(resolution, 64u, 1024u);
     pack_options.blockAlign = true;
-    pack_options.padding = 2;
+    // Four source pixels keep chart separation intact through bilinear
+    // sampling and BC6H's 4x4 block footprint.
+    pack_options.padding = 4;
     xatlas::Generate(atlas_handle, chart_options, pack_options);
     if (atlas_handle->meshCount == 0 || atlas_handle->width == 0 || atlas_handle->height == 0)
     {
@@ -587,8 +1008,15 @@ bool GenerateClientLightmapAtlas(
         return false;
     }
 
-    width = atlas_handle->width;
-    height = atlas_handle->height;
+    const uint32_t atlas_width = atlas_handle->width;
+    const uint32_t atlas_height = atlas_handle->height;
+    width = FinalizeClientLightmapDimension(atlas_width);
+    height = FinalizeClientLightmapDimension(atlas_height);
+    if (width < atlas_width || height < atlas_height)
+    {
+        error = "final lightmap dimensions would shrink the xatlas output";
+        return false;
+    }
     const xatlas::Mesh& atlas_mesh = atlas_handle->meshes[0];
     const auto old_positions = meshcomponent->vertex_positions;
     const auto old_normals = meshcomponent->vertex_normals;
@@ -627,6 +1055,8 @@ bool GenerateClientLightmapAtlas(
         }
         meshcomponent->indices[j] = index;
         meshcomponent->vertex_positions[index] = old_positions[vertex.xref];
+        // xatlas returns texel-space coordinates. Normalize against the exact
+        // final texture dimensions, not the tightly cropped xatlas extent.
         meshcomponent->vertex_atlas[index] = XMFLOAT2(vertex.uv[0] / float(width), vertex.uv[1] / float(height));
         if (!old_normals.empty()) meshcomponent->vertex_normals[index] = old_normals[vertex.xref];
         if (!old_winds.empty()) meshcomponent->vertex_windweights[index] = old_winds[vertex.xref];

@@ -5,6 +5,7 @@
 #include "NewPipelineTransport.h"
 
 #include <string>
+#include <deque>
 #include <unordered_map>
 
 namespace wicked_newpipeline
@@ -20,6 +21,15 @@ struct NewPipelineClientRenderSettings
     bool remote_ao_enabled = true;
     float remote_gi_max_weight = 1.0f;
     float remote_ao_max_weight = 1.0f;
+};
+
+struct LightmapDiagnosticSettings
+{
+    uint32_t resolution = 256;
+    uint32_t sample_count = 512;
+    uint32_t bounce_count = 3;
+    bool force_regenerate_atlas = false;
+    bool pause_before_save = true;
 };
 
 struct RemoteConsumeState
@@ -60,6 +70,17 @@ public:
     void CancelLightmapBake();
     bool IsLightmapBakeActive() const;
     std::string GetLightmapBakeStatus() const;
+    bool PickLightmapDiagnosticObjectAtScreenCenter();
+    bool HasLightmapDiagnosticObject() const;
+    void SetLightmapDiagnosticSettings(const LightmapDiagnosticSettings& settings);
+    const LightmapDiagnosticSettings& GetLightmapDiagnosticSettings() const { return lightmap_diagnostic_settings; }
+    void RequestLightmapDiagnosticBake();
+    void ResumeLightmapDiagnosticSave();
+    void DiscardLightmapDiagnosticBake();
+    bool IsLightmapDiagnosticSessionActive() const { return lightmap_diagnostic_session_active; }
+    bool IsLightmapDiagnosticPaused() const;
+    bool IsLightmapDiagnosticCompressed() const;
+    std::string GetLightmapDiagnosticStatus() const;
     void RequestStaticLightingBake();
     void CancelStaticLightingBake();
     bool IsStaticLightingBakeActive() const;
@@ -73,6 +94,8 @@ public:
     uint32_t GetReflectionProbeDebugMipCount() const;
     const wi::graphics::Texture& GetLocalLightmapIrradiance() const { return local_lightmap_irradiance; }
     const wi::graphics::Texture& GetLocalLightmapValidity() const { return local_lightmap_validity; }
+    const wi::graphics::Texture& GetLocalLightmapCoverage() const { return local_lightmap_coverage; }
+    const wi::graphics::Texture& GetLocalLightmapRaw() const { return local_lightmap_raw; }
     const wi::graphics::Texture& GetLocalIndirectFinalInput() const { return local_indirect_final_input; }
 
     void Start() override;
@@ -86,12 +109,17 @@ private:
     void UpdateLocalCamera(float dt);
     void PublishControlPacket(float dt);
     void AcquireRemoteVideoFrame(float dt);
+    void PollRemoteFrameMetadata();
     void MaintainWebRTC(float dt);
     bool ValidateRemoteFrame(const RemoteRawFrame& frame, std::string& reason) const;
+    bool ValidateRemoteVideoLayout(const RemoteVideoFrameLayout& layout, std::string& reason) const;
     bool IsControlPacketChanged(const ClientControlPacket& packet) const;
     void AcceptRemoteFrame(const RemoteRawFrame& frame);
+    void AcceptRemoteVideoFrame(const RetainedI420Frame& frame, const RemoteVideoFrameLayout& layout);
+    void CommitAcceptedRemoteMetadata(const RemoteFrameMetadata& metadata);
     void InvalidateRemote(const std::string& reason);
     bool UploadRemoteTextures(const RemoteRawFrame& frame);
+    bool UploadRemoteVideoTextures(const RetainedI420Frame& frame, const RemoteVideoFrameLayout& layout);
     const wi::graphics::Texture* GetDebugPreviewTexture() const;
     void DrawUnavailablePreview(wi::graphics::CommandList cmd) const;
     void ApplyRenderSettings(bool log_changes);
@@ -112,8 +140,15 @@ private:
     void DisableBakedLightmaps();
     void RestoreBakedLightmaps();
     bool PrepareLightmapBake();
-    void UpdateLightmapBake();
-    bool StartNextLightmapBake();
+    void UpdateLightmapBake(float dt);
+    bool FillLightmapBakeBatch();
+    bool FinalizeOnePendingLightmap();
+    void UpdateLightmapBakeWorkload(float dt);
+    void UpdateLightmapBakeProgress();
+    void ClearLightmapBakeRequests(bool clear_lightmaps);
+    void ResetLightmapBakeScheduling();
+    uint64_t GetActiveLightmapTexelCount() const;
+    uint64_t GetLightmapBakeTotalSamples() const;
     void FinishLightmapBake();
     void FailLightmapBake(const std::string& reason);
     bool SavePreparedScene(const std::string& path, std::string& error);
@@ -122,6 +157,7 @@ private:
     void CleanupLightmapBakeTemps();
     void ReloadSceneAfterLightmapBakeAbort();
     void LogLightmapSceneParity(const char* phase);
+    void EndLightmapDiagnosticSession(const std::string& status);
 
     RuntimeConfig config;
     enum class LightmapBakeState : uint8_t
@@ -130,6 +166,8 @@ private:
         Preparing,
         Baking,
         Saving,
+        DiagnosticPaused,
+        DiagnosticCompressed,
         Completed,
         Cancelled,
         Failed,
@@ -152,6 +190,17 @@ private:
     wi::scene::CameraComponent local_camera;
     ClientStaticLighting client_static_lighting;
     ClientLightmapBakeSettings lightmap_bake_settings;
+    ClientLightmapBakeSettings lightmap_bake_settings_before_diagnostic;
+    LightmapDiagnosticSettings lightmap_diagnostic_settings;
+    ClientLightmapAtlasAudit lightmap_diagnostic_atlas_audit;
+    wi::ecs::Entity lightmap_diagnostic_entity = wi::ecs::INVALID_ENTITY;
+    std::string lightmap_diagnostic_object_name;
+    std::string lightmap_diagnostic_status = "Diagnostic: pick an object at screen center";
+    bool lightmap_diagnostic_session_active = false;
+    bool lightmap_diagnostic_resume_requested = false;
+    bool lightmap_diagnostic_atlas_regenerated = false;
+    bool lightmap_bake_denoiser_available = false;
+    bool lightmap_bake_denoiser_required = false;
     std::string scene_asset_path;
     wi::ecs::Entity scene_source_root_entity = wi::ecs::INVALID_ENTITY;
     std::string prepared_scene_temp_path;
@@ -159,27 +208,59 @@ private:
     std::string lightmap_bake_status = "Lightmap: idle";
     wi::vector<wi::ecs::Entity> lightmap_bake_queue;
     wi::vector<wi::ecs::Entity> lightmap_bake_completed;
+    wi::vector<wi::ecs::Entity> lightmap_bake_active;
+    wi::vector<wi::ecs::Entity> lightmap_bake_pending_save;
     std::unordered_map<wi::ecs::Entity, XMUINT2> lightmap_bake_dimensions;
-    wi::ecs::Entity active_lightmap_bake_entity = wi::ecs::INVALID_ENTITY;
     LightmapBakeState lightmap_bake_state = LightmapBakeState::Idle;
     size_t lightmap_bake_next_index = 0;
     uint32_t lightmap_bake_skipped = 0;
+    uint32_t lightmap_bake_iterations_per_frame = 1;
+    uint32_t lightmap_bake_effective_iterations_per_frame = 1;
+    uint32_t lightmap_bake_adaptation_frames = 0;
     uint32_t previous_raytrace_bounce_count = 0;
     uint64_t source_scene_hash_before_bake = 0;
     uint64_t prepared_derived_scene_hash = 0;
+    uint64_t lightmap_bake_scheduled_active_texels = 0;
+    uint64_t lightmap_bake_last_progress_time_usec = 0;
+    uint64_t lightmap_bake_last_progress_sample_total = 0;
+    uint64_t lightmap_bake_rate_time_usec = 0;
+    uint64_t lightmap_bake_rate_sample_total = 0;
+    float lightmap_bake_frame_time_ema = 0.0f;
+    float lightmap_bake_samples_per_second = 0.0f;
     XMFLOAT3 lightmap_irradiance_min = {};
     XMFLOAT3 lightmap_irradiance_sum = {};
     XMFLOAT3 lightmap_irradiance_max = {};
     uint64_t lightmap_valid_texel_count = 0;
     uint64_t lightmap_missing_texel_count = 0;
+    uint64_t lightmap_invalid_texel_count = 0;
     SceneParityFingerprint lightmap_bake_scene_fingerprint;
     bool lightmap_bake_scene_fingerprint_valid = false;
     bool lightmap_cancel_requested = false;
     FileMockControlMailbox mock_control_mailbox;
     FileMockRemoteMailbox mock_remote_mailbox;
     WebRTCVideoTransport webrtc_transport;
+    struct RemoteVideoUploadSlot
+    {
+        wi::graphics::Texture upload_y;
+        wi::graphics::Texture upload_uv;
+        wi::graphics::Texture gpu_y;
+        wi::graphics::Texture gpu_uv;
+        std::array<wi::graphics::Texture,
+            static_cast<size_t>(RemoteBufferSemantic::Count)> semantic_outputs;
+        uint32_t width = 0;
+        uint32_t height = 0;
+    };
+    std::array<RemoteVideoUploadSlot, wi::graphics::GraphicsDevice::GetBufferCount()> remote_video_upload_ring;
     std::array<wi::graphics::Texture, static_cast<size_t>(RemoteBufferSemantic::Count)> accepted_remote_textures;
     uint32_t accepted_remote_buffer_mask = 0;
+    uint64_t remote_texture_creation_count = 0;
+    uint64_t remote_gpu_upload_bytes = 0;
+    WebRTCTransportState previous_webrtc_state = WebRTCTransportState::Disabled;
+    std::deque<RemoteVideoFrameLayout> downstream_metadata_cache;
+    bool downstream_metadata_active = false;
+    uint64_t downstream_metadata_matches = 0;
+    uint64_t downstream_metadata_misses = 0;
+    uint64_t downstream_metadata_mismatches = 0;
     RemoteFrameMetadata accepted_remote_metadata;
     wi::ecs::Entity environment_probe_entity = wi::ecs::INVALID_ENTITY;
     bool environment_probe_created_by_client = false;
@@ -197,7 +278,6 @@ private:
     uint32_t scene_generation = 1;
     ClientControlPacket last_published_control_packet;
     float control_publish_accumulator = 0.0f;
-    float webrtc_retry_accumulator = 0.0f;
     bool has_published_control_packet = false;
     bool scene_initialized = false;
     bool baked_sun_reference_valid = false;
@@ -207,6 +287,8 @@ private:
     mutable wi::graphics::Texture local_ao_snapshot;
     wi::graphics::Texture local_lightmap_irradiance;
     wi::graphics::Texture local_lightmap_validity;
+    wi::graphics::Texture local_lightmap_coverage;
+    wi::graphics::Texture local_lightmap_raw;
     wi::graphics::Texture local_indirect_final_input;
     wi::graphics::Texture local_specular_indirect;
     wi::graphics::Texture elastic_indirect_diffuse;

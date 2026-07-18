@@ -13,6 +13,8 @@
 
 #include "Utility/meshoptimizer/meshoptimizer.h"
 
+#include <cmath>
+
 #if __has_include("OpenImageDenoise/oidn.hpp")
 #include "OpenImageDenoise/oidn.hpp"
 #if OIDN_VERSION_MAJOR >= 2
@@ -31,6 +33,36 @@ using namespace wi::primitive;
 
 namespace wi::scene
 {
+#ifdef OPEN_IMAGE_DENOISE
+	namespace
+	{
+		struct LightmapDenoiserContext
+		{
+			oidn::DeviceRef device;
+			bool available = false;
+
+			LightmapDenoiserContext()
+			{
+				device = oidn::newDevice();
+				device.commit();
+				const char* error_message = nullptr;
+				const oidn::Error error = device.getError(error_message);
+				available = error == oidn::Error::None;
+				if (!available)
+				{
+					wi::backlog::post(std::string("[OpenImageDenoise unavailable] ") +
+						(error_message != nullptr ? error_message : "device initialization failed"));
+				}
+			}
+		};
+
+		LightmapDenoiserContext& GetLightmapDenoiserContext()
+		{
+			static LightmapDenoiserContext context;
+			return context;
+		}
+	}
+#endif // OPEN_IMAGE_DENOISE
 
 
 	XMFLOAT3 TransformComponent::GetPosition() const
@@ -2011,12 +2043,22 @@ namespace wi::scene
 	{
 		lightmap_render = {};
 		lightmap = {};
+		lightmap_coverage = {};
 		lightmapWidth = 0;
 		lightmapHeight = 0;
 		lightmapIterationCount = 0;
 		lightmapTextureData.clear();
+		lightmapCoverageData.clear();
 		lightmapStatistics = {};
 		SetLightmapRenderRequest(false);
+	}
+	bool ObjectComponent::IsLightmapDenoiserAvailable()
+	{
+#ifdef OPEN_IMAGE_DENOISE
+		return GetLightmapDenoiserContext().available;
+#else
+		return false;
+#endif // OPEN_IMAGE_DENOISE
 	}
 	void ObjectComponent::SaveLightmap()
 	{
@@ -2033,6 +2075,7 @@ namespace wi::scene
 				const uint64_t texel_count = uint64_t(lightmapWidth) * uint64_t(lightmapHeight);
 				if (lightmapTextureData.size() >= texel_count * sizeof(XMHALF4))
 				{
+					lightmapCoverageData.assign(static_cast<size_t>(texel_count), uint8_t{0});
 					const XMHALF4* texels = reinterpret_cast<const XMHALF4*>(lightmapTextureData.data());
 					XMFLOAT3 minimum(FLT_MAX, FLT_MAX, FLT_MAX);
 					XMFLOAT3 maximum = {};
@@ -2041,11 +2084,16 @@ namespace wi::scene
 					{
 						XMFLOAT4 sample;
 						XMStoreFloat4(&sample, XMLoadHalf4(texels + i));
-						if (sample.w <= 0)
+						const bool finite = std::isfinite(sample.x) && std::isfinite(sample.y) &&
+							std::isfinite(sample.z) && std::isfinite(sample.w);
+						if (sample.w <= 0 || !finite)
 						{
+							if (!finite)
+								++lightmapStatistics.invalid_sample_texel_count;
 							++lightmapStatistics.missing_texel_count;
 							continue;
 						}
+						lightmapCoverageData[static_cast<size_t>(i)] = 255;
 						const XMFLOAT3 irradiance(
 							std::max(0.0f, sample.x * XM_PI),
 							std::max(0.0f, sample.y * XM_PI),
@@ -2075,26 +2123,23 @@ namespace wi::scene
 			}
 
 #ifdef OPEN_IMAGE_DENOISE
-			if (success)
+			LightmapDenoiserContext& denoiser = GetLightmapDenoiserContext();
+			lightmapStatistics.denoiser_available = denoiser.available;
+			if (success && denoiser.available)
 			{
 				size_t width = (size_t)lightmapWidth;
 				size_t height = (size_t)lightmapHeight;
 				{
 					// https://github.com/OpenImageDenoise/oidn#c11-api-example
-
-					// Create an Intel Open Image Denoise device
-					static oidn::DeviceRef device = oidn::newDevice();
-					static bool init = false;
-					if (!init)
-					{
-						device.commit();
-						init = true;
-					}
+					oidn::DeviceRef& device = denoiser.device;
 
 					oidn::BufferRef lightmapTextureData_buffer = device.newBuffer(lightmapTextureData.size());
 					oidn::BufferRef texturedata_dst_buffer = device.newBuffer(lightmapTextureData.size());
 
 					lightmapTextureData_buffer.write(0, lightmapTextureData.size(), lightmapTextureData.data());
+					// The filter writes RGB with an 8-byte texel stride. Seed the
+					// destination so the coverage alpha lane remains deterministic.
+					texturedata_dst_buffer.write(0, lightmapTextureData.size(), lightmapTextureData.data());
 
 					// Create a denoising filter
 					oidn::FilterRef filter = device.newFilter("RTLightmap");
@@ -2108,13 +2153,16 @@ namespace wi::scene
 					// Check for errors
 					const char* errorMessage;
 					auto error = device.getError(errorMessage);
-					if (error != oidn::Error::None && error != oidn::Error::Cancelled)
+					if (error != oidn::Error::None)
 					{
-						wi::backlog::post(std::string("[OpenImageDenoise error] ") + errorMessage);
+						lightmapStatistics.denoiser_failed = true;
+						wi::backlog::post(std::string("[OpenImageDenoise error] ") +
+							(errorMessage != nullptr ? errorMessage : "filter execution failed"));
 					}
 					else
 					{
 						texturedata_dst_buffer.read(0, lightmapTextureData.size(), lightmapTextureData.data());
+						lightmapStatistics.denoiser_applied = true;
 					}
 				}
 			}
@@ -2124,6 +2172,16 @@ namespace wi::scene
 
 			wi::texturehelper::CreateTexture(lightmap, lightmapTextureData.data(), lightmapWidth, lightmapHeight, lightmap.desc.format);
 			wi::graphics::GetDevice()->SetName(&lightmap, "lightmap");
+			if (!lightmapCoverageData.empty())
+			{
+				wi::texturehelper::CreateTexture(
+					lightmap_coverage,
+					lightmapCoverageData.data(),
+					lightmapWidth,
+					lightmapHeight,
+					Format::R8_UNORM);
+				wi::graphics::GetDevice()->SetName(&lightmap_coverage, "lightmap_coverage");
+			}
 		}
 	}
 	void ObjectComponent::CompressLightmap()

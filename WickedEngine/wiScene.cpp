@@ -4646,6 +4646,10 @@ namespace wi::scene
 				{
 					inst.lightmap = device->GetDescriptorIndex(&object.lightmap, SubresourceType::SRV);
 				}
+				if (object.lightmap_coverage.IsValid())
+				{
+					inst.lightmap_coverage = device->GetDescriptorIndex(&object.lightmap_coverage, SubresourceType::SRV);
+				}
 				inst.uid = entity;
 				inst.layerMask = layerMask;
 				inst.color = wi::math::pack_half4(object.color);

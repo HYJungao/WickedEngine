@@ -61,11 +61,32 @@ std::string NewPipelineServerRenderPath::GetDebugStatusSummary() const
     size_t pending_count = 0;
     for (const ReadbackSlot& slot : readback_ring)
         pending_count += slot.pending ? 1u : 0u;
+    for (const PackedReadbackSlot& slot : packed_readback_ring)
+        pending_count += slot.pending ? 1u : 0u;
     const std::string shadow = authoritative_shadow_index < 16
         ? std::to_string(authoritative_shadow_index)
         : std::string{"unavailable"};
+    const WebRTCTransportStats transport = webrtc_transport.GetStats();
+    const std::string transport_status = config.remote_source == RemoteSourceMode::WebRTC
+        ? "\nWebRTC: " + std::string{ToString(transport.state)} + " " + transport.codec_name +
+            (transport.native_codec ? " native-surface" :
+                (transport.power_efficient_codec ? " power-efficient" : " software-surface")) +
+            " impl=" + transport.codec_implementation +
+            " encode=" + std::to_string(transport.total_encode_time_usec / 1000u) + " ms" +
+            " net=" + std::to_string(transport.compressed_bytes_sent / 1024u) + " KiB" +
+            " captures=" + std::to_string(remote_capture_count) +
+            " capture-drop=" + std::to_string(remote_capture_drops) +
+            " queue-drop=" + std::to_string(publish_queue_drops.load(std::memory_order_relaxed)) +
+            " readback=" + std::to_string(gpu_readback_bytes / 1024u) + " KiB" +
+            " cpu-copy=" + std::to_string(
+                (cpu_readback_copy_bytes + transport.cpu_full_frame_copy_bytes) / 1024u) + " KiB" +
+            " convert=" + std::to_string(transport.cpu_conversion_usec / 1000u) + " ms" +
+            (transport.native_codec || transport.codec_fallback_reason.empty()
+                ? std::string{} : " fallback=" + transport.codec_fallback_reason)
+        : std::string{};
     return GetEffectiveAlgorithmSummary() + "\nSun shadow slice: " + shadow +
         "\nReadback: async ring 3, pending " + std::to_string(pending_count) +
+        transport_status +
         "\nDDGI: frame " + std::to_string(local_scene.ddgi.frame_index) +
         (local_scene.ddgi.frame_index >= 64 ? " converged" : " warming") +
         " reset=" + ToString(ddgi_reset_reason);
@@ -85,8 +106,7 @@ void NewPipelineServerRenderPath::Start()
     if (config.remote_source == RemoteSourceMode::WebRTC)
     {
         std::string error;
-        std::lock_guard lock(webrtc_mutex);
-        if (!webrtc_transport.Start(true, config, &error))
+        if (!webrtc_transport.RequestStart(true, config, &error))
             wi::backlog::post("Server WebRTC start failed: " + error);
     }
 
@@ -289,25 +309,32 @@ void NewPipelineServerRenderPath::DrawUnavailablePreview(wi::graphics::CommandLi
 
 void NewPipelineServerRenderPath::MaintainWebRTC(float dt)
 {
+    (void)dt;
     webrtc_transport.Tick();
     if (config.remote_source != RemoteSourceMode::WebRTC)
         return;
-    std::lock_guard lock(webrtc_mutex);
     const WebRTCTransportStats stats = webrtc_transport.GetStats();
-    if (stats.state != WebRTCTransportState::Failed)
+    if (stats.state == previous_webrtc_state)
+        return;
+    wi::backlog::post("Server WebRTC " + std::string{ToString(previous_webrtc_state)} + " -> " +
+        ToString(stats.state) + (stats.status.empty() ? std::string{} : ": " + stats.status));
+    if (previous_webrtc_state == WebRTCTransportState::Connected &&
+        stats.state != WebRTCTransportState::Connected)
     {
-        webrtc_retry_accumulator = 0.0f;
-        return;
+        for (ReadbackSlot& slot : readback_ring)
+        {
+            slot.pending = false;
+            slot.available_mask = 0;
+        }
+        for (PackedReadbackSlot& slot : packed_readback_ring)
+            slot.pending = false;
+        readback_write_index = 0;
+        packed_readback_write_index = 0;
+        std::lock_guard lock(publish_mutex);
+        pending_publish_frame.reset();
+        pending_i420_frame.reset();
     }
-    webrtc_retry_accumulator += dt;
-    if (webrtc_retry_accumulator < 2.0f)
-        return;
-    webrtc_retry_accumulator = 0.0f;
-    std::string error;
-    if (!webrtc_transport.Start(true, config, &error))
-        wi::backlog::post("Server WebRTC retry failed: " + error);
-    else
-        wi::backlog::post("Server WebRTC retrying signaling: " + config.signaling_url);
+    previous_webrtc_state = stats.state;
 }
 
 bool NewPipelineServerRenderPath::EnsureTransportTexture(RemoteBufferSemantic semantic, uint32_t width, uint32_t height)
@@ -403,7 +430,17 @@ bool NewPipelineServerRenderPath::EnsureShadowSliceTexture(uint32_t width, uint3
 
 void NewPipelineServerRenderPath::PublishRemotePayload(float dt)
 {
-    ConsumeCompletedReadback();
+    if (config.remote_source == RemoteSourceMode::WebRTC &&
+        webrtc_transport.GetStats().state != WebRTCTransportState::Connected)
+    {
+        mock_publish_accumulator = 0.0f;
+        return;
+    }
+
+    if (config.remote_source == RemoteSourceMode::WebRTC)
+        ConsumeCompletedPackedReadback();
+    else
+        ConsumeCompletedReadback();
 
     if (settings.remote_publish_fps <= 0.0f)
     {
@@ -435,12 +472,18 @@ void NewPipelineServerRenderPath::PublishRemotePayload(float dt)
         rtSSR.IsValid() ? &rtSSR : nullptr,
         shadow_snapshot_valid && shadow_slice_texture.IsValid() ? &shadow_slice_texture : nullptr,
     };
+    if (config.remote_source == RemoteSourceMode::WebRTC)
+    {
+        CapturePackedRemoteFrame(sources);
+        return;
+    }
     ReadbackSlot& slot = readback_ring[readback_write_index];
     if (slot.pending)
     {
         // The ring only advances when a copy is submitted. A still-pending slot
         // means the producer outran the three-frame latency, so drop this capture
         // instead of ever waiting for the GPU on the render thread.
+        ++remote_capture_drops;
         return;
     }
 
@@ -477,6 +520,7 @@ void NewPipelineServerRenderPath::PublishRemotePayload(float dt)
         device->Barrier(wi::graphics::GPUBarrier::Image(
             &transport_textures[index], transport_desc.layout, wi::graphics::ResourceState::COPY_SRC), cmd);
         device->CopyResource(&readback, &transport_textures[index], cmd);
+        gpu_readback_bytes += static_cast<uint64_t>(transport_desc.width) * transport_desc.height * 4u;
         device->Barrier(wi::graphics::GPUBarrier::Image(
             &transport_textures[index], wi::graphics::ResourceState::COPY_SRC, transport_desc.layout), cmd);
         available_mask |= RemoteBufferKindMask(semantic);
@@ -517,8 +561,219 @@ void NewPipelineServerRenderPath::PublishRemotePayload(float dt)
     slot.metadata.ddgi_reset_reason = ddgi_reset_reason;
     slot.available_mask = available_mask;
     slot.pending = true;
+    ++remote_capture_count;
     device->SubmitCommandLists();
     readback_write_index = (readback_write_index + 1) % kReadbackRingSize;
+}
+
+void NewPipelineServerRenderPath::CapturePackedRemoteFrame(
+    const std::array<const wi::graphics::Texture*, static_cast<size_t>(RemoteBufferSemantic::Count)>& sources)
+{
+    PackedReadbackSlot& slot = packed_readback_ring[packed_readback_write_index];
+    if (slot.pending || (slot.readback && slot.readback.use_count() > 1))
+    {
+        ++remote_capture_drops;
+        return;
+    }
+
+    RemoteRawFrame contract;
+    uint32_t available_mask = 0;
+    for (size_t index = 0; index < sources.size(); ++index)
+    {
+        const wi::graphics::Texture* source = sources[index];
+        RemoteRawBuffer& buffer = contract.buffers[index];
+        buffer.semantic = static_cast<RemoteBufferSemantic>(index);
+        if (source == nullptr || !source->IsValid())
+            continue;
+        const wi::graphics::TextureDesc& desc = source->GetDesc();
+        buffer.width = desc.width;
+        buffer.height = desc.height;
+        buffer.available = true;
+        buffer.encoding = index == static_cast<size_t>(RemoteBufferSemantic::RemoteIndirectDiffuse) ||
+            index == static_cast<size_t>(RemoteBufferSemantic::RemoteSpecularIndirect)
+            ? RemoteBufferEncoding::LogHDR16F
+            : RemoteBufferEncoding::ScalarLuma8;
+        available_mask |= RemoteBufferKindMask(buffer.semantic);
+    }
+    if (available_mask == 0)
+        return;
+
+    RemoteFrameMetadata& metadata = contract.metadata;
+    metadata.frame_id = remote_frame_id + 1u;
+    metadata.timestamp_usec = NowUsec();
+    metadata.source_generation = remote_generation;
+    metadata.continuity_mask = available_mask;
+    metadata.available_buffer_mask = available_mask;
+    metadata.dynamic_range = RemoteDynamicRange::HDR;
+    metadata.source_stream_id = kRemoteFrameStreamId;
+    metadata.view_origin = local_camera.Eye;
+    XMStoreFloat3(&metadata.view_forward,
+        XMVector3Normalize(XMVectorSubtract(XMLoadFloat3(&local_camera.At), XMLoadFloat3(&local_camera.Eye))));
+    metadata.view = local_camera.View;
+    metadata.projection = local_camera.Projection;
+    XMStoreFloat4x4(&metadata.view_projection,
+        XMMatrixMultiply(XMLoadFloat4x4(&local_camera.View), XMLoadFloat4x4(&local_camera.Projection)));
+    XMStoreFloat4x4(&metadata.inverse_view, XMMatrixInverse(nullptr, XMLoadFloat4x4(&metadata.view)));
+    XMStoreFloat4x4(&metadata.inverse_projection, XMMatrixInverse(nullptr, XMLoadFloat4x4(&metadata.projection)));
+    XMStoreFloat4x4(&metadata.inverse_view_projection,
+        XMMatrixInverse(nullptr, XMLoadFloat4x4(&metadata.view_projection)));
+    metadata.near_plane = local_camera.zNearP;
+    metadata.far_plane = local_camera.zFarP;
+    metadata.history_valid = local_scene.ddgi.frame_index >= 64;
+    metadata.reset_this_frame = ddgi_announced_reset_serial != ddgi_reset_serial;
+    metadata.confidence = 1.0f;
+    metadata.valid = true;
+    metadata.ddgi_frame_index = local_scene.ddgi.frame_index;
+    metadata.ddgi_reset_reason = ddgi_reset_reason;
+
+    RemoteVideoFrameLayout layout;
+    std::vector<uint8_t> metadata_luma;
+    std::string layout_error;
+    if (!BuildRemoteVideoFrameLayout(contract, layout, metadata_luma, &layout_error))
+    {
+        wi::backlog::post("Server GPU I420 layout failed: " + layout_error);
+        return;
+    }
+    if (packed_layout_width != layout.video_width || packed_layout_height != layout.video_height)
+    {
+        packed_layout_width = layout.video_width;
+        packed_layout_height = layout.video_height;
+        ++remote_generation;
+        metadata.source_generation = remote_generation;
+        if (!BuildRemoteVideoFrameLayout(contract, layout, metadata_luma, &layout_error))
+        {
+            wi::backlog::post("Server GPU I420 layout rebuild failed: " + layout_error);
+            return;
+        }
+    }
+
+    const uint32_t y_stride = (layout.video_width + 3u) & ~3u;
+    const uint32_t uv_stride = (layout.video_width / 2u + 3u) & ~3u;
+    const uint32_t u_offset = y_stride * layout.video_height;
+    const uint32_t v_offset = u_offset + uv_stride * (layout.video_height / 2u);
+    const uint64_t packed_size = static_cast<uint64_t>(v_offset) +
+        static_cast<uint64_t>(uv_stride) * (layout.video_height / 2u);
+    if (packed_size == 0 || packed_size > std::numeric_limits<uint32_t>::max())
+    {
+        wi::backlog::post("Server GPU I420 packed buffer size is invalid.");
+        return;
+    }
+
+    wi::graphics::GraphicsDevice* device = wi::graphics::GetDevice();
+    const uint64_t metadata_buffer_size = (metadata_luma.size() + 3u) & ~3ull;
+    if (!slot.metadata_upload.IsValid() || slot.metadata_upload.GetDesc().size < metadata_buffer_size)
+    {
+        wi::graphics::GPUBufferDesc desc;
+        desc.size = metadata_buffer_size;
+        desc.usage = wi::graphics::Usage::UPLOAD;
+        desc.bind_flags = wi::graphics::BindFlag::SHADER_RESOURCE;
+        desc.misc_flags = wi::graphics::ResourceMiscFlag::BUFFER_RAW;
+        slot.metadata_upload = {};
+        if (!device->CreateBuffer(&desc, nullptr, &slot.metadata_upload))
+            return;
+        device->SetName(&slot.metadata_upload, "newpipeline.server.i420.metadata_upload");
+    }
+    if (!slot.packed_gpu.IsValid() || slot.packed_gpu.GetDesc().size != packed_size)
+    {
+        wi::graphics::GPUBufferDesc desc;
+        desc.size = packed_size;
+        desc.bind_flags = wi::graphics::BindFlag::UNORDERED_ACCESS;
+        desc.misc_flags = wi::graphics::ResourceMiscFlag::BUFFER_RAW;
+        slot.packed_gpu = {};
+        if (!device->CreateBuffer(&desc, nullptr, &slot.packed_gpu))
+            return;
+        device->SetName(&slot.packed_gpu, "newpipeline.server.i420.packed_gpu");
+    }
+    if (!slot.readback || !slot.readback->buffer.IsValid() || slot.readback->buffer.GetDesc().size != packed_size)
+    {
+        slot.readback = std::make_shared<PackedReadbackStorage>();
+        wi::graphics::GPUBufferDesc desc;
+        desc.size = packed_size;
+        desc.usage = wi::graphics::Usage::READBACK;
+        if (!device->CreateBuffer(&desc, nullptr, &slot.readback->buffer))
+        {
+            slot.readback.reset();
+            return;
+        }
+        device->SetName(&slot.readback->buffer, "newpipeline.server.i420.readback");
+    }
+    if (slot.metadata_upload.mapped_data == nullptr || slot.readback->buffer.mapped_data == nullptr)
+        return;
+    std::memcpy(slot.metadata_upload.mapped_data, metadata_luma.data(), metadata_luma.size());
+
+    wi::renderer::I420AtlasPackDesc pack_desc;
+    pack_desc.video_resolution = XMUINT2(layout.video_width, layout.video_height);
+    pack_desc.metadata_rows = static_cast<uint32_t>(metadata_luma.size() / layout.video_width);
+    pack_desc.y_stride = y_stride;
+    pack_desc.uv_stride = uv_stride;
+    pack_desc.u_offset = u_offset;
+    pack_desc.v_offset = v_offset;
+    pack_desc.available_mask = available_mask;
+    for (size_t index = 0; index < layout.tiles.size(); ++index)
+    {
+        const RemoteVideoTileLayout& tile = layout.tiles[index];
+        pack_desc.tile_rects[index] = XMUINT4(tile.origin_x, tile.origin_y, tile.width, tile.height);
+    }
+
+    wi::graphics::CommandList cmd = device->BeginCommandList();
+    wi::renderer::RGB_to_I420_Atlas(sources.data(), slot.metadata_upload, slot.packed_gpu, pack_desc, cmd);
+    device->Barrier(wi::graphics::GPUBarrier::Buffer(
+        &slot.packed_gpu, wi::graphics::ResourceState::UNORDERED_ACCESS, wi::graphics::ResourceState::COPY_SRC), cmd);
+    device->CopyResource(&slot.readback->buffer, &slot.packed_gpu, cmd);
+    device->Barrier(wi::graphics::GPUBarrier::Buffer(
+        &slot.packed_gpu, wi::graphics::ResourceState::COPY_SRC, wi::graphics::ResourceState::UNORDERED_ACCESS), cmd);
+
+    slot.layout = std::move(layout);
+    slot.y_stride = y_stride;
+    slot.uv_stride = uv_stride;
+    slot.u_offset = u_offset;
+    slot.v_offset = v_offset;
+    slot.pending = true;
+    // Wicked waits for the fence associated with a buffered frame index before
+    // reusing that index.  At this frame count the copy recorded below is
+    // therefore complete without a render-thread WaitForGPU().
+    slot.gpu_ready_frame = device->GetFrameCount() + wi::graphics::GraphicsDevice::GetBufferCount();
+    remote_frame_id = metadata.frame_id;
+    if (metadata.reset_this_frame)
+        ddgi_announced_reset_serial = ddgi_reset_serial;
+    ++remote_capture_count;
+    gpu_readback_bytes += packed_size;
+    device->SubmitCommandLists();
+    packed_readback_write_index = (packed_readback_write_index + 1u) % kReadbackRingSize;
+}
+
+void NewPipelineServerRenderPath::ConsumeCompletedPackedReadback()
+{
+    wi::graphics::GraphicsDevice* device = wi::graphics::GetDevice();
+    PackedReadbackSlot* completed = nullptr;
+    for (PackedReadbackSlot& candidate : packed_readback_ring)
+    {
+        if (!candidate.pending || !candidate.readback ||
+            candidate.readback->buffer.mapped_data == nullptr ||
+            device->GetFrameCount() < candidate.gpu_ready_frame)
+            continue;
+        if (completed == nullptr ||
+            candidate.layout.metadata.frame_id < completed->layout.metadata.frame_id)
+            completed = &candidate;
+    }
+    if (completed == nullptr)
+        return;
+
+    PackedReadbackSlot& slot = *completed;
+    const uint8_t* bytes = static_cast<const uint8_t*>(slot.readback->buffer.mapped_data);
+    RetainedI420Frame frame;
+    frame.width = slot.layout.video_width;
+    frame.height = slot.layout.video_height;
+    frame.y_plane = bytes;
+    frame.y_stride = slot.y_stride;
+    frame.u_plane = bytes + slot.u_offset;
+    frame.u_stride = slot.uv_stride;
+    frame.v_plane = bytes + slot.v_offset;
+    frame.v_stride = slot.uv_stride;
+    frame.timestamp_usec = static_cast<int64_t>(slot.layout.metadata.timestamp_usec);
+    frame.frame_lifetime = slot.readback;
+    slot.pending = false;
+    QueueI420FrameForPublish(std::move(frame), slot.layout);
 }
 
 void NewPipelineServerRenderPath::ConsumeCompletedReadback()
@@ -561,6 +816,7 @@ void NewPipelineServerRenderPath::ConsumeCompletedReadback()
             std::memcpy(destination.payload_rgba8.data() + y * destination_pitch,
                 source + static_cast<size_t>(y) * source_pitch, destination_pitch);
         }
+        cpu_readback_copy_bytes += static_cast<uint64_t>(destination_pitch) * desc.height;
         frame.metadata.width = std::max(frame.metadata.width, desc.width);
         frame.metadata.height = std::max(frame.metadata.height, desc.height);
     }
@@ -578,27 +834,59 @@ void NewPipelineServerRenderPath::StartPublishWorker()
         return;
     publish_worker_stop = false;
     publish_worker = std::thread([this]() {
+        bool first_packed_frame_published = false;
+        uint32_t published_generation = 0;
         for (;;)
         {
             RemoteRawFrame frame;
+            RetainedI420Frame i420_frame;
+            RemoteVideoFrameLayout i420_layout;
+            bool has_raw_frame = false;
+            bool has_i420_frame = false;
             {
                 std::unique_lock lock(publish_mutex);
-                publish_cv.wait(lock, [this]() { return publish_worker_stop || pending_publish_frame.has_value(); });
-                if (publish_worker_stop && !pending_publish_frame.has_value())
+                publish_cv.wait(lock, [this]() {
+                    return publish_worker_stop || pending_publish_frame.has_value() || pending_i420_frame.has_value();
+                });
+                if (publish_worker_stop && !pending_publish_frame.has_value() && !pending_i420_frame.has_value())
                     return;
-                frame = std::move(*pending_publish_frame);
-                pending_publish_frame.reset();
+                if (pending_i420_frame.has_value())
+                {
+                    i420_frame = std::move(pending_i420_frame->frame);
+                    i420_layout = std::move(pending_i420_frame->layout);
+                    pending_i420_frame.reset();
+                    has_i420_frame = true;
+                }
+                else if (pending_publish_frame.has_value())
+                {
+                    frame = std::move(*pending_publish_frame);
+                    pending_publish_frame.reset();
+                    has_raw_frame = true;
+                }
             }
 
             std::string error;
             bool published = false;
-            if (config.remote_source == RemoteSourceMode::Mock)
+            if (has_i420_frame)
+            {
+                if (i420_layout.metadata.camera_cut ||
+                    i420_layout.metadata.source_generation != published_generation)
+                {
+                    webrtc_transport.RequestKeyframe();
+                }
+                const bool metadata_sent = webrtc_transport.SendFrameMetadata(i420_layout);
+                published = metadata_sent && webrtc_transport.SendI420Frame(i420_frame);
+                if (published)
+                    published_generation = i420_layout.metadata.source_generation;
+                if (!published)
+                    error = webrtc_transport.GetStats().status;
+            }
+            else if (has_raw_frame && config.remote_source == RemoteSourceMode::Mock)
             {
                 published = mock_remote_mailbox.PublishLatest(frame, &error);
             }
-            else
+            else if (has_raw_frame)
             {
-                std::lock_guard transport_lock(webrtc_mutex);
                 published = webrtc_transport.SendFrame(frame);
                 if (!published)
                     error = webrtc_transport.GetStats().status;
@@ -606,9 +894,14 @@ void NewPipelineServerRenderPath::StartPublishWorker()
             if (!published)
                 wi::backlog::post("Server remote publish failed: " +
                     (error.empty() ? std::string{"unknown transport error"} : error));
-            else if (frame.metadata.frame_id == 1)
+            else if ((has_raw_frame && frame.metadata.frame_id == 1) ||
+                (has_i420_frame && !first_packed_frame_published))
+            {
                 wi::backlog::post("Server remote published first asynchronous frame: " +
-                    std::to_string(frame.metadata.width) + "x" + std::to_string(frame.metadata.height));
+                    std::to_string(has_i420_frame ? i420_frame.width : frame.metadata.width) + "x" +
+                    std::to_string(has_i420_frame ? i420_frame.height : frame.metadata.height));
+                first_packed_frame_published = first_packed_frame_published || has_i420_frame;
+            }
         }
     });
 }
@@ -629,7 +922,21 @@ void NewPipelineServerRenderPath::QueueFrameForPublish(RemoteRawFrame&& frame)
     {
         std::lock_guard lock(publish_mutex);
         // Latest-frame semantics: encoding never builds a backlog behind rendering.
+        if (pending_publish_frame.has_value())
+            publish_queue_drops.fetch_add(1, std::memory_order_relaxed);
         pending_publish_frame = std::move(frame);
+    }
+    publish_cv.notify_one();
+}
+
+void NewPipelineServerRenderPath::QueueI420FrameForPublish(
+    RetainedI420Frame&& frame, const RemoteVideoFrameLayout& layout)
+{
+    {
+        std::lock_guard lock(publish_mutex);
+        if (pending_i420_frame.has_value())
+            publish_queue_drops.fetch_add(1, std::memory_order_relaxed);
+        pending_i420_frame = PendingI420Publish{std::move(frame), layout};
     }
     publish_cv.notify_one();
 }

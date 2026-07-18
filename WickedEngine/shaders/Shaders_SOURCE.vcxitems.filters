@@ -938,6 +938,15 @@
     <FxCompile Include="$(MSBuildThisFileDirectory)yuv_to_rgbCS.hlsl">
       <Filter>CS</Filter>
     </FxCompile>
+    <FxCompile Include="$(MSBuildThisFileDirectory)yuv_to_rgb_regionCS.hlsl">
+      <Filter>CS</Filter>
+    </FxCompile>
+    <FxCompile Include="$(MSBuildThisFileDirectory)rgb_to_i420_atlasCS.hlsl">
+      <Filter>CS</Filter>
+    </FxCompile>
+    <ClInclude Include="$(MSBuildThisFileDirectory)ShaderInterop_I420.h">
+      <Filter>Interop</Filter>
+    </ClInclude>
     <FxCompile Include="$(MSBuildThisFileDirectory)blockcompressCS_BC1.hlsl">
       <Filter>CS</Filter>
     </FxCompile>
