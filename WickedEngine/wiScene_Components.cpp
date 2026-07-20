@@ -2073,6 +2073,11 @@ namespace wi::scene
 			wi::helper::saveTextureToMemory(
 				lightmap_statistics_texture, adaptive_statistics_data);
 		}
+		wi::vector<uint8_t> strict_coverage_data;
+		const bool strict_coverage_success =
+			lightmap_coverage.IsValid() &&
+			lightmap_coverage.desc.format == Format::R8_UNORM &&
+			wi::helper::saveTextureToMemory(lightmap_coverage, strict_coverage_data);
 		lightmap_render = {};
 		lightmap_batch = {};
 		lightmap_statistics_texture = {};
@@ -2085,6 +2090,32 @@ namespace wi::scene
 			bool success = wi::helper::saveTextureToMemory(lightmap, lightmapTextureData);
 			assert(success);
 			lightmapStatistics = {};
+			const uint64_t texel_count = uint64_t(lightmapWidth) * uint64_t(lightmapHeight);
+			if (strict_coverage_success && strict_coverage_data.size() >= texel_count)
+			{
+				lightmapCoverageData.assign(
+					strict_coverage_data.begin(),
+					strict_coverage_data.begin() + static_cast<size_t>(texel_count));
+			}
+			else
+			{
+				// Coverage is a required bake product. Do not silently reconstruct it
+				// from the padded lightmap alpha because that reintroduces the old
+				// first-jitter/alpha coupling and marks padding as mapped geometry.
+				lightmapCoverageData.clear();
+				success = false;
+			}
+			if (!success)
+			{
+				wi::backlog::post(
+					"[Lightmap error] resolved irradiance or strict coverage readback failed",
+					wi::backlog::LogLevel::Error);
+				lightmapTextureData.clear();
+				lightmapCoverageData.clear();
+				lightmap = {};
+				lightmap_coverage = {};
+				return;
+			}
 			const uint64_t adaptive_texel_count =
 				uint64_t(lightmapWidth) * uint64_t(lightmapHeight);
 			if (adaptive_statistics_data.size() >=
@@ -2110,10 +2141,8 @@ namespace wi::scene
 			}
 			if (success && lightmap.desc.format == Format::R16G16B16A16_FLOAT)
 			{
-				const uint64_t texel_count = uint64_t(lightmapWidth) * uint64_t(lightmapHeight);
 				if (lightmapTextureData.size() >= texel_count * sizeof(XMHALF4))
 				{
-					lightmapCoverageData.assign(static_cast<size_t>(texel_count), uint8_t{0});
 					const XMHALF4* texels = reinterpret_cast<const XMHALF4*>(lightmapTextureData.data());
 					XMFLOAT3 minimum(FLT_MAX, FLT_MAX, FLT_MAX);
 					XMFLOAT3 maximum = {};
@@ -2122,16 +2151,20 @@ namespace wi::scene
 					{
 						XMFLOAT4 sample;
 						XMStoreFloat4(&sample, XMLoadHalf4(texels + i));
+						const bool covered = lightmapCoverageData[static_cast<size_t>(i)] != 0;
 						const bool finite = std::isfinite(sample.x) && std::isfinite(sample.y) &&
-							std::isfinite(sample.z) && std::isfinite(sample.w);
-						if (sample.w <= 0 || !finite)
+							std::isfinite(sample.z);
+						if (!covered)
 						{
-							if (!finite)
-								++lightmapStatistics.invalid_sample_texel_count;
 							++lightmapStatistics.missing_texel_count;
 							continue;
 						}
-						lightmapCoverageData[static_cast<size_t>(i)] = 255;
+						if (!finite)
+						{
+							++lightmapStatistics.invalid_sample_texel_count;
+							++lightmapStatistics.missing_texel_count;
+							continue;
+						}
 						const XMFLOAT3 irradiance(
 							std::max(0.0f, sample.x * XM_PI),
 							std::max(0.0f, sample.y * XM_PI),
@@ -2343,6 +2376,54 @@ namespace wi::scene
 				lightmapStatistics.denoiser_applied = all_components_succeeded && !components.empty();
 			}
 #endif // OPEN_IMAGE_DENOISE
+
+			// Rebuild compression padding from the final (potentially denoised)
+			// geometric texels. Coverage itself remains unchanged. Four iterations
+			// match the xatlas chart padding and BC6H's 4x4 source footprint.
+			if (success && lightmapTextureData.size() >= texel_count * sizeof(XMHALF4) &&
+				lightmapCoverageData.size() >= texel_count)
+			{
+				XMHALF4* texels = reinterpret_cast<XMHALF4*>(lightmapTextureData.data());
+				wi::vector<uint8_t> padded_valid = lightmapCoverageData;
+				static constexpr int offsets[8][2] = {
+					{ 0, -1 }, { 0, 1 }, { -1, 0 }, { 1, 0 },
+					{ -1, -1 }, { 1, -1 }, { 1, 1 }, { -1, 1 },
+				};
+				for (uint32_t iteration = 0; iteration < 4; ++iteration)
+				{
+					const wi::vector<uint8_t> source_valid = padded_valid;
+					const wi::vector<XMHALF4> source_texels(texels, texels + texel_count);
+					bool expanded = false;
+					for (uint32_t y = 0; y < lightmapHeight; ++y)
+					{
+						for (uint32_t x = 0; x < lightmapWidth; ++x)
+						{
+							const uint64_t index = uint64_t(y) * lightmapWidth + x;
+							if (source_valid[static_cast<size_t>(index)] != 0)
+								continue;
+							for (const auto& offset : offsets)
+							{
+								const int candidate_x = static_cast<int>(x) + offset[0];
+								const int candidate_y = static_cast<int>(y) + offset[1];
+								if (candidate_x < 0 || candidate_y < 0 ||
+									candidate_x >= static_cast<int>(lightmapWidth) ||
+									candidate_y >= static_cast<int>(lightmapHeight))
+									continue;
+								const uint64_t candidate = uint64_t(candidate_y) * lightmapWidth +
+									static_cast<uint32_t>(candidate_x);
+								if (source_valid[static_cast<size_t>(candidate)] == 0)
+									continue;
+								texels[index] = source_texels[static_cast<size_t>(candidate)];
+								padded_valid[static_cast<size_t>(index)] = 255;
+								expanded = true;
+								break;
+							}
+						}
+					}
+					if (!expanded)
+						break;
+				}
+			}
 
 			CompressLightmap();
 

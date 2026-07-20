@@ -4765,6 +4765,19 @@ namespace wi::scene
 						device->CreateTexture(&desc, nullptr, &object.lightmap);
 						device->SetName(&object.lightmap, "lightmap");
 					}
+					if (!object.lightmap_coverage.IsValid() ||
+						!has_flag(object.lightmap_coverage.desc.bind_flags, BindFlag::UNORDERED_ACCESS) ||
+						object.lightmap_coverage.desc.width != object.lightmapWidth ||
+						object.lightmap_coverage.desc.height != object.lightmapHeight)
+					{
+						TextureDesc desc;
+						desc.width = object.lightmapWidth;
+						desc.height = object.lightmapHeight;
+						desc.bind_flags = BindFlag::UNORDERED_ACCESS | BindFlag::SHADER_RESOURCE;
+						desc.format = Format::R8_UNORM;
+						device->CreateTexture(&desc, nullptr, &object.lightmap_coverage);
+						device->SetName(&object.lightmap_coverage, "lightmap_coverage_strict");
+					}
 				}
 
 				if (!object.lightmapTextureData.empty() && !object.lightmap.IsValid())

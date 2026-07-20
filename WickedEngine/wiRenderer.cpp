@@ -1491,7 +1491,7 @@ void LoadShaders()
 		desc.vs = &shaders[VSTYPE_RENDERLIGHTMAP];
 		desc.ps = &shaders[PSTYPE_RENDERLIGHTMAP];
 		desc.rs = &rasterizers[RSTYPE_LIGHTMAP];
-		desc.bs = &blendStates[BSTYPE_TRANSPARENT];
+		desc.bs = &blendStates[BSTYPE_LIGHTMAP_ACCUMULATE];
 		desc.dss = &depthStencils[DSSTYPE_DEFAULT]; // Note: depth is used to disallow overlapped pixel/primitive writes with conservative rasterization!
 
 		device->CreatePipelineState(&desc, &PSO_renderlightmap);
@@ -2573,6 +2573,23 @@ void SetUpStates()
 	bd.alpha_to_coverage_enable = false;
 	bd.independent_blend_enable = false;
 	blendStates[BSTYPE_TRANSPARENTSHADOW] = bd;
+
+	// A lightmap texel can be covered by a different subset of the jittered UV
+	// raster passes than its neighbours. Accumulate an unnormalised radiance sum
+	// and a local valid-sample count so missing raster passes are not interpreted
+	// as black samples. Resolve performs sum / count after tracing.
+	bd = {};
+	bd.render_target[0].blend_enable = true;
+	bd.render_target[0].src_blend = Blend::ONE;
+	bd.render_target[0].dest_blend = Blend::ONE;
+	bd.render_target[0].blend_op = BlendOp::ADD;
+	bd.render_target[0].src_blend_alpha = Blend::ONE;
+	bd.render_target[0].dest_blend_alpha = Blend::ONE;
+	bd.render_target[0].blend_op_alpha = BlendOp::ADD;
+	bd.render_target[0].render_target_write_mask = ColorWrite::ENABLE_ALL;
+	bd.independent_blend_enable = false;
+	bd.alpha_to_coverage_enable = false;
+	blendStates[BSTYPE_LIGHTMAP_ACCUMULATE] = bd;
 
 
 
@@ -11426,18 +11443,35 @@ void RefreshLightmaps(const Scene& scene, CommandList cmd, uint32_t iterations_p
 				device->EventBegin("Lightmap expand", cmd);
 
 				device->BindComputeShader(&shaders[CSTYPE_LIGHTMAP_EXPAND], cmd);
+				struct LightmapExpandPushConstants
+				{
+					uint32_t resolve;
+				};
+				LightmapExpandPushConstants expand_push = {};
 
-				// render -> lightmap
+				// Resolve the additive radiance sum with its per-texel valid sample
+				// count. Strict geometric coverage is written to its own texture and
+				// remains unchanged by the following color-padding passes.
 				{
 					device->BindResource(&object.lightmap_render, 0, cmd);
 					device->BindUAV(&object.lightmap, 0, cmd);
+					device->BindUAV(&object.lightmap_coverage, 1, cmd);
 
-					device->Barrier(GPUBarrier::Image(&object.lightmap, object.lightmap.desc.layout, ResourceState::UNORDERED_ACCESS), cmd);
+					GPUBarrier barriers[] = {
+						GPUBarrier::Image(&object.lightmap, object.lightmap.desc.layout, ResourceState::UNORDERED_ACCESS),
+						GPUBarrier::Image(&object.lightmap_coverage, object.lightmap_coverage.desc.layout, ResourceState::UNORDERED_ACCESS),
+					};
+					device->Barrier(barriers, arraysize(barriers), cmd);
 
+					expand_push.resolve = 1;
+					device->PushConstants(&expand_push, sizeof(expand_push), cmd);
 					device->Dispatch((desc.width + POSTPROCESS_BLOCKSIZE - 1) / POSTPROCESS_BLOCKSIZE, (desc.height + POSTPROCESS_BLOCKSIZE - 1) / POSTPROCESS_BLOCKSIZE, 1, cmd);
 
 					device->Barrier(GPUBarrier::Image(&object.lightmap, ResourceState::UNORDERED_ACCESS, object.lightmap.desc.layout), cmd);
+					device->Barrier(GPUBarrier::Memory(&object.lightmap_coverage), cmd);
 				}
+				expand_push.resolve = 0;
+				device->PushConstants(&expand_push, sizeof(expand_push), cmd);
 				for (int repeat = 0; repeat < 4; ++repeat)
 				{
 					// lightmap -> temp
@@ -11468,6 +11502,10 @@ void RefreshLightmaps(const Scene& scene, CommandList cmd, uint32_t iterations_p
 						device->Barrier(GPUBarrier::Image(&object.lightmap, ResourceState::UNORDERED_ACCESS, object.lightmap.desc.layout), cmd);
 					}
 				}
+				device->Barrier(GPUBarrier::Image(
+					&object.lightmap_coverage,
+					ResourceState::UNORDERED_ACCESS,
+					object.lightmap_coverage.desc.layout), cmd);
 				device->EventEnd(cmd);
 			}
 

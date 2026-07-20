@@ -1000,9 +1000,12 @@ LightmapOutput main(Input input)
 		result *= min(1.0, LIGHTMAP_SAMPLE_RADIANCE_MAX / max(peak, 1e-4));
 	}
 
-	output.accumulated = float4(result, xTraceAccumulationFactor);
-	const uint batch_size = max(xTraceUserData.z, 1u);
-	const uint batch_sample = xTraceSampleIndex % batch_size;
-	output.batch = float4(result, rcp(float(batch_sample + 1u)));
+	// Both render targets use additive blending. RGB is an unnormalised radiance
+	// sum and alpha is the local valid-sample count. UV raster jitter means a
+	// texel is not necessarily covered in every object iteration, so using the
+	// global iteration as a running-average weight biases late-covered texels
+	// toward black and makes entire low-density triangles fail coverage.
+	output.accumulated = float4(result, 1);
+	output.batch = float4(result, 1);
 	return output;
 }

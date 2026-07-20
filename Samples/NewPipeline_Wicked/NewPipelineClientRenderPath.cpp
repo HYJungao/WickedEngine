@@ -37,7 +37,7 @@ constexpr uint32_t kClientReflectionProbeResolution = 128;
 constexpr const char* kLightmapBakeModeMetadataKey = "newpipeline.lightmap_bake_mode";
 constexpr size_t kMaxLightmapsInFlight = 8;
 constexpr uint32_t kMaxClientLightmapIterationsPerFrame = 32;
-constexpr uint64_t kLightmapTransientBytesPerTexel = 24;
+constexpr uint64_t kLightmapTransientBytesPerTexel = 57;
 constexpr uint64_t kLightmapMinimumVRAMReserve = 512ull * 1024ull * 1024ull;
 constexpr float kLightmapFrameTimeEMAWeight = 0.2f;
 constexpr float kLightmapFrameTimeRampUp = 0.075f;
@@ -49,8 +49,9 @@ constexpr uint64_t kLightmapNoProgressTimeoutUsec = 30'000'000;
 uint64_t EstimateLightmapTransientBytes(const XMUINT2& dimensions)
 {
     const uint64_t texels = uint64_t(dimensions.x) * uint64_t(dimensions.y);
-    // R32G32B32A32 accumulation (16 B) + R16G16B16A16 expanded result
-    // (8 B), plus a 25% allocator/deferred-destruction safety margin.
+    // R32G32B32A32 accumulation, independent batch and adaptive statistics
+    // (3 * 16 B) + R16G16B16A16 resolved result (8 B) + strict R8 coverage
+    // (1 B), plus a 25% allocator/deferred-destruction safety margin.
     return texels * kLightmapTransientBytesPerTexel * 5ull / 4ull;
 }
 

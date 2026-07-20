@@ -4,6 +4,13 @@
 Texture2D lightmap_input : register(t0);
 
 RWTexture2D<float4> lightmap_output : register(u0);
+RWTexture2D<unorm float> lightmap_coverage_output : register(u1);
+
+struct LightmapExpandPushConstants
+{
+	uint resolve;
+};
+PUSHCONSTANT(push, LightmapExpandPushConstants);
 
 static const int2 offsets[] = {
 	int2(0, -1),
@@ -28,6 +35,18 @@ void main(uint3 DTid : SV_DispatchThreadID)
 	if (pixel.x >= output_width || pixel.y >= output_height)
 		return;
 	float4 color = lightmap_input[pixel];
+
+	if (push.resolve != 0)
+	{
+		// The tracing target stores radiance sum in RGB and the exact local valid
+		// sample count in alpha. Resolve once into the sampled half-float lightmap
+		// and persist strict geometric coverage separately from padding.
+		const bool covered = color.a > 0;
+		color = covered ? float4(max(0, color.rgb / color.a), 1) : 0;
+		lightmap_coverage_output[pixel] = covered ? 1 : 0;
+		lightmap_output[pixel] = color;
+		return;
+	}
 
 	for (uint i = 0; (i < arraysize(offsets)) && (color.a < 1); ++i)
 	{

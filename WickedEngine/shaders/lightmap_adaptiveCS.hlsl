@@ -20,15 +20,16 @@ void main(uint3 DTid : SV_DispatchThreadID)
 		return;
 
 	const uint2 pixel = DTid.xy;
-	const float4 batch = lightmap_batch[pixel];
-	if (batch.a <= 0)
+	const float4 batch_sum_and_count = lightmap_batch[pixel];
+	if (batch_sum_and_count.a <= 0)
 		return; // atlas padding or an invalid raster sample
+	const float3 batch_mean = batch_sum_and_count.rgb / batch_sum_and_count.a;
 
 	float4 state = lightmap_statistics[pixel];
 	if (state.w > 0.5)
 		return;
 
-	const float luminance = max(0, dot(batch.rgb, float3(0.2126, 0.7152, 0.0722)));
+	const float luminance = max(0, dot(batch_mean, float3(0.2126, 0.7152, 0.0722)));
 	const float observation = log2(1.0 + luminance);
 	const float count = state.z + 1.0;
 	const float delta = observation - state.x;

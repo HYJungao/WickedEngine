@@ -494,6 +494,9 @@ namespace wi::enums
 		BSTYPE_MULTIPLY,
 		BSTYPE_INVERSE,
 		BSTYPE_TRANSPARENTSHADOW,
+		// Lightmap radiance is stored as an additive sum and alpha stores the
+		// per-texel valid sample count. Both channels must use ONE + ONE.
+		BSTYPE_LIGHTMAP_ACCUMULATE,
 		BSTYPE_COUNT
 	};
 
