@@ -91,9 +91,6 @@ enum class DebugPreviewMode : uint8_t
     TransportSpecularIndirect,
     TransportShadowVisibility,
     LocalReflectionProbe,
-    LocalLightmapValidity,
-    LocalLightmapCoverage,
-    LocalLightmapRaw,
     LocalIndirectFinalInput,
 };
 

@@ -69,6 +69,7 @@ namespace
 {
 constexpr size_t kMaxControlBytes = 64u * 1024u;
 constexpr size_t kMaxDataChannelBufferedBytes = 1u * 1024u * 1024u;
+constexpr size_t kMaxReceiveQueueDepth = 8u;
 constexpr uint32_t kMaxVideoDimension = 8192;
 // The V2 video frame is a data atlas rather than a camera image. Let congestion
 // control drop frames, but never silently downscale it because that destroys the
@@ -824,10 +825,10 @@ public:
         if (server_)
             return false;
         std::lock_guard<std::mutex> lock(video_mutex_);
-        if (!latest_video_.has_value())
+        if (received_video_queue_.empty())
             return false;
-        output = std::move(*latest_video_);
-        latest_video_.reset();
+        output = std::move(received_video_queue_.front());
+        received_video_queue_.pop_front();
         return true;
     }
 
@@ -888,10 +889,10 @@ public:
         if (server_)
             return false;
         std::lock_guard<std::mutex> lock(frame_metadata_mutex_);
-        if (latest_frame_metadata_.empty())
+        if (received_frame_metadata_queue_.empty())
             return false;
-        output = std::move(latest_frame_metadata_);
-        latest_frame_metadata_.clear();
+        output = std::move(received_frame_metadata_queue_.front());
+        received_frame_metadata_queue_.pop_front();
         return true;
     }
 
@@ -911,7 +912,7 @@ public:
     uint32_t DecodedQueueDepth()
     {
         std::lock_guard<std::mutex> lock(video_mutex_);
-        return latest_video_.has_value() ? 1u : 0u;
+        return static_cast<uint32_t>(received_video_queue_.size());
     }
     uint64_t SentControls() const { return sent_controls_.load(); }
     uint64_t ReceivedControls() const { return received_controls_.load(); }
@@ -1407,7 +1408,10 @@ private:
         if (server_ || !buffer.binary || buffer.size() == 0 || buffer.size() > kMaxControlBytes)
             return;
         std::lock_guard<std::mutex> lock(frame_metadata_mutex_);
-        latest_frame_metadata_.assign(buffer.data.data(), buffer.data.data() + buffer.size());
+        if (received_frame_metadata_queue_.size() >= kMaxReceiveQueueDepth)
+            received_frame_metadata_queue_.pop_front();
+        received_frame_metadata_queue_.emplace_back(
+            buffer.data.data(), buffer.data.data() + buffer.size());
     }
 
     void OnControlMessage(const webrtc::DataBuffer& buffer)
@@ -1444,9 +1448,12 @@ private:
         received.i420 = i420;
         {
             std::lock_guard<std::mutex> lock(video_mutex_);
-            if (latest_video_.has_value())
+            if (received_video_queue_.size() >= kMaxReceiveQueueDepth)
+            {
+                received_video_queue_.pop_front();
                 dropped_frames_.fetch_add(1);
-            latest_video_ = std::move(received);
+            }
+            received_video_queue_.push_back(std::move(received));
         }
         received_frames_.fetch_add(1);
     }
@@ -1590,7 +1597,7 @@ private:
     webrtc::scoped_refptr<webrtc::VideoTrackInterface> remote_video_track_;
     std::unique_ptr<VideoSink> video_sink_;
     std::mutex video_mutex_;
-    std::optional<ReceivedVideoFrame> latest_video_;
+    std::deque<ReceivedVideoFrame> received_video_queue_;
     std::mutex channel_mutex_;
     webrtc::scoped_refptr<webrtc::DataChannelInterface> control_channel_;
     std::unique_ptr<ChannelObserver> channel_observer_;
@@ -1599,7 +1606,7 @@ private:
     std::mutex control_mutex_;
     std::vector<uint8_t> latest_control_;
     std::mutex frame_metadata_mutex_;
-    std::vector<uint8_t> latest_frame_metadata_;
+    std::deque<std::vector<uint8_t>> received_frame_metadata_queue_;
     std::mutex ice_mutex_;
     std::vector<PendingIce> pending_ice_;
     mutable std::mutex status_mutex_;

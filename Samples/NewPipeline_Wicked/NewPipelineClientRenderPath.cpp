@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cmath>
 #include <filesystem>
+#include <iterator>
 #include <limits>
 #include <sstream>
 #include <unordered_set>
@@ -24,6 +25,8 @@ namespace
 // encode/decode and scheduling jitter before falling back to local rendering.
 constexpr float kRemoteStaleTimeoutSeconds = 5.0f;
 constexpr uint64_t kMaxRemoteFrameAgeUsec = 5'000'000;
+constexpr uint64_t kRemotePairTimeoutUsec = 1'000'000;
+constexpr size_t kMaxPendingRemotePairs = 8;
 constexpr float kRemoteFullQualitySeconds = 1.5f;
 constexpr float kElasticBlendAttackSpeed = 5.0f;
 constexpr float kElasticBlendReleaseSpeed = 10.0f;
@@ -154,28 +157,6 @@ std::string FormatLightmapBakeCoverage(const LightmapBakeCoverage& coverage, siz
         " atlas_failures=" + std::to_string(coverage.atlas_failures);
 }
 
-std::string FormatLightmapStatistics(
-    const wi::scene::ObjectComponent::LightmapStatistics& statistics)
-{
-    std::ostringstream stream;
-    stream << "valid=" << statistics.valid_texel_count <<
-        " missing=" << statistics.missing_texel_count <<
-        " invalid=" << statistics.invalid_sample_texel_count <<
-        " irradiance[min=" << statistics.irradiance_min.x << "," <<
-            statistics.irradiance_min.y << "," << statistics.irradiance_min.z <<
-        " avg=" << statistics.irradiance_average.x << "," <<
-            statistics.irradiance_average.y << "," << statistics.irradiance_average.z <<
-        " max=" << statistics.irradiance_max.x << "," <<
-            statistics.irradiance_max.y << "," << statistics.irradiance_max.z << "]" <<
-        " adaptive[texels=" << statistics.adaptive_texel_count <<
-            " converged=" << statistics.adaptive_converged_texel_count <<
-            " avg_batches=" << statistics.adaptive_average_batches << "]" <<
-        " denoiser=" << (statistics.denoiser_applied ? "applied" :
-            statistics.denoiser_failed ? "failed" :
-            statistics.denoiser_available ? "available-not-applied" : "unavailable");
-    return stream.str();
-}
-
 uint64_t NowUsec()
 {
     using clock = std::chrono::steady_clock;
@@ -237,6 +218,12 @@ float SmoothWeight(float current, float target, float dt)
 
 void NewPipelineClientRenderPath::SetRuntimeConfig(const RuntimeConfig& value)
 {
+    if (config.remote_source != value.remote_source)
+    {
+        ClearPendingRemoteFrames();
+        downstream_metadata_active = false;
+        remote_consume = {};
+    }
     config        = value;
     switch (config.remote_debug_mode)
     {
@@ -326,12 +313,18 @@ std::string NewPipelineClientRenderPath::GetDebugStatusSummary() const
             " meta=" + std::to_string(downstream_metadata_matches) + "/" +
                 std::to_string(downstream_metadata_misses) + "/" +
                 std::to_string(downstream_metadata_mismatches) +
+            " pair[m/v/x]=" + std::to_string(downstream_metadata_first_matches) + "/" +
+                std::to_string(downstream_video_first_matches) + "/" +
+                std::to_string(downstream_pair_expirations) +
+            " pending=" + std::to_string(downstream_metadata_cache.size()) + "/" +
+                std::to_string(pending_remote_video_frames.size()) +
             (transport.native_codec || transport.codec_fallback_reason.empty()
                 ? std::string{} : " fallback=" + transport.codec_fallback_reason)
         : std::string{};
     return GetEffectiveAlgorithmSummary() + "\n" + client_static_lighting.GetStatusSummary() + transport_status +
         "\nRemote decoded: " +
-        (remote_consume.accepted_valid ? std::string{"available"} : std::string{"unavailable"}) +
+        (remote_consume.accepted_valid ? std::string{"available"} :
+            std::string{"unavailable ("} + remote_consume.fallback_reason + ")") +
         "\nRemote DDGI: frame " + std::to_string(remote_ddgi_frame_index) +
         (remote_consume.history_valid ? " converged" : " warming") +
         " reset=" + ToString(remote_ddgi_reset_reason) +
@@ -412,18 +405,10 @@ void NewPipelineClientRenderPath::ResizeBuffers()
 {
     wi::RenderPath3D::ResizeBuffers();
     local_ao_snapshot = {};
-    local_lightmap_irradiance = {};
-    local_lightmap_validity = {};
-    local_lightmap_coverage = {};
-    local_lightmap_raw = {};
     local_indirect_final_input = {};
     local_specular_indirect = {};
     elastic_indirect_diffuse = {};
     elastic_ao = {};
-    visibilityResources.texture_lightmap_irradiance = nullptr;
-    visibilityResources.texture_lightmap_validity = nullptr;
-    visibilityResources.texture_lightmap_coverage = nullptr;
-    visibilityResources.texture_lightmap_raw = nullptr;
     visibilityResources.texture_local_indirect_diffuse = nullptr;
     visibilityResources.texture_specular_indirect = nullptr;
     visibilityResources.texture_elastic_indirect_diffuse = nullptr;
@@ -445,51 +430,6 @@ void NewPipelineClientRenderPath::ResizeBuffers()
         desc.format = wi::graphics::Format::R16G16B16A16_FLOAT;
         desc.bind_flags = wi::graphics::BindFlag::SHADER_RESOURCE | wi::graphics::BindFlag::UNORDERED_ACCESS;
         desc.layout = wi::graphics::ResourceState::SHADER_RESOURCE_COMPUTE;
-        if (wi::graphics::GetDevice()->CreateTexture(&desc, nullptr, &local_lightmap_irradiance))
-        {
-            wi::graphics::GetDevice()->SetName(&local_lightmap_irradiance, "newpipeline.client.local_lightmap_irradiance");
-            visibilityResources.texture_lightmap_irradiance = &local_lightmap_irradiance;
-        }
-        else
-        {
-            wi::backlog::post("Client Local Lightmap Irradiance texture creation failed: " +
-                std::to_string(internal_resolution.x) + "x" + std::to_string(internal_resolution.y));
-        }
-
-        wi::graphics::TextureDesc validity_desc = desc;
-        validity_desc.format = wi::graphics::Format::R8G8B8A8_UNORM;
-        if (wi::graphics::GetDevice()->CreateTexture(&validity_desc, nullptr, &local_lightmap_validity))
-        {
-            wi::graphics::GetDevice()->SetName(&local_lightmap_validity, "newpipeline.client.local_lightmap_validity");
-            visibilityResources.texture_lightmap_validity = &local_lightmap_validity;
-        }
-        else
-        {
-            wi::backlog::post("Client Local Lightmap Validity texture creation failed: " +
-                std::to_string(internal_resolution.x) + "x" + std::to_string(internal_resolution.y));
-        }
-
-        if (wi::graphics::GetDevice()->CreateTexture(&validity_desc, nullptr, &local_lightmap_coverage))
-        {
-            wi::graphics::GetDevice()->SetName(&local_lightmap_coverage, "newpipeline.client.local_lightmap_coverage");
-            visibilityResources.texture_lightmap_coverage = &local_lightmap_coverage;
-        }
-        else
-        {
-            wi::backlog::post("Client Local Lightmap Coverage texture creation failed: " +
-                std::to_string(internal_resolution.x) + "x" + std::to_string(internal_resolution.y));
-        }
-
-        if (wi::graphics::GetDevice()->CreateTexture(&desc, nullptr, &local_lightmap_raw))
-        {
-            wi::graphics::GetDevice()->SetName(&local_lightmap_raw, "newpipeline.client.local_lightmap_raw");
-            visibilityResources.texture_lightmap_raw = &local_lightmap_raw;
-        }
-        else
-        {
-            wi::backlog::post("Client Local Lightmap Raw texture creation failed: " +
-                std::to_string(internal_resolution.x) + "x" + std::to_string(internal_resolution.y));
-        }
         if (wi::graphics::GetDevice()->CreateTexture(&desc, nullptr, &local_indirect_final_input))
         {
             wi::graphics::GetDevice()->SetName(&local_indirect_final_input, "newpipeline.client.local_indirect_final_input");
@@ -611,8 +551,9 @@ void NewPipelineClientRenderPath::MaintainWebRTC(float dt)
     if (previous_webrtc_state == WebRTCTransportState::Connected &&
         stats.state != WebRTCTransportState::Connected)
     {
-        downstream_metadata_cache.clear();
+        ClearPendingRemoteFrames();
         downstream_metadata_active = false;
+        InvalidateRemote("transport disconnected");
     }
     previous_webrtc_state = stats.state;
 }
@@ -634,8 +575,92 @@ void NewPipelineClientRenderPath::PollRemoteFrameMetadata()
             ++iterator;
     }
     downstream_metadata_cache.push_back(std::move(layout));
-    while (downstream_metadata_cache.size() > 8)
+    while (downstream_metadata_cache.size() > kMaxPendingRemotePairs)
+    {
         downstream_metadata_cache.pop_front();
+        ++downstream_pair_expirations;
+    }
+}
+
+void NewPipelineClientRenderPath::ClearPendingRemoteFrames()
+{
+    downstream_metadata_cache.clear();
+    pending_remote_video_frames.clear();
+}
+
+void NewPipelineClientRenderPath::PrunePendingRemoteFrames(uint64_t now_usec)
+{
+    while (!downstream_metadata_cache.empty())
+    {
+        const uint64_t received = downstream_metadata_cache.front().metadata.local_receive_timestamp_usec;
+        if (received != 0 && received + kRemotePairTimeoutUsec >= now_usec)
+            break;
+        downstream_metadata_cache.pop_front();
+        ++downstream_pair_expirations;
+    }
+    while (!pending_remote_video_frames.empty())
+    {
+        const uint64_t received = pending_remote_video_frames.front().local_receive_timestamp_usec;
+        if (received + kRemotePairTimeoutUsec >= now_usec)
+            break;
+        pending_remote_video_frames.pop_front();
+        ++downstream_pair_expirations;
+    }
+}
+
+bool NewPipelineClientRenderPath::TryMatchRemoteVideoFrame(
+    RetainedI420Frame& frame,
+    RemoteVideoFrameLayout& layout)
+{
+    struct Match
+    {
+        size_t video_index = 0;
+        size_t metadata_index = 0;
+        uint64_t timestamp_usec = 0;
+        bool valid = false;
+    } match;
+
+    for (size_t video_index = 0; video_index < pending_remote_video_frames.size(); ++video_index)
+    {
+        const int64_t timestamp = pending_remote_video_frames[video_index].frame.timestamp_usec;
+        if (timestamp <= 0)
+            continue;
+        for (size_t metadata_index = 0; metadata_index < downstream_metadata_cache.size(); ++metadata_index)
+        {
+            if (downstream_metadata_cache[metadata_index].metadata.timestamp_usec !=
+                static_cast<uint64_t>(timestamp))
+                continue;
+            if (!match.valid || static_cast<uint64_t>(timestamp) > match.timestamp_usec)
+            {
+                match.video_index = video_index;
+                match.metadata_index = metadata_index;
+                match.timestamp_usec = static_cast<uint64_t>(timestamp);
+                match.valid = true;
+            }
+        }
+    }
+    if (!match.valid)
+        return false;
+
+    const PendingRemoteVideoFrame& pending_video = pending_remote_video_frames[match.video_index];
+    const RemoteVideoFrameLayout& pending_metadata = downstream_metadata_cache[match.metadata_index];
+    if (pending_metadata.metadata.local_receive_timestamp_usec <= pending_video.local_receive_timestamp_usec)
+        ++downstream_metadata_first_matches;
+    else
+        ++downstream_video_first_matches;
+
+    frame = pending_video.frame;
+    layout = pending_metadata;
+    layout.metadata.local_receive_timestamp_usec = NowUsec();
+
+    pending_remote_video_frames.erase(
+        pending_remote_video_frames.begin(),
+        std::next(pending_remote_video_frames.begin(), match.video_index + 1));
+    downstream_metadata_cache.erase(
+        downstream_metadata_cache.begin(),
+        std::next(downstream_metadata_cache.begin(), match.metadata_index + 1));
+    ++downstream_metadata_matches;
+    return true;
 }
 
 void NewPipelineClientRenderPath::InitializeSceneIfNeeded()
@@ -1093,16 +1118,13 @@ void NewPipelineClientRenderPath::RequestLightmapBake()
 
     lightmap_bake_denoiser_available =
         wi::scene::ObjectComponent::IsLightmapDenoiserAvailable();
-    lightmap_bake_denoiser_required = !lightmap_diagnostic_session_active;
-    if (!lightmap_diagnostic_session_active)
-    {
-        wi::backlog::post(
-            "Client lightmap production quality: integrator=vertex-nee-mis-v4-geometric-bias"
-            " sampler=independent-owen-sobol-batches"
-            " light_selection=spatial-candidate-contribution-cdf"
-            " guiding=first-bounce-tile-mixture denoiser=OIDN-required"
-            " samples=" + std::to_string(lightmap_bake_settings.sample_count));
-    }
+    lightmap_bake_denoiser_required = true;
+    wi::backlog::post(
+        "Client lightmap production quality: integrator=vertex-nee-mis-v4-geometric-bias"
+        " sampler=independent-owen-sobol-batches"
+        " light_selection=spatial-candidate-contribution-cdf"
+        " guiding=first-bounce-tile-mixture denoiser=OIDN-required"
+        " samples=" + std::to_string(lightmap_bake_settings.sample_count));
     if (!scene_initialized || scene_asset_path.empty())
     {
         render_settings.lightmap_bake_requested = false;
@@ -1329,125 +1351,12 @@ bool NewPipelineClientRenderPath::IsLightmapBakeActive() const
 {
     return lightmap_bake_state == LightmapBakeState::Preparing ||
         lightmap_bake_state == LightmapBakeState::Baking ||
-        lightmap_bake_state == LightmapBakeState::Saving ||
-        lightmap_bake_state == LightmapBakeState::DiagnosticPaused ||
-        lightmap_bake_state == LightmapBakeState::DiagnosticCompressed;
+        lightmap_bake_state == LightmapBakeState::Saving;
 }
 
 std::string NewPipelineClientRenderPath::GetLightmapBakeStatus() const
 {
     return lightmap_bake_status;
-}
-
-bool NewPipelineClientRenderPath::PickLightmapDiagnosticObjectAtScreenCenter()
-{
-    if (!scene_initialized || IsLightmapBakeActive())
-    {
-        lightmap_diagnostic_status = "Diagnostic: object pick unavailable while scene/bake is inactive";
-        return false;
-    }
-
-    const long center_x = static_cast<long>(GetLogicalWidth() * 0.5f);
-    const long center_y = static_cast<long>(GetLogicalHeight() * 0.5f);
-    const wi::primitive::Ray ray = wi::renderer::GetPickRay(center_x, center_y, *this, local_camera);
-    const wi::scene::PickResult pick = wi::scene::Pick(
-        ray, wi::enums::FILTER_OBJECT_ALL, ~0u, local_scene);
-    if (pick.entity == wi::ecs::INVALID_ENTITY || local_scene.objects.GetComponent(pick.entity) == nullptr)
-    {
-        lightmap_diagnostic_entity = wi::ecs::INVALID_ENTITY;
-        lightmap_diagnostic_object_name.clear();
-        lightmap_diagnostic_status = "Diagnostic: screen center did not hit a mesh object";
-        return false;
-    }
-
-    lightmap_diagnostic_entity = pick.entity;
-    const wi::scene::NameComponent* name = local_scene.names.GetComponent(pick.entity);
-    lightmap_diagnostic_object_name = name != nullptr && !name->name.empty()
-        ? name->name : std::to_string(pick.entity);
-    lightmap_diagnostic_status = "Diagnostic target: " + lightmap_diagnostic_object_name +
-        " entity=" + std::to_string(pick.entity) + " (ready)";
-    wi::backlog::post(lightmap_diagnostic_status);
-    return true;
-}
-
-bool NewPipelineClientRenderPath::HasLightmapDiagnosticObject() const
-{
-    return lightmap_diagnostic_entity != wi::ecs::INVALID_ENTITY &&
-        local_scene.objects.GetComponent(lightmap_diagnostic_entity) != nullptr;
-}
-
-void NewPipelineClientRenderPath::SetLightmapDiagnosticSettings(
-    const LightmapDiagnosticSettings& settings)
-{
-    if (lightmap_diagnostic_session_active)
-        return;
-    lightmap_diagnostic_settings = settings;
-    lightmap_diagnostic_settings.resolution = std::clamp(settings.resolution, 64u, 1024u);
-    lightmap_diagnostic_settings.sample_count = std::clamp(settings.sample_count, 1u, 8192u);
-    lightmap_diagnostic_settings.bounce_count = std::clamp(settings.bounce_count, 1u, 8u);
-}
-
-void NewPipelineClientRenderPath::RequestLightmapDiagnosticBake()
-{
-    if (IsLightmapBakeActive() || IsReflectionProbeBakeActive())
-    {
-        lightmap_diagnostic_status = "Diagnostic: another lighting operation is active";
-        return;
-    }
-    if (!HasLightmapDiagnosticObject())
-    {
-        lightmap_diagnostic_status = "Diagnostic: pick an object at screen center first";
-        return;
-    }
-
-    lightmap_bake_settings_before_diagnostic = lightmap_bake_settings;
-    lightmap_bake_settings.resolution = lightmap_diagnostic_settings.resolution;
-    lightmap_bake_settings.sample_count = lightmap_diagnostic_settings.sample_count;
-    lightmap_bake_settings.bounce_count = lightmap_diagnostic_settings.bounce_count;
-    lightmap_diagnostic_session_active = true;
-    lightmap_diagnostic_resume_requested = false;
-    lightmap_diagnostic_atlas_regenerated = false;
-    lightmap_diagnostic_atlas_audit = {};
-    lightmap_diagnostic_sampling_audit = {};
-    lightmap_diagnostic_status = "Diagnostic: preparing selected object " +
-        lightmap_diagnostic_object_name;
-    RequestLightmapBake();
-    if (lightmap_bake_state == LightmapBakeState::Failed)
-        EndLightmapDiagnosticSession(lightmap_bake_status);
-}
-
-void NewPipelineClientRenderPath::ResumeLightmapDiagnosticSave()
-{
-    if (!lightmap_diagnostic_session_active ||
-        lightmap_bake_state != LightmapBakeState::DiagnosticPaused)
-        return;
-    lightmap_diagnostic_resume_requested = true;
-    lightmap_diagnostic_status = "Diagnostic: running temporary SaveLightmap/OIDN+BC6H pipeline";
-}
-
-void NewPipelineClientRenderPath::DiscardLightmapDiagnosticBake()
-{
-    if (!lightmap_diagnostic_session_active)
-        return;
-    CancelLightmapBake();
-    lightmap_diagnostic_status = "Diagnostic: discarding temporary result and restoring production sidecars";
-}
-
-bool NewPipelineClientRenderPath::IsLightmapDiagnosticPaused() const
-{
-    return lightmap_diagnostic_session_active &&
-        lightmap_bake_state == LightmapBakeState::DiagnosticPaused;
-}
-
-bool NewPipelineClientRenderPath::IsLightmapDiagnosticCompressed() const
-{
-    return lightmap_diagnostic_session_active &&
-        lightmap_bake_state == LightmapBakeState::DiagnosticCompressed;
-}
-
-std::string NewPipelineClientRenderPath::GetLightmapDiagnosticStatus() const
-{
-    return lightmap_diagnostic_status;
 }
 
 bool NewPipelineClientRenderPath::SavePreparedScene(const std::string& path, std::string& error)
@@ -1538,15 +1447,12 @@ bool NewPipelineClientRenderPath::PrepareLightmapBake()
     std::unordered_map<wi::ecs::Entity, XMUINT2> mesh_dimensions;
     std::unordered_set<std::string> object_ids;
     LightmapBakeCoverage coverage;
-    coverage.total = lightmap_diagnostic_session_active
-        ? 1u : static_cast<uint32_t>(local_scene.objects.GetCount());
+    coverage.total = static_cast<uint32_t>(local_scene.objects.GetCount());
     uint32_t skipped_logged = 0;
     for (size_t i = 0; i < local_scene.objects.GetCount(); ++i)
     {
         wi::scene::ObjectComponent& object = local_scene.objects[i];
         const wi::ecs::Entity entity = local_scene.objects.GetEntity(i);
-        if (lightmap_diagnostic_session_active && entity != lightmap_diagnostic_entity)
-            continue;
         const LightmapBakeEligibility eligibility =
             ClassifyLightmapBakeEligibility(local_scene, entity, object);
         AccumulateCoverage(coverage, eligibility);
@@ -1564,10 +1470,7 @@ bool NewPipelineClientRenderPath::PrepareLightmapBake()
         {
             dimensions = known_dimensions->second;
         }
-        else if (mesh != nullptr &&
-            (mesh->vertex_atlas.empty() ||
-                (lightmap_diagnostic_session_active &&
-                    lightmap_diagnostic_settings.force_regenerate_atlas)))
+        else if (mesh != nullptr && mesh->vertex_atlas.empty())
         {
             std::string atlas_error;
             if (!GenerateClientLightmapAtlas(
@@ -1584,30 +1487,11 @@ bool NewPipelineClientRenderPath::PrepareLightmapBake()
                     wi::backlog::post("Client lightmap atlas skipped object " + std::to_string(entity) + ": " + atlas_error);
                 continue;
             }
-            if (lightmap_diagnostic_session_active)
-                lightmap_diagnostic_atlas_regenerated = true;
         }
         else
         {
             if (object.lightmapWidth > 0 && object.lightmapHeight > 0)
                 dimensions = {object.lightmapWidth, object.lightmapHeight};
-        }
-
-        // A reused atlas stores normalized UVs, so it can be tested at a
-        // different density without regenerating topology. Preserve its
-        // aspect ratio and interpret the diagnostic resolution as long edge.
-        if (lightmap_diagnostic_session_active && !lightmap_diagnostic_atlas_regenerated)
-        {
-            const uint32_t source_long_edge = std::max(dimensions.x, dimensions.y);
-            if (source_long_edge > 0)
-            {
-                const float scale = float(lightmap_bake_settings.resolution) /
-                    float(source_long_edge);
-                dimensions.x = std::max(16u, static_cast<uint32_t>(
-                    std::round(float(dimensions.x) * scale)));
-                dimensions.y = std::max(16u, static_cast<uint32_t>(
-                    std::round(float(dimensions.y) * scale)));
-            }
         }
 
         dimensions.x = FinalizeClientLightmapDimension(dimensions.x);
@@ -1618,92 +1502,6 @@ bool NewPipelineClientRenderPath::PrepareLightmapBake()
             return false;
         }
 
-        if (lightmap_diagnostic_session_active && mesh != nullptr)
-        {
-            lightmap_diagnostic_atlas_audit = AuditClientLightmapAtlas(
-                *mesh, dimensions.x, dimensions.y);
-            const std::string audit = lightmap_diagnostic_atlas_audit.Summary(
-                dimensions.x, dimensions.y);
-            lightmap_diagnostic_status = "Diagnostic atlas " +
-                std::string{lightmap_diagnostic_atlas_audit.HasStructuralFailure() ? "FAIL" : "PASS"} +
-                " (" +
-                std::string{lightmap_diagnostic_atlas_regenerated ? "regenerated" : "reused"} +
-                "): " + audit;
-            wi::backlog::post(lightmap_diagnostic_status);
-
-            uint32_t static_lights = 0;
-            uint32_t dynamic_lights = 0;
-            uint32_t logged_lights = 0;
-            for (size_t light_index = 0; light_index < local_scene.lights.GetCount(); ++light_index)
-            {
-                const wi::scene::LightComponent& light = local_scene.lights[light_index];
-                if (light.IsInactive())
-                    continue;
-                if (light.IsStatic())
-                    ++static_lights;
-                else
-                    ++dynamic_lights;
-
-                // Keep the diagnostic self-contained: color casts cannot be
-                // attributed reliably from a light count alone.  Log authored
-                // color/intensity and placement for a bounded number of active
-                // lights so a 1/2/3-bounce comparison identifies the source.
-                if (logged_lights < 16)
-                {
-                    const wi::ecs::Entity light_entity = local_scene.lights.GetEntity(light_index);
-                    const wi::scene::NameComponent* light_name = local_scene.names.GetComponent(light_entity);
-                    const char* light_type = "unknown";
-                    switch (light.GetType())
-                    {
-                    case wi::scene::LightComponent::DIRECTIONAL: light_type = "directional"; break;
-                    case wi::scene::LightComponent::POINT: light_type = "point"; break;
-                    case wi::scene::LightComponent::SPOT: light_type = "spot"; break;
-                    case wi::scene::LightComponent::RECTANGLE: light_type = "rectangle"; break;
-                    default: break;
-                    }
-                    std::ostringstream stream;
-                    stream << "Client lightmap diagnostic light[" << logged_lights << "]: entity="
-                        << light_entity << " name="
-                        << (light_name != nullptr ? light_name->name : "<unnamed>")
-                        << " type=" << light_type
-                        << " static=" << (light.IsStatic() ? 1 : 0)
-                        << " color=" << light.color.x << ',' << light.color.y << ',' << light.color.z
-                        << " intensity=" << light.intensity
-                        << " authored_rgb=" << light.color.x * light.intensity << ','
-                        << light.color.y * light.intensity << ','
-                        << light.color.z * light.intensity
-                        << " range=" << light.GetRange()
-                        << " radius=" << light.radius
-                        << " position=" << light.position.x << ',' << light.position.y << ',' << light.position.z
-                        << " direction=" << light.direction.x << ',' << light.direction.y << ',' << light.direction.z;
-                    wi::backlog::post(stream.str());
-                    ++logged_lights;
-                }
-            }
-            if (static_lights + dynamic_lights > logged_lights)
-            {
-                wi::backlog::post(
-                    "Client lightmap diagnostic lights: " +
-                    std::to_string(static_lights + dynamic_lights - logged_lights) +
-                    " additional active lights omitted");
-            }
-            wi::backlog::post(
-                "Client lightmap diagnostic config: object=" + lightmap_diagnostic_object_name +
-                " entity=" + std::to_string(lightmap_diagnostic_entity) +
-                " dimensions=" + std::to_string(dimensions.x) + "x" + std::to_string(dimensions.y) +
-                " samples=" + std::to_string(lightmap_bake_settings.sample_count) +
-                " bounces=" + std::to_string(lightmap_bake_settings.bounce_count) +
-                " static_lights=" + std::to_string(static_lights) +
-                " dynamic_lights=" + std::to_string(dynamic_lights) +
-                " integrator=vertex-nee-mis-v4-geometric-bias" +
-                " sampler=independent-owen-sobol-batches" +
-                " light_selection=spatial-candidate-contribution-cdf" +
-                " guiding=first-bounce-tile-mixture" +
-                " denoiser=" + std::string{
-                    lightmap_bake_denoiser_available ? "OIDN" : "unavailable"} +
-                " pause_before_save=" +
-                    std::string{lightmap_diagnostic_settings.pause_before_save ? "1" : "0"});
-        }
         mesh_dimensions[object.meshID] = dimensions;
 
         std::string id = ClientLightmapPackage::EnsureObjectId(local_scene, entity);
@@ -1888,37 +1686,6 @@ bool NewPipelineClientRenderPath::FinalizeOnePendingLightmap()
         return false;
     }
 
-    if (lightmap_diagnostic_session_active && entity == lightmap_diagnostic_entity)
-    {
-        wi::vector<uint8_t> accumulation_data;
-        wi::vector<uint8_t> coverage_data;
-        const wi::scene::MeshComponent* mesh = local_scene.meshes.GetComponent(object->meshID);
-        const bool accumulation_readback = object->lightmap_render.IsValid() &&
-            object->lightmap_render.GetDesc().format == wi::graphics::Format::R32G32B32A32_FLOAT &&
-            wi::helper::saveTextureToMemory(object->lightmap_render, accumulation_data);
-        const bool coverage_readback = object->lightmap_coverage.IsValid() &&
-            object->lightmap_coverage.GetDesc().format == wi::graphics::Format::R8_UNORM &&
-            wi::helper::saveTextureToMemory(object->lightmap_coverage, coverage_data);
-        if (mesh != nullptr && accumulation_readback && coverage_readback)
-        {
-            lightmap_diagnostic_sampling_audit = AuditClientLightmapSampling(
-                *mesh,
-                object->lightmapWidth,
-                object->lightmapHeight,
-                lightmap_bake_settings.sample_count,
-                accumulation_data,
-                coverage_data);
-        }
-        else
-        {
-            lightmap_diagnostic_sampling_audit = {};
-            lightmap_diagnostic_sampling_audit.expected_samples = lightmap_bake_settings.sample_count;
-        }
-        const std::string sampling_summary = lightmap_diagnostic_sampling_audit.Summary();
-        lightmap_diagnostic_status = "Diagnostic sampling: " + sampling_summary;
-        wi::backlog::post("Client lightmap diagnostic sampling audit: " + sampling_summary);
-    }
-
     object->SaveLightmap();
     if (!object->lightmap.IsValid() || object->lightmapTextureData.empty() ||
         object->lightmap.GetDesc().format != wi::graphics::Format::BC6H_UF16)
@@ -1974,12 +1741,6 @@ bool NewPipelineClientRenderPath::FinalizeOnePendingLightmap()
     }
     lightmap_missing_texel_count += statistics.missing_texel_count;
     lightmap_invalid_texel_count += statistics.invalid_sample_texel_count;
-    if (lightmap_diagnostic_session_active)
-    {
-        wi::backlog::post(
-            "Client lightmap diagnostic pre-compression statistics: " +
-            FormatLightmapStatistics(statistics));
-    }
     lightmap_bake_completed.push_back(entity);
     lightmap_bake_pending_save.erase(lightmap_bake_pending_save.begin());
     return true;
@@ -2152,7 +1913,6 @@ void NewPipelineClientRenderPath::UpdateLightmapBake(float dt)
         return;
     if (lightmap_cancel_requested)
     {
-        const bool was_diagnostic = lightmap_diagnostic_session_active;
         ClearLightmapBakeRequests(true);
         wi::renderer::SetRaytraceBounceCount(previous_raytrace_bounce_count);
         ResetLightmapBakeScheduling();
@@ -2168,29 +1928,6 @@ void NewPipelineClientRenderPath::UpdateLightmapBake(float dt)
         static_lighting_bake_requested = false;
         lightmap_cancel_requested = false;
         wi::backlog::post(lightmap_bake_status);
-        if (was_diagnostic)
-            EndLightmapDiagnosticSession("Diagnostic: discarded; production lightmaps restored (repick target)");
-        return;
-    }
-    if (lightmap_bake_state == LightmapBakeState::DiagnosticCompressed)
-        return;
-    if (lightmap_bake_state == LightmapBakeState::DiagnosticPaused)
-    {
-        if (!lightmap_diagnostic_resume_requested)
-            return;
-        lightmap_diagnostic_resume_requested = false;
-        if (!FinalizeOnePendingLightmap())
-            return;
-        wi::renderer::SetRaytraceBounceCount(previous_raytrace_bounce_count);
-        ResetLightmapBakeScheduling();
-        CleanupLightmapBakeTemps();
-        render_settings.lightmap_bake_requested = false;
-        lightmap_bake_state = LightmapBakeState::DiagnosticCompressed;
-        lightmap_bake_status = "Lightmap diagnostic: temporary SaveLightmap result ready; Discard restores production package";
-        lightmap_diagnostic_status = "Diagnostic: sampling=" +
-            std::string{lightmap_diagnostic_sampling_audit.Classification()} +
-            "; SaveLightmap/OIDN+BC6H result ready in Local Lightmap Raw; compare with the paused R16F capture, then Discard";
-        wi::backlog::post(lightmap_diagnostic_status);
         return;
     }
     if (lightmap_bake_state == LightmapBakeState::Preparing)
@@ -2220,44 +1957,10 @@ void NewPipelineClientRenderPath::UpdateLightmapBake(float dt)
         ++i;
     }
 
-    if (lightmap_diagnostic_session_active &&
-        lightmap_diagnostic_settings.pause_before_save &&
-        !lightmap_bake_pending_save.empty())
-    {
-        setLightmapRefreshIterationsPerFrame(1);
-        wi::renderer::SetRaytraceBounceCount(previous_raytrace_bounce_count);
-        lightmap_bake_state = LightmapBakeState::DiagnosticPaused;
-        lightmap_bake_status = "Lightmap diagnostic: paused before SaveLightmap (live R16F Raw)";
-        lightmap_diagnostic_status = "Diagnostic: live R16F result ready in Local Lightmap Raw; atlas=" +
-            std::string{lightmap_diagnostic_atlas_audit.HasStructuralFailure() ? "FAIL" : "PASS"} +
-            " overlaps=" + std::to_string(lightmap_diagnostic_atlas_audit.overlapping_triangle_pair_count) +
-            " degenerate=" + std::to_string(lightmap_diagnostic_atlas_audit.degenerate_triangle_count) +
-            "; capture it, then Resume Save or Discard";
-        SetDebugPreviewMode(DebugPreviewMode::LocalLightmapRaw);
-        wi::backlog::post(lightmap_diagnostic_status);
-        return;
-    }
-
     // SaveLightmap performs a synchronous GPU readback and BC6H readback. Keep
     // it to one object per update while the next active batch keeps sampling.
     if (!FinalizeOnePendingLightmap())
         return;
-
-    if (lightmap_diagnostic_session_active &&
-        lightmap_bake_active.empty() && lightmap_bake_pending_save.empty() &&
-        lightmap_bake_next_index >= lightmap_bake_queue.size())
-    {
-        wi::renderer::SetRaytraceBounceCount(previous_raytrace_bounce_count);
-        ResetLightmapBakeScheduling();
-        CleanupLightmapBakeTemps();
-        render_settings.lightmap_bake_requested = false;
-        lightmap_bake_state = LightmapBakeState::DiagnosticCompressed;
-        lightmap_bake_status = "Lightmap diagnostic: temporary SaveLightmap result ready; Discard restores production package";
-        lightmap_diagnostic_status = "Diagnostic: SaveLightmap/OIDN+BC6H result ready in Local Lightmap Raw; Discard when captured";
-        SetDebugPreviewMode(DebugPreviewMode::LocalLightmapRaw);
-        wi::backlog::post(lightmap_diagnostic_status);
-        return;
-    }
 
     FillLightmapBakeBatch();
     if (lightmap_bake_active.empty() && lightmap_bake_pending_save.empty() &&
@@ -2541,7 +2244,6 @@ void NewPipelineClientRenderPath::FinishLightmapBake()
 
 void NewPipelineClientRenderPath::FailLightmapBake(const std::string& reason)
 {
-    const bool was_diagnostic = lightmap_diagnostic_session_active;
     ClearLightmapBakeRequests(true);
     wi::renderer::SetRaytraceBounceCount(previous_raytrace_bounce_count);
     ResetLightmapBakeScheduling();
@@ -2557,17 +2259,6 @@ void NewPipelineClientRenderPath::FailLightmapBake(const std::string& reason)
         lightmap_bake_status += "; " + source_error;
     static_lighting_bake_requested = false;
     wi::backlog::post(lightmap_bake_status);
-    if (was_diagnostic)
-        EndLightmapDiagnosticSession("Diagnostic failed: " + reason + " (repick target)");
-}
-
-void NewPipelineClientRenderPath::EndLightmapDiagnosticSession(const std::string& status)
-{
-    lightmap_bake_settings = lightmap_bake_settings_before_diagnostic;
-    lightmap_diagnostic_session_active = false;
-    lightmap_diagnostic_resume_requested = false;
-    lightmap_diagnostic_entity = wi::ecs::INVALID_ENTITY;
-    lightmap_diagnostic_status = status;
 }
 
 void NewPipelineClientRenderPath::CleanupLightmapBakeTemps()
@@ -3176,9 +2867,64 @@ void NewPipelineClientRenderPath::AcquireRemoteVideoFrame(float dt)
     RemoteVideoFrameLayout video_layout;
     std::string error;
     bool received = false;
+    bool queued_video_without_metadata = false;
     if (gpu_video_path)
     {
-        received = webrtc_transport.TryAcquireI420Frame(retained_frame);
+        RetainedI420Frame acquired_frame;
+        if (webrtc_transport.TryAcquireI420Frame(acquired_frame))
+        {
+            if (!downstream_metadata_active)
+            {
+                retained_frame = std::move(acquired_frame);
+                received = DecodeRemoteVideoFrameLayout(retained_frame, video_layout, &error);
+                if (!received)
+                {
+                    InvalidateRemote(error.empty() ? "legacy video metadata decode failed" : error);
+                    return;
+                }
+            }
+            else
+            {
+                const int64_t timestamp = acquired_frame.timestamp_usec;
+                auto duplicate = std::find_if(
+                    pending_remote_video_frames.begin(), pending_remote_video_frames.end(),
+                    [timestamp](const PendingRemoteVideoFrame& pending) {
+                        return pending.frame.timestamp_usec == timestamp;
+                    });
+                if (duplicate != pending_remote_video_frames.end())
+                    pending_remote_video_frames.erase(duplicate);
+                PendingRemoteVideoFrame pending;
+                pending.frame = std::move(acquired_frame);
+                pending.local_receive_timestamp_usec = NowUsec();
+                pending_remote_video_frames.push_back(std::move(pending));
+                queued_video_without_metadata = true;
+                while (pending_remote_video_frames.size() > kMaxPendingRemotePairs)
+                {
+                    pending_remote_video_frames.pop_front();
+                    ++downstream_pair_expirations;
+                }
+            }
+        }
+
+        if (downstream_metadata_active)
+        {
+            PrunePendingRemoteFrames(NowUsec());
+            received = TryMatchRemoteVideoFrame(retained_frame, video_layout);
+            if (!received)
+            {
+                if (!pending_remote_video_frames.empty())
+                {
+                    if (queued_video_without_metadata)
+                        ++downstream_metadata_misses;
+                    if (!remote_consume.accepted_valid)
+                        remote_consume.fallback_reason = "waiting for matching frame metadata";
+                }
+                else if (!downstream_metadata_cache.empty() && !remote_consume.accepted_valid)
+                {
+                    remote_consume.fallback_reason = "waiting for matching video frame";
+                }
+            }
+        }
     }
     else
     {
@@ -3203,7 +2949,8 @@ void NewPipelineClientRenderPath::AcquireRemoteVideoFrame(float dt)
                 InvalidateRemote("stale remote video frame > 5s");
             }
         }
-        else if (!remote_consume.no_remote_logged)
+        else if (!remote_consume.no_remote_logged &&
+            pending_remote_video_frames.empty() && downstream_metadata_cache.empty())
         {
             wi::backlog::post(config.remote_source == RemoteSourceMode::Mock
                 ? "Client mock packed-video: no latest frame, using local scene."
@@ -3213,63 +2960,31 @@ void NewPipelineClientRenderPath::AcquireRemoteVideoFrame(float dt)
         return;
     }
 
-    if (gpu_video_path)
+    if (gpu_video_path && downstream_metadata_active)
     {
-        auto match = std::find_if(downstream_metadata_cache.begin(), downstream_metadata_cache.end(),
-            [&retained_frame](const RemoteVideoFrameLayout& candidate) {
-                return candidate.metadata.timestamp_usec == retained_frame.timestamp_usec;
-            });
-        if (match == downstream_metadata_cache.end())
+        RemoteVideoFrameLayout pixel_layout;
+        bool agrees = DecodeRemoteVideoFrameLayout(retained_frame, pixel_layout, &error) &&
+            video_layout.video_width == pixel_layout.video_width &&
+            video_layout.video_height == pixel_layout.video_height &&
+            video_layout.metadata.frame_id == pixel_layout.metadata.frame_id &&
+            video_layout.metadata.source_generation == pixel_layout.metadata.source_generation &&
+            video_layout.metadata.timestamp_usec == pixel_layout.metadata.timestamp_usec &&
+            video_layout.metadata.available_buffer_mask == pixel_layout.metadata.available_buffer_mask &&
+            video_layout.metadata.continuity_mask == pixel_layout.metadata.continuity_mask;
+        for (size_t index = 0; agrees && index < pixel_layout.tiles.size(); ++index)
         {
-            ++downstream_metadata_misses;
-            if (downstream_metadata_active)
-            {
-                // The unordered metadata channel can legitimately lose a
-                // packet. Drop only this decoded frame and retain the previous
-                // accepted lighting until its normal stale timeout.
-                if (remote_consume.accepted_valid)
-                    remote_consume.stale_timer += dt;
-                return;
-            }
-            // Transitional compatibility before the first np.frame_meta
-            // packet arrives: recover identity from the legacy pixel band.
-            if (!DecodeRemoteVideoFrameLayout(retained_frame, video_layout, &error))
-            {
-                InvalidateRemote(error.empty() ? "legacy video metadata decode failed" : error);
-                return;
-            }
+            const RemoteVideoTileLayout& pixel = pixel_layout.tiles[index];
+            const RemoteVideoTileLayout& channel = video_layout.tiles[index];
+            agrees = pixel.semantic == channel.semantic && pixel.width == channel.width &&
+                pixel.height == channel.height && pixel.origin_x == channel.origin_x &&
+                pixel.origin_y == channel.origin_y && pixel.available == channel.available &&
+                pixel.encoding == channel.encoding;
         }
-        else
+        if (!agrees)
         {
-            RemoteVideoFrameLayout pixel_layout;
-            bool agrees = DecodeRemoteVideoFrameLayout(retained_frame, pixel_layout, &error) &&
-                match->video_width == pixel_layout.video_width &&
-                match->video_height == pixel_layout.video_height &&
-                match->metadata.frame_id == pixel_layout.metadata.frame_id &&
-                match->metadata.source_generation == pixel_layout.metadata.source_generation &&
-                match->metadata.timestamp_usec == pixel_layout.metadata.timestamp_usec &&
-                match->metadata.available_buffer_mask == pixel_layout.metadata.available_buffer_mask &&
-                match->metadata.continuity_mask == pixel_layout.metadata.continuity_mask;
-            for (size_t index = 0; agrees && index < pixel_layout.tiles.size(); ++index)
-            {
-                const RemoteVideoTileLayout& pixel = pixel_layout.tiles[index];
-                const RemoteVideoTileLayout& channel = match->tiles[index];
-                agrees = pixel.semantic == channel.semantic && pixel.width == channel.width &&
-                    pixel.height == channel.height && pixel.origin_x == channel.origin_x &&
-                    pixel.origin_y == channel.origin_y && pixel.available == channel.available &&
-                    pixel.encoding == channel.encoding;
-            }
-            if (!agrees)
-            {
-                ++downstream_metadata_mismatches;
-                downstream_metadata_cache.erase(match);
-                InvalidateRemote("pixel-band/frame-metadata mismatch");
-                return;
-            }
-            ++downstream_metadata_matches;
-            video_layout = *match;
-            video_layout.metadata.local_receive_timestamp_usec = NowUsec();
-            downstream_metadata_cache.erase(downstream_metadata_cache.begin(), std::next(match));
+            ++downstream_metadata_mismatches;
+            InvalidateRemote("pixel-band/frame-metadata mismatch");
+            return;
         }
     }
 
@@ -3370,14 +3085,6 @@ const wi::graphics::Texture* NewPipelineClientRenderPath::GetDebugPreviewTexture
     case DebugPreviewMode::GBufferNormalXY:
     case DebugPreviewMode::GBufferRoughness:
         return visibilityResources.texture_normal_roughness.IsValid() ? &visibilityResources.texture_normal_roughness : nullptr;
-    case DebugPreviewMode::LocalIndirectDiffuse:
-        return local_lightmap_irradiance.IsValid() ? &local_lightmap_irradiance : nullptr;
-    case DebugPreviewMode::LocalLightmapValidity:
-        return local_lightmap_validity.IsValid() ? &local_lightmap_validity : nullptr;
-    case DebugPreviewMode::LocalLightmapCoverage:
-        return local_lightmap_coverage.IsValid() ? &local_lightmap_coverage : nullptr;
-    case DebugPreviewMode::LocalLightmapRaw:
-        return local_lightmap_raw.IsValid() ? &local_lightmap_raw : nullptr;
     case DebugPreviewMode::LocalIndirectFinalInput:
         return local_indirect_final_input.IsValid() ? &local_indirect_final_input : nullptr;
     case DebugPreviewMode::LocalAO:
@@ -3481,9 +3188,7 @@ void NewPipelineClientRenderPath::Compose(wi::graphics::CommandList cmd) const
             fx.color = XMFLOAT4(1.0f, 1.0f, 0.0f, 1.0f);
         else if (debug_preview_mode == DebugPreviewMode::GBufferRoughness)
             fx.color = XMFLOAT4(0.0f, 0.0f, 4.0f, 1.0f);
-        else if (debug_preview_mode == DebugPreviewMode::LocalIndirectDiffuse ||
-            debug_preview_mode == DebugPreviewMode::LocalLightmapRaw ||
-            debug_preview_mode == DebugPreviewMode::LocalIndirectFinalInput ||
+        else if (debug_preview_mode == DebugPreviewMode::LocalIndirectFinalInput ||
             debug_preview_mode == DebugPreviewMode::LocalSpecularIndirect ||
             debug_preview_mode == DebugPreviewMode::LocalReflectionProbe ||
             debug_preview_mode == DebugPreviewMode::RemoteIndirectDiffuse ||

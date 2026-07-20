@@ -107,7 +107,6 @@ struct Surface
 	bool receiveshadow;
 	bool is_backface;
 	bool gi_applied;
-	bool lightmap_available;
 	bool lightmap_covered;
 	bool capsuleshadow_disabled;
 
@@ -164,7 +163,6 @@ struct Surface
 		receiveshadow = true;
 		is_backface = false;
 		gi_applied = false;
-		lightmap_available = false;
 		lightmap_covered = false;
 		capsuleshadow_disabled = true;
 
@@ -324,14 +322,12 @@ struct Surface
 	inline bool IsReceiveShadow() { return receiveshadow; }
 	inline bool IsBackface() { return is_backface; }
 	inline bool IsGIApplied() { return gi_applied; }
-	inline bool IsLightmapAvailable() { return lightmap_available; }
 	inline bool IsLightmapCovered() { return lightmap_covered; }
 	inline bool IsCapsuleShadowDisabled() { return capsuleshadow_disabled; }
 	
 	inline void SetReceiveShadow(bool value) { receiveshadow = value; }
 	inline void SetBackface(bool value) { is_backface = value; }
 	inline void SetGIApplied(bool value) { gi_applied = value; }
-	inline void SetLightmapAvailable(bool value) { lightmap_available = value; }
 	inline void SetLightmapCovered(bool value) { lightmap_covered = value; }
 	inline void SetCapsuleShadowDisabled(bool value) { capsuleshadow_disabled = value; }
 
@@ -668,7 +664,6 @@ struct Surface
 			Texture2D<half4> tex = bindless_textures_half4[MakeUniformResourceIndex(inst.lightmap)];
 			const half4 lightmap_sample = tex.SampleLevel(sampler_linear_clamp, atlas, 0);
 			gi = lightmap_sample.rgb;
-			SetLightmapAvailable(true);
 			if (inst.lightmap_coverage >= 0)
 			{
 				Texture2D<half4> coverage_tex = bindless_textures_half4[MakeUniformResourceIndex(inst.lightmap_coverage)];
@@ -680,9 +675,7 @@ struct Surface
 				// textures return opaque alpha and remain conservatively covered.
 				SetLightmapCovered(lightmap_sample.a > 0.5h);
 			}
-			// A missing atlas texel must not suppress all other GI fallbacks. The
-			// separate availability flag keeps object-level validity diagnostics
-			// independent from per-texel coverage.
+			// A missing atlas texel must not suppress all other GI fallbacks.
 			SetGIApplied(IsLightmapCovered());
 		}
 

@@ -14,10 +14,6 @@
 struct VisibilityPushConstants
 {
 	uint global_tile_offset;
-	int lightmap_irradiance_uav;
-	int lightmap_validity_uav;
-	int lightmap_coverage_uav;
-	int lightmap_raw_uav;
 	int local_indirect_diffuse_uav;
 };
 PUSHCONSTANT(push, VisibilityPushConstants);
@@ -69,52 +65,7 @@ void main(uint Gid : SV_GroupID, uint groupIndex : SV_GroupIndex)
 		return;
 	}
 
-	// Surface::load() marks GI as applied only when this primitive has a valid
-	// object lightmap and atlas. Wicked stores the diffuse lightmap term with
-	// the Lambert PI divide included, so multiply by PI for a material-independent
-	// irradiance buffer matching RemoteIndirectDiffuseFormal semantics.
-	[branch]
-	if (push.lightmap_irradiance_uav >= 0)
-	{
-		RWTexture2D<float4> output_lightmap_irradiance =
-			bindless_rwtextures[descriptor_index(push.lightmap_irradiance_uav)];
-		output_lightmap_irradiance[pixel] = surface.IsGIApplied()
-			? float4(surface.gi * PI, 1)
-			: 0;
-	}
-
-	// Primitive validity is established before this shader is dispatched, so a
-	// written pixel always contains geometry. Do not classify from brightness:
-	// a valid lightmap texel is allowed to be physically black.
-	[branch]
-	if (push.lightmap_validity_uav >= 0)
-	{
-		RWTexture2D<float4> output_lightmap_validity =
-			bindless_rwtextures[descriptor_index(push.lightmap_validity_uav)];
-		output_lightmap_validity[pixel] = surface.IsLightmapAvailable()
-			? float4(0, 1, 0, 1)
-			: float4(1, 0, 1, 1);
-	}
-
-	[branch]
-	if (push.lightmap_coverage_uav >= 0)
-	{
-		RWTexture2D<float4> output_lightmap_coverage =
-			bindless_rwtextures[descriptor_index(push.lightmap_coverage_uav)];
-		output_lightmap_coverage[pixel] = !surface.IsLightmapAvailable()
-			? float4(1, 0, 1, 1)
-			: (surface.IsLightmapCovered() ? float4(0, 1, 0, 1) : float4(1, 0, 0, 1));
-	}
-
-	[branch]
-	if (push.lightmap_raw_uav >= 0)
-	{
-		RWTexture2D<float4> output_lightmap_raw =
-			bindless_rwtextures[descriptor_index(push.lightmap_raw_uav)];
-		output_lightmap_raw[pixel] = surface.IsGIApplied() ? float4(max(0, surface.gi), 1) : 0;
-	}
-
-	// This diagnostic must also be available when the main scene uses raster
+	// This intermediate must also be available when the main scene uses raster
 	// shading. Visibility_Shade() is not dispatched in that configuration, so
 	// produce the same local pre-elastic GI value from the already reconstructed
 	// surface here instead of leaving the preview texture permanently black.

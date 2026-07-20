@@ -447,10 +447,6 @@ namespace wi::renderer
 		wi::graphics::GPUBuffer bins;					 // material type binning
 		wi::graphics::GPUBuffer binned_tiles;			 // material type binning
 		wi::graphics::Texture texture_normal_roughness;
-		const wi::graphics::Texture* texture_lightmap_irradiance = nullptr; // optional material-independent lightmap irradiance output
-		const wi::graphics::Texture* texture_lightmap_validity = nullptr; // optional: green=baked, magenta=geometry without lightmap, black=sky
-		const wi::graphics::Texture* texture_lightmap_coverage = nullptr; // optional: green=covered texel, red=lightmap hole, magenta=no lightmap
-		const wi::graphics::Texture* texture_lightmap_raw = nullptr; // optional raw Lambert-divided lightmap RGB
 		const wi::graphics::Texture* texture_local_indirect_diffuse = nullptr; // optional local Final GI input before remote blending (RGB includes PI)
 		const wi::graphics::Texture* texture_specular_indirect = nullptr; // optional final indirect-specular contribution for debugging
 		// Optional elastic-rendering inputs. These are screen-space results from
@@ -478,10 +474,6 @@ namespace wi::renderer
 			bins = {};
 			binned_tiles = {};
 			texture_normal_roughness = {};
-			texture_lightmap_irradiance = nullptr;
-			texture_lightmap_validity = nullptr;
-			texture_lightmap_coverage = nullptr;
-			texture_lightmap_raw = nullptr;
 			texture_local_indirect_diffuse = nullptr;
 			texture_specular_indirect = nullptr;
 			texture_remote_indirect_diffuse = nullptr;

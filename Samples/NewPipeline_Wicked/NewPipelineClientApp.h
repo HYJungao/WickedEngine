@@ -26,7 +26,6 @@ private:
     NewPipelineClientRenderPath  render_path;
     wi::gui::Window              debug_window;
     wi::gui::Window              elastic_lighting_window;
-    wi::gui::Window              lightmap_diagnostic_window;
     wi::gui::CheckBox            sun_enabled_checkbox;
     wi::gui::Slider              sun_yaw_slider;
     wi::gui::Slider              sun_pitch_slider;
@@ -49,16 +48,6 @@ private:
     wi::gui::CheckBox            remote_ao_checkbox;
     wi::gui::Slider              remote_ao_weight_slider;
     wi::gui::Label               elastic_lighting_status_label;
-    wi::gui::Button              diagnostic_pick_center_button;
-    wi::gui::ComboBox            diagnostic_resolution_combo;
-    wi::gui::ComboBox            diagnostic_samples_combo;
-    wi::gui::ComboBox            diagnostic_bounces_combo;
-    wi::gui::CheckBox            diagnostic_regenerate_atlas_checkbox;
-    wi::gui::CheckBox            diagnostic_pause_before_save_checkbox;
-    wi::gui::Button              diagnostic_bake_button;
-    wi::gui::Button              diagnostic_resume_button;
-    wi::gui::Button              diagnostic_discard_button;
-    wi::gui::Label               diagnostic_status_label;
     bool                         configured = false;
     bool                         debug_ui_created = false;
 };

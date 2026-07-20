@@ -151,9 +151,6 @@ const char* ToString(DebugPreviewMode mode)
     case DebugPreviewMode::TransportSpecularIndirect: return "transport_specular_indirect";
     case DebugPreviewMode::TransportShadowVisibility: return "transport_shadow_visibility";
     case DebugPreviewMode::LocalReflectionProbe: return "local_reflection_probe";
-    case DebugPreviewMode::LocalLightmapValidity: return "local_lightmap_validity";
-    case DebugPreviewMode::LocalLightmapCoverage: return "local_lightmap_coverage";
-    case DebugPreviewMode::LocalLightmapRaw: return "local_lightmap_raw";
     case DebugPreviewMode::LocalIndirectFinalInput: return "local_indirect_final_input";
     default: return "unknown";
     }

@@ -12148,50 +12148,6 @@ void Visibility_Surface(
 	device->ClearUAV(&res.texture_normal_roughness, 0, cmd);
 	device->Barrier(GPUBarrier::Memory(&res.texture_normal_roughness), cmd);
 
-	int lightmap_irradiance_uav = -1;
-	if (res.texture_lightmap_irradiance != nullptr && res.texture_lightmap_irradiance->IsValid())
-	{
-		device->Barrier(GPUBarrier::Image(
-			res.texture_lightmap_irradiance,
-			res.texture_lightmap_irradiance->desc.layout,
-			ResourceState::UNORDERED_ACCESS), cmd);
-		device->ClearUAV(res.texture_lightmap_irradiance, 0, cmd);
-		device->Barrier(GPUBarrier::Memory(res.texture_lightmap_irradiance), cmd);
-		lightmap_irradiance_uav = device->GetDescriptorIndex(res.texture_lightmap_irradiance, SubresourceType::UAV);
-	}
-	int lightmap_validity_uav = -1;
-	if (res.texture_lightmap_validity != nullptr && res.texture_lightmap_validity->IsValid())
-	{
-		device->Barrier(GPUBarrier::Image(
-			res.texture_lightmap_validity,
-			res.texture_lightmap_validity->desc.layout,
-			ResourceState::UNORDERED_ACCESS), cmd);
-		device->ClearUAV(res.texture_lightmap_validity, 0, cmd);
-		device->Barrier(GPUBarrier::Memory(res.texture_lightmap_validity), cmd);
-		lightmap_validity_uav = device->GetDescriptorIndex(res.texture_lightmap_validity, SubresourceType::UAV);
-	}
-	int lightmap_coverage_uav = -1;
-	if (res.texture_lightmap_coverage != nullptr && res.texture_lightmap_coverage->IsValid())
-	{
-		device->Barrier(GPUBarrier::Image(
-			res.texture_lightmap_coverage,
-			res.texture_lightmap_coverage->desc.layout,
-			ResourceState::UNORDERED_ACCESS), cmd);
-		device->ClearUAV(res.texture_lightmap_coverage, 0, cmd);
-		device->Barrier(GPUBarrier::Memory(res.texture_lightmap_coverage), cmd);
-		lightmap_coverage_uav = device->GetDescriptorIndex(res.texture_lightmap_coverage, SubresourceType::UAV);
-	}
-	int lightmap_raw_uav = -1;
-	if (res.texture_lightmap_raw != nullptr && res.texture_lightmap_raw->IsValid())
-	{
-		device->Barrier(GPUBarrier::Image(
-			res.texture_lightmap_raw,
-			res.texture_lightmap_raw->desc.layout,
-			ResourceState::UNORDERED_ACCESS), cmd);
-		device->ClearUAV(res.texture_lightmap_raw, 0, cmd);
-		device->Barrier(GPUBarrier::Memory(res.texture_lightmap_raw), cmd);
-		lightmap_raw_uav = device->GetDescriptorIndex(res.texture_lightmap_raw, SubresourceType::UAV);
-	}
 	int local_indirect_diffuse_uav = -1;
 	if (res.texture_local_indirect_diffuse != nullptr && res.texture_local_indirect_diffuse->IsValid())
 	{
@@ -12211,28 +12167,19 @@ void Visibility_Surface(
 	struct VisibilitySurfacePushConstants
 	{
 		uint32_t global_tile_offset;
-		int32_t lightmap_irradiance_uav;
-		int32_t lightmap_validity_uav;
-		int32_t lightmap_coverage_uav;
-		int32_t lightmap_raw_uav;
 		int32_t local_indirect_diffuse_uav;
 	};
 	VisibilitySurfacePushConstants push = {};
-	push.lightmap_irradiance_uav = lightmap_irradiance_uav;
-	push.lightmap_validity_uav = lightmap_validity_uav;
-	push.lightmap_coverage_uav = lightmap_coverage_uav;
-	push.lightmap_raw_uav = lightmap_raw_uav;
 	push.local_indirect_diffuse_uav = local_indirect_diffuse_uav;
-	const bool surface_diagnostics_requested = lightmap_irradiance_uav >= 0 || lightmap_validity_uav >= 0 ||
-		lightmap_coverage_uav >= 0 || lightmap_raw_uav >= 0 || local_indirect_diffuse_uav >= 0;
+	const bool local_indirect_requested = local_indirect_diffuse_uav >= 0;
 	uint64_t bins_offset = 0;
 
 	// surface dispatches per material type:
 	device->EventBegin("Surface parameters UNIFORM", cmd);
 	for (uint i = 0; i < MaterialComponent::SHADERTYPE_COUNT; ++i)
 	{
-		if (surface_diagnostics_requested ||
-			(i != MaterialComponent::SHADERTYPE_UNLIT && i != MaterialComponent::SHADERTYPE_INTERIORMAPPING)) // special types skip normal output unless diagnostics need surface classification
+		if (local_indirect_requested ||
+			(i != MaterialComponent::SHADERTYPE_UNLIT && i != MaterialComponent::SHADERTYPE_INTERIORMAPPING)) // special types skip normal output unless the local indirect intermediate needs the reconstructed surface
 		{
 			device->BindComputeShader(&shaders[CSTYPE_VISIBILITY_SURFACE_UNIFORM_PERMUTATION_BEGIN + i], cmd);
 			device->PushConstants(&push, sizeof(push), cmd);
@@ -12246,8 +12193,8 @@ void Visibility_Surface(
 	device->EventBegin("Surface parameters DIVERGENT", cmd);
 	for (uint i = 0; i < MaterialComponent::SHADERTYPE_COUNT; ++i)
 	{
-		if (surface_diagnostics_requested ||
-			(i != MaterialComponent::SHADERTYPE_UNLIT && i != MaterialComponent::SHADERTYPE_INTERIORMAPPING)) // special types skip normal output unless diagnostics need surface classification
+		if (local_indirect_requested ||
+			(i != MaterialComponent::SHADERTYPE_UNLIT && i != MaterialComponent::SHADERTYPE_INTERIORMAPPING)) // special types skip normal output unless the local indirect intermediate needs the reconstructed surface
 		{
 			device->BindComputeShader(&shaders[CSTYPE_VISIBILITY_SURFACE_DIVERGENT_PERMUTATION_BEGIN + i], cmd);
 			device->PushConstants(&push, sizeof(push), cmd);
@@ -12261,34 +12208,6 @@ void Visibility_Surface(
 	// Ending barriers:
 	//	These resources will be used by other post processing effects
 	device->Barrier(GPUBarrier::Image(&res.texture_normal_roughness, ResourceState::UNORDERED_ACCESS, res.texture_normal_roughness.desc.layout), cmd);
-	if (res.texture_lightmap_irradiance != nullptr && res.texture_lightmap_irradiance->IsValid())
-	{
-		device->Barrier(GPUBarrier::Image(
-			res.texture_lightmap_irradiance,
-			ResourceState::UNORDERED_ACCESS,
-			res.texture_lightmap_irradiance->desc.layout), cmd);
-	}
-	if (res.texture_lightmap_validity != nullptr && res.texture_lightmap_validity->IsValid())
-	{
-		device->Barrier(GPUBarrier::Image(
-			res.texture_lightmap_validity,
-			ResourceState::UNORDERED_ACCESS,
-			res.texture_lightmap_validity->desc.layout), cmd);
-	}
-	if (res.texture_lightmap_coverage != nullptr && res.texture_lightmap_coverage->IsValid())
-	{
-		device->Barrier(GPUBarrier::Image(
-			res.texture_lightmap_coverage,
-			ResourceState::UNORDERED_ACCESS,
-			res.texture_lightmap_coverage->desc.layout), cmd);
-	}
-	if (res.texture_lightmap_raw != nullptr && res.texture_lightmap_raw->IsValid())
-	{
-		device->Barrier(GPUBarrier::Image(
-			res.texture_lightmap_raw,
-			ResourceState::UNORDERED_ACCESS,
-			res.texture_lightmap_raw->desc.layout), cmd);
-	}
 	if (res.texture_local_indirect_diffuse != nullptr && res.texture_local_indirect_diffuse->IsValid())
 	{
 		device->Barrier(GPUBarrier::Image(

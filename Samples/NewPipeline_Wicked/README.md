@@ -31,9 +31,8 @@ windows are unfocused. Client camera input is disabled while unfocused and no
 automatic camera orbit is applied.
 
 The Client starts on `Final`; receiving a remote frame never changes the
-selection. Its **Preview Buffer** menu contains the local low-end buffers,
-including strict `Local Lightmap Irradiance`, `Local Lightmap Validity`, and
-material-independent `Local Indirect (Final Input)`,
+selection. Its **Preview Buffer** menu contains the material-independent
+`Local Indirect (Final Input)`,
 the four accepted remote buffers, the actual `Elastic GI` / `Elastic AO` Final
 inputs, and an explicit `Remote 2x2 Overview`. The
 Server debug panel contains `Final`, its four local producer buffers, and four
@@ -64,8 +63,7 @@ beside each executable. The macOS Xcode targets link the package dylib and copy
 all OIDN/device/runtime dylibs into the application Frameworks directory. The
 SDK itself is ignored by Git. Production does not raise the sample count when
 OIDN is missing: it reports the missing dependency and preserves the previous
-lightmap package. Diagnostic object bakes retain their explicitly selected
-sample count and can still run without the denoiser.
+lightmap package.
 
 ## Windows WebRTC package
 
@@ -115,12 +113,7 @@ The Client local renderer is deliberately independent and low-end oriented:
 raster shadow maps (1024 for 2D lights, 512 for cube lights), SSAO, baked
 lightmaps, and a non-realtime 128-pixel environment probe. Local DDGI, RTAO,
 ray-traced diffuse/reflections/shadows, SSGI, SSR, screen-space shadows, and
-planar reflections are disabled. Lightmaps contribute to both Final and the
-full-resolution `Local Lightmap Irradiance` preview. That preview stores
-material-independent irradiance in RGB (`sampledLightmap * PI`) and validity in
-alpha; missing lightmaps and sky remain black. `Local Lightmap Validity` uses
-green for geometry with a valid lightmap/atlas, magenta for geometry without one,
-and black for sky. `Local Indirect (Final Input)` shows the exact local diffuse GI
+planar reflections are disabled. `Local Indirect (Final Input)` shows the exact local diffuse GI
 term used by Final before remote blending, including the ambient fallback on
 dynamic or otherwise unbaked geometry. Static probes contribute to Final,
 and raster shadows remain in the light shadow-map atlas. Remote DDGI and RTAO
@@ -194,7 +187,7 @@ data to a temporary package and commits only the two sidecars with rollback
 backups after the temporary pair passes the cold-start loader. The source hash
 is checked before preparation, before commit, and after reload. It then captures
 and reload-verifies the Reflection Probe. The individual Lightmap and Probe
-buttons remain available for diagnostics. `Cancel Bake` or any pre-commit
+buttons remain available for independent asset maintenance. `Cancel Bake` or any pre-commit
 failure preserves the previous sidecars and leaves the source byte-for-byte
 untouched.
 
@@ -237,9 +230,12 @@ pass. Semantic output textures are persistent at a stable generation/resolution.
 
 Frame metadata is dual-written to the legacy luma band and the unordered,
 unreliable `np.frame_meta` DataChannel. After the metadata channel becomes active,
-the Client accepts a decoded frame only when its timestamp has a matching validated
-metadata packet; loss affects only that frame. The legacy band remains for migration
-agreement checks.
+the Client retains video frames and metadata in separate bounded queues and accepts
+the newest pair with an exact timestamp match, regardless of which side arrived
+first. Unmatched entries expire after one second and each queue is capped at eight
+entries; a transient unmatched frame does not discard the last accepted remote
+input. The legacy band remains for migration agreement checks, and a matched pair
+is still rejected if its DataChannel metadata disagrees with the pixel band.
 
 Session creation, teardown and retry run on a lifecycle service thread with bounded
 backoff. When signaling is unavailable, render updates only poll an atomic state and
