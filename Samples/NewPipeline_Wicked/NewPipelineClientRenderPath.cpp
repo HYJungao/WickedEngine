@@ -1092,33 +1092,14 @@ void NewPipelineClientRenderPath::RequestLightmapBake()
 
     lightmap_bake_denoiser_available =
         wi::scene::ObjectComponent::IsLightmapDenoiserAvailable();
-    lightmap_bake_denoiser_required = false;
+    lightmap_bake_denoiser_required = !lightmap_diagnostic_session_active;
     if (!lightmap_diagnostic_session_active)
     {
-        if (lightmap_bake_denoiser_available)
-        {
-            // This is a maximum budget, not a uniform cost: converged texels stop
-            // tracing after the independent-batch test, while weak/rarely hit texels
-            // retain the full budget. A 512 hard cap would defeat adaptive sampling
-            // exactly where the remaining dark spots occur.
-            lightmap_bake_settings.sample_count = std::max(
-                lightmap_bake_settings.sample_count,
-                kClientLightmapUnfilteredSamples);
-            lightmap_bake_denoiser_required =
-                lightmap_bake_settings.sample_count < kClientLightmapUnfilteredSamples;
-        }
-        else
-        {
-            lightmap_bake_settings.sample_count = std::max(
-                lightmap_bake_settings.sample_count,
-                kClientLightmapUnfilteredSamples);
-        }
         wi::backlog::post(
             "Client lightmap production quality: integrator=vertex-nee-mis-v3"
             " sampler=independent-owen-sobol-batches"
             " light_selection=spatial-candidate-contribution-cdf"
-            " guiding=first-bounce-tile-mixture denoiser=" +
-            std::string{lightmap_bake_denoiser_available ? "OIDN-required" : "unavailable-raw-fallback"} +
+            " guiding=first-bounce-tile-mixture denoiser=OIDN-required"
             " samples=" + std::to_string(lightmap_bake_settings.sample_count));
     }
     if (!scene_initialized || scene_asset_path.empty())
@@ -1127,6 +1108,18 @@ void NewPipelineClientRenderPath::RequestLightmapBake()
         lightmap_bake_state = LightmapBakeState::Failed;
         lightmap_bake_status = "Lightmap: UNAVAILABLE no persistent .wiscene";
         client_static_lighting.SetLightmapStatus(ClientLightingAssetState::Unavailable, lightmap_bake_status);
+        wi::backlog::post(lightmap_bake_status);
+        return;
+    }
+    if (lightmap_bake_denoiser_required && !lightmap_bake_denoiser_available)
+    {
+        render_settings.lightmap_bake_requested = false;
+        lightmap_bake_state = LightmapBakeState::Failed;
+        lightmap_bake_status =
+            "Lightmap: UNAVAILABLE OpenImageDenoise is required for production bakes";
+        client_static_lighting.SetLightmapStatus(
+            ClientLightingAssetState::Unavailable, lightmap_bake_status);
+        static_lighting_bake_requested = false;
         wi::backlog::post(lightmap_bake_status);
         return;
     }

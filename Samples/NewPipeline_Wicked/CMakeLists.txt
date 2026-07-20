@@ -20,6 +20,8 @@ if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
 endif()
 
 set(NEWPIPELINE_WEBRTC_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/WebRTC/7827")
+set(NEWPIPELINE_OIDN_ROOT
+    "${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/OpenImageDenoise")
 set(NEWPIPELINE_WEBRTC_INCLUDE "${NEWPIPELINE_WEBRTC_ROOT}/include")
 set(NEWPIPELINE_WEBRTC_DEBUG_LIB "${NEWPIPELINE_WEBRTC_ROOT}/debug/webrtc.lib")
 set(NEWPIPELINE_WEBRTC_RELEASE_LIB "${NEWPIPELINE_WEBRTC_ROOT}/release/webrtc.lib")
@@ -114,24 +116,19 @@ function(newpipeline_wicked_add_windows_target TARGET_NAME ENTRY APP_SOURCE APP_
     )
     if(TARGET OpenImageDenoise)
         target_link_libraries(${TARGET_NAME} PRIVATE OpenImageDenoise)
-        if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.21)
-            # Includes OpenImageDenoise.dll and its device/runtime DLLs rather
-            # than copying only the import target's primary binary.
-            add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    $<TARGET_RUNTIME_DLLS:${TARGET_NAME}>
-                    "$<TARGET_FILE_DIR:${TARGET_NAME}>"
-                COMMAND_EXPAND_LISTS
-                VERBATIM
-            )
-        else()
-            add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    "$<TARGET_FILE:OpenImageDenoise>"
-                    "$<TARGET_FILE_DIR:${TARGET_NAME}>"
-                VERBATIM
-            )
-        endif()
+    endif()
+
+    if(EXISTS "${NEWPIPELINE_OIDN_ROOT}/bin/OpenImageDenoise.dll")
+        # Deploy only from the repository-local SDK. No PATH/debug-environment
+        # mutation or machine-wide package fallback is used.
+        add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_directory
+                "${NEWPIPELINE_OIDN_ROOT}/bin"
+                "$<TARGET_FILE_DIR:${TARGET_NAME}>"
+            COMMENT
+                "Deploying bundled OpenImageDenoise runtime for ${TARGET_NAME}"
+            VERBATIM
+        )
     endif()
     source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}" FILES
         ${ENTRY} ${APP_SOURCE} ${APP_HEADER} ${RENDER_SOURCE} ${RENDER_HEADER}

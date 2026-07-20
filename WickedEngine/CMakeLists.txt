@@ -9,14 +9,23 @@ set(MIN_OpenImageDenoise_VERSION "2.0")
 option(WICKED_ENABLE_OPENIMAGEDENOISE "Enable production lightmap denoising" ON)
 
 if(WICKED_ENABLE_OPENIMAGEDENOISE)
-    # OIDN is used by the offline lightmap path on every desktop platform,
-    # including Windows. Previously it was searched only in the non-Windows
-    # branch, which made Windows client bakes permanently report unavailable.
-    find_package(OpenImageDenoise "${MIN_OpenImageDenoise_VERSION}" CONFIG QUIET)
-    if(OpenImageDenoise_FOUND)
+    # NewPipeline carries a self-contained official OIDN SDK. Do not inspect or
+    # modify machine-wide search paths: this fixed repository path is the only
+    # accepted dependency source for the NewPipeline lightmap pipeline.
+    set(WICKED_NEWPIPELINE_OIDN_ROOT
+        "${WICKED_ROOT_DIR}/Samples/NewPipeline_Wicked/ThirdParty/OpenImageDenoise")
+    if(EXISTS "${WICKED_NEWPIPELINE_OIDN_ROOT}/include/OpenImageDenoise/oidn.hpp")
+        message(STATUS
+            "Using bundled NewPipeline OpenImageDenoise SDK: ${WICKED_NEWPIPELINE_OIDN_ROOT}")
+        find_package(OpenImageDenoise "${MIN_OpenImageDenoise_VERSION}"
+            CONFIG REQUIRED
+            PATHS "${WICKED_NEWPIPELINE_OIDN_ROOT}"
+            NO_DEFAULT_PATH)
         message(STATUS "OpenImageDenoise ${OpenImageDenoise_VERSION} Found.")
     else()
-        message(STATUS "OpenImageDenoise>=${MIN_OpenImageDenoise_VERSION} not found; high-sample fallback remains enabled.")
+        set(OpenImageDenoise_FOUND FALSE)
+        message(STATUS
+            "Bundled NewPipeline OpenImageDenoise SDK not found; production lightmap denoising is unavailable.")
     endif()
 endif()
 

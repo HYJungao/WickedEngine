@@ -7,12 +7,10 @@
 
 namespace wicked_newpipeline
 {
-// Production policy follows the same broad contract as GPU Lightmass: a
-// moderate progressive sample budget is acceptable only when the offline
-// denoiser is actually present. Dependency-free builds use the higher raw
-// budget instead of silently shipping a noisy 512-sample bake.
+// Sampling quality and denoising are independent controls. Production uses a
+// fixed progressive budget and requires the offline denoiser; it never changes
+// the requested sample count to compensate for a missing dependency.
 static constexpr uint32_t kClientLightmapDenoisedSamples = 512;
-static constexpr uint32_t kClientLightmapUnfilteredSamples = 2048;
 
 struct ClientLightmapBakeSettings
 {

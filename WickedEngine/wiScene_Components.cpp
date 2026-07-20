@@ -2278,19 +2278,51 @@ namespace wi::scene
 						}
 					}
 
+					// OIDN's default device can be a CPU or GPU. System-allocator
+					// pointers are not device-accessible on discrete GPUs, so use
+					// OIDN-owned buffers and its explicit host transfer API. This is
+					// also the required OIDN 2.x portable path.
+					const size_t image_bytes = size_t(patch_count) * sizeof(XMFLOAT3);
+					oidn::BufferRef input_buffer = denoiser.device.newBuffer(image_bytes);
+					oidn::BufferRef output_buffer = denoiser.device.newBuffer(image_bytes);
+					const char* error_message = nullptr;
+					if (!input_buffer || !output_buffer ||
+						denoiser.device.getError(error_message) != oidn::Error::None)
+					{
+						all_components_succeeded = false;
+						wi::backlog::post(std::string("[OpenImageDenoise error] ") +
+							(error_message != nullptr ? error_message : "buffer allocation failed"));
+						break;
+					}
+					input_buffer.write(0, image_bytes, input.data());
+					if (denoiser.device.getError(error_message) != oidn::Error::None)
+					{
+						all_components_succeeded = false;
+						wi::backlog::post(std::string("[OpenImageDenoise error] ") +
+							(error_message != nullptr ? error_message : "input upload failed"));
+						break;
+					}
+
 					oidn::FilterRef filter = denoiser.device.newFilter("RTLightmap");
-					filter.setImage("color", input.data(), oidn::Format::Float3,
+					filter.setImage("color", input_buffer, oidn::Format::Float3,
 						patch_width, patch_height);
-					filter.setImage("output", output.data(), oidn::Format::Float3,
+					filter.setImage("output", output_buffer, oidn::Format::Float3,
 						patch_width, patch_height);
 					filter.commit();
 					filter.execute();
-					const char* error_message = nullptr;
 					if (denoiser.device.getError(error_message) != oidn::Error::None)
 					{
 						all_components_succeeded = false;
 						wi::backlog::post(std::string("[OpenImageDenoise error] ") +
 							(error_message != nullptr ? error_message : "filter execution failed"));
+						break;
+					}
+					output_buffer.read(0, image_bytes, output.data());
+					if (denoiser.device.getError(error_message) != oidn::Error::None)
+					{
+						all_components_succeeded = false;
+						wi::backlog::post(std::string("[OpenImageDenoise error] ") +
+							(error_message != nullptr ? error_message : "output readback failed"));
 						break;
 					}
 

@@ -296,7 +296,7 @@ void NewPipelineClientApp::CreateDebugUI()
     diagnostic_samples_combo.Create("Samples: ");
     diagnostic_samples_combo.SetPos(XMFLOAT2(175.0f, 74.0f));
     diagnostic_samples_combo.SetSize(XMFLOAT2(190.0f, 20.0f));
-    for (uint32_t value : {128u, 512u, 2048u})
+    for (uint32_t value : {128u, 512u})
         diagnostic_samples_combo.AddItem(std::to_string(value), value);
     diagnostic_samples_combo.SetSelectedByUserdataWithoutCallback(initial_diagnostic_settings.sample_count);
     diagnostic_samples_combo.OnSelect([this](const wi::gui::EventArgs& args) {

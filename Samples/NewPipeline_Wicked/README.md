@@ -48,6 +48,25 @@ explicit remote overview.
 Open `NewPipeline_Wicked_MacOS.xcodeproj`, start the signaling relay, then run
 `NewPipeline_Wicked_Server_MacOS` and `NewPipeline_Wicked_Client_MacOS`.
 
+## Open Image Denoise
+
+Production Client lightmap baking requires an official OIDN 2.x SDK. Extract
+the platform package contents directly into:
+
+```text
+ThirdParty/OpenImageDenoise/include/OpenImageDenoise/oidn.hpp
+ThirdParty/OpenImageDenoise/lib/...
+ThirdParty/OpenImageDenoise/bin/...       # Windows runtime DLLs
+```
+
+Windows CMake discovers that directory and copies the full `bin/*.dll` payload
+beside each executable. The macOS Xcode targets link the package dylib and copy
+all OIDN/device/runtime dylibs into the application Frameworks directory. The
+SDK itself is ignored by Git. Production does not raise the sample count when
+OIDN is missing: it reports the missing dependency and preserves the previous
+lightmap package. Diagnostic object bakes retain their explicitly selected
+sample count and can still run without the denoiser.
+
 ## Windows WebRTC package
 
 Use WebRTC 7827 built for Visual Studio 2022 x64 with the MSVC STL ABI. Debug
