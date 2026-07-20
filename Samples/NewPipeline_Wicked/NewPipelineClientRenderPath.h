@@ -193,6 +193,7 @@ private:
     ClientLightmapBakeSettings lightmap_bake_settings_before_diagnostic;
     LightmapDiagnosticSettings lightmap_diagnostic_settings;
     ClientLightmapAtlasAudit lightmap_diagnostic_atlas_audit;
+    ClientLightmapSamplingAudit lightmap_diagnostic_sampling_audit;
     wi::ecs::Entity lightmap_diagnostic_entity = wi::ecs::INVALID_ENTITY;
     std::string lightmap_diagnostic_object_name;
     std::string lightmap_diagnostic_status = "Diagnostic: pick an object at screen center";

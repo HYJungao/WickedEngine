@@ -2384,44 +2384,51 @@ namespace wi::scene
 				lightmapCoverageData.size() >= texel_count)
 			{
 				XMHALF4* texels = reinterpret_cast<XMHALF4*>(lightmapTextureData.data());
-				wi::vector<uint8_t> padded_valid = lightmapCoverageData;
+				// Multi-source breadth-first expansion is equivalent to four synchronous
+				// 8-neighbour dilation passes, but it allocates once and visits each
+				// padding texel at most once. Seed order is atlas order, so ties remain
+				// deterministic across platforms.
+				constexpr uint8_t unvisited = 0xFF;
+				constexpr uint8_t padding_radius = 4;
+				wi::vector<uint8_t> distance(static_cast<size_t>(texel_count), unvisited);
+				std::deque<uint64_t> padding_queue;
+				for (uint64_t index = 0; index < texel_count; ++index)
+				{
+					if (lightmapCoverageData[static_cast<size_t>(index)] != 0)
+					{
+						distance[static_cast<size_t>(index)] = 0;
+						padding_queue.push_back(index);
+					}
+				}
 				static constexpr int offsets[8][2] = {
 					{ 0, -1 }, { 0, 1 }, { -1, 0 }, { 1, 0 },
 					{ -1, -1 }, { 1, -1 }, { 1, 1 }, { -1, 1 },
 				};
-				for (uint32_t iteration = 0; iteration < 4; ++iteration)
+				while (!padding_queue.empty())
 				{
-					const wi::vector<uint8_t> source_valid = padded_valid;
-					const wi::vector<XMHALF4> source_texels(texels, texels + texel_count);
-					bool expanded = false;
-					for (uint32_t y = 0; y < lightmapHeight; ++y)
+					const uint64_t index = padding_queue.front();
+					padding_queue.pop_front();
+					const uint8_t source_distance = distance[static_cast<size_t>(index)];
+					if (source_distance >= padding_radius)
+						continue;
+					const uint32_t x = static_cast<uint32_t>(index % lightmapWidth);
+					const uint32_t y = static_cast<uint32_t>(index / lightmapWidth);
+					for (const auto& offset : offsets)
 					{
-						for (uint32_t x = 0; x < lightmapWidth; ++x)
-						{
-							const uint64_t index = uint64_t(y) * lightmapWidth + x;
-							if (source_valid[static_cast<size_t>(index)] != 0)
-								continue;
-							for (const auto& offset : offsets)
-							{
-								const int candidate_x = static_cast<int>(x) + offset[0];
-								const int candidate_y = static_cast<int>(y) + offset[1];
-								if (candidate_x < 0 || candidate_y < 0 ||
-									candidate_x >= static_cast<int>(lightmapWidth) ||
-									candidate_y >= static_cast<int>(lightmapHeight))
-									continue;
-								const uint64_t candidate = uint64_t(candidate_y) * lightmapWidth +
-									static_cast<uint32_t>(candidate_x);
-								if (source_valid[static_cast<size_t>(candidate)] == 0)
-									continue;
-								texels[index] = source_texels[static_cast<size_t>(candidate)];
-								padded_valid[static_cast<size_t>(index)] = 255;
-								expanded = true;
-								break;
-							}
-						}
+						const int candidate_x = static_cast<int>(x) + offset[0];
+						const int candidate_y = static_cast<int>(y) + offset[1];
+						if (candidate_x < 0 || candidate_y < 0 ||
+							candidate_x >= static_cast<int>(lightmapWidth) ||
+							candidate_y >= static_cast<int>(lightmapHeight))
+							continue;
+						const uint64_t candidate = uint64_t(candidate_y) * lightmapWidth +
+							static_cast<uint32_t>(candidate_x);
+						if (distance[static_cast<size_t>(candidate)] != unvisited)
+							continue;
+						texels[candidate] = texels[index];
+						distance[static_cast<size_t>(candidate)] = uint8_t(source_distance + 1u);
+						padding_queue.push_back(candidate);
 					}
-					if (!expanded)
-						break;
 				}
 			}
 

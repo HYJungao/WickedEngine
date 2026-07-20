@@ -42,6 +42,51 @@ struct Input
 #endif // DEBUG_CHARTS
 };
 
+float3 LightmapAlignGeometricNormal(float3 geometric_normal, float3 shading_normal)
+{
+	const float length_sq = dot(geometric_normal, geometric_normal);
+	if (!isfinite(length_sq) || length_sq <= 1e-12)
+		return shading_normal;
+	geometric_normal *= rsqrt(length_sq);
+	return dot(geometric_normal, shading_normal) < 0 ? -geometric_normal : geometric_normal;
+}
+
+float3 LightmapRasterGeometricNormal(float3 P, float3 shading_normal)
+{
+	return LightmapAlignGeometricNormal(cross(ddx(P), ddy(P)), shading_normal);
+}
+
+float3 LightmapSurfaceGeometricNormal(in Surface surface)
+{
+	const float3 P0 = mul(surface.inst.transform.GetMatrix(), float4(surface.data0.xyz, 1)).xyz;
+	const float3 P1 = mul(surface.inst.transform.GetMatrix(), float4(surface.data1.xyz, 1)).xyz;
+	const float3 P2 = mul(surface.inst.transform.GetMatrix(), float4(surface.data2.xyz, 1)).xyz;
+	float3 geometric_normal = cross(P2 - P1, P1 - P0);
+	if (surface.IsBackface())
+		geometric_normal = -geometric_normal;
+	return LightmapAlignGeometricNormal(geometric_normal, surface.N);
+}
+
+float LightmapRayBias(float3 origin, float hit_distance = 0)
+{
+	// Match the scale-aware path-tracer strategy used by Unreal: retain Wicked's
+	// established millimetre base offset, but grow it by a small ULP radius for
+	// large world coordinates or long paths where a fixed epsilon is ineffective.
+	const float reference = max(max3(abs(origin)), abs(hit_distance));
+	const float relative = asfloat(asuint(reference) + 16u) - reference;
+	return max(0.001, relative);
+}
+
+float3 LightmapOffsetRayOrigin(
+	float3 origin,
+	float3 geometric_normal,
+	float position_bias_sign,
+	float hit_distance = 0)
+{
+	return origin + geometric_normal * position_bias_sign *
+		LightmapRayBias(origin, hit_distance);
+}
+
 uint LightmapGuidingTileOffset(uint2 pixel)
 {
 	const uint tile_width = (xTraceResolution.x + LIGHTMAP_GUIDING_TILE_SIZE - 1u) /
@@ -131,7 +176,13 @@ static const float2 tangent_directions[] = {
 // Bakery pixel pushing: https://ndotl.wordpress.com/2018/08/29/baking-artifact-free-lightmaps/
 //	This can push position outside of enclosed area within a pixel to remove shadow leaks
 //	Instead the shadow texel reaching outside, this will make light go inside which is better in most cases
-void BakeryPixelPush(inout float3 P, in float3 N, in float2 UV, inout RNG rng, inout float bakerydebug)
+void BakeryPixelPush(
+	inout float3 P,
+	in float3 N,
+	in float3 geometric_normal,
+	in float2 UV,
+	inout RNG rng,
+	inout float bakerydebug)
 {
 	float3 dUV1 = max(abs(ddx(P)), abs(ddy(P)));
 	float dPos = max(max(dUV1.x, dUV1.y), dUV1.z);
@@ -144,9 +195,9 @@ void BakeryPixelPush(inout float3 P, in float3 N, in float2 UV, inout RNG rng, i
 	for (uint i = 0; i < arraysize(tangent_directions) && WaveActiveAnyTrue(valid); ++i)
 	{
 		RayDesc ray;
-		ray.Origin = P + N * 0.001;
 		ray.Direction = normalize(mul(float3(tangent_directions[i], 1), TBN));
-		ray.TMin = 0.001;
+		ray.Origin = LightmapOffsetRayOrigin(P, geometric_normal, 1);
+		ray.TMin = 0;
 		ray.TMax = dPos;
 	
 		bool backface_hit = false;
@@ -210,7 +261,7 @@ void BakeryPixelPush(inout float3 P, in float3 N, in float2 UV, inout RNG rng, i
 		if (valid && backface_hit)
 		{
 			bakerydebug = 1;
-			P = hit_pos - hit_nor * 0.001;
+			P = hit_pos - hit_nor * LightmapRayBias(hit_pos, length(hit_pos - ray.Origin));
 		}
 	}
 }
@@ -570,10 +621,14 @@ float3 EvaluateLightmapDirect(
 
 	float3 visibility = diffuse_throughput;
 	RayDesc shadow_ray;
-	shadow_ray.Origin = receiver.P + receiver.N * 0.001;
-	shadow_ray.TMin = 0.001;
-	shadow_ray.TMax = dist;
 	shadow_ray.Direction = normalize(L + max3(receiver.sss));
+	const float3 receiver_geometric_normal = LightmapAlignGeometricNormal(receiver.facenormal, receiver.N);
+	if (dot(shadow_ray.Direction, receiver_geometric_normal) <= 0)
+		return 0;
+	const float shadow_bias = LightmapRayBias(receiver.P, dist >= FLT_MAX - 1 ? 0 : dist);
+	shadow_ray.Origin = receiver.P + receiver_geometric_normal * shadow_bias;
+	shadow_ray.TMin = 0;
+	shadow_ray.TMax = dist == FLT_MAX ? FLT_MAX : max(0.0, dist - shadow_bias);
 
 #ifdef RTAPI
 	uint flags = RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES | RAY_FLAG_CULL_FRONT_FACING_TRIANGLES;
@@ -682,10 +737,16 @@ float3 EvaluateLightmapDirectMIS(
 
 	float3 visibility = diffuse_throughput;
 	RayDesc shadow_ray;
-	shadow_ray.Origin = receiver.P + receiver.N * 0.001;
-	shadow_ray.TMin = 0.001;
-	shadow_ray.TMax = light_sample.distance == FLT_MAX ? FLT_MAX : max(0.001, light_sample.distance - 0.001);
 	shadow_ray.Direction = normalize(light_sample.direction + max3(receiver.sss));
+	const float3 receiver_geometric_normal = LightmapAlignGeometricNormal(receiver.facenormal, receiver.N);
+	if (dot(shadow_ray.Direction, receiver_geometric_normal) <= 0)
+		return 0;
+	const float shadow_bias = LightmapRayBias(
+		receiver.P, light_sample.distance >= FLT_MAX - 1 ? 0 : light_sample.distance);
+	shadow_ray.Origin = receiver.P + receiver_geometric_normal * shadow_bias;
+	shadow_ray.TMin = 0;
+	shadow_ray.TMax = light_sample.distance == FLT_MAX ? FLT_MAX :
+		max(0.0, light_sample.distance - shadow_bias);
 
 #ifdef RTAPI
 	uint flags = RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES | RAY_FLAG_CULL_FRONT_FACING_TRIANGLES;
@@ -758,12 +819,16 @@ LightmapOutput main(Input input)
 	qmc.init((uint2)input.pos.xy, xTraceSampleIndex, xTraceUserData.z);
 
 	float3 P = input.pos3D;
+	float3 geometric_normal = LightmapRasterGeometricNormal(P, surface.N);
+	surface.facenormal = geometric_normal;
 
 	float bakerydebug = 0;
-	BakeryPixelPush(P, surface.N, uv, rng, bakerydebug);
+	BakeryPixelPush(P, surface.N, geometric_normal, uv, rng, bakerydebug);
+	// Pixel pushing can move the receiver onto a nearby geometric surface. The
+	// derivative normal still represents the source chart and remains the stable
+	// outward side for its initial irradiance sample.
 	
 	RayDesc ray;
-	ray.Origin = P + surface.N * 0.001;
 	const uint2 lightmap_pixel = (uint2)input.pos.xy;
 	const float4 primary_sample = qmc.sample4D(0);
 	float primary_throughput = 1;
@@ -777,9 +842,10 @@ LightmapOutput main(Input input)
 		ray.Direction = normalize(lightmap_sample_hemisphere_cos(surface.N, primary_sample.xy));
 		previous_bsdf_pdf = saturate(dot(ray.Direction, surface.N)) / PI;
 	}
+	ray.Origin = LightmapOffsetRayOrigin(P, geometric_normal, 1);
 	const float3 primary_direction = ray.Direction;
 	const float3 lightmap_normal = surface.N;
-	ray.TMin = 0.001;
+	ray.TMin = 0;
 	ray.TMax = FLT_MAX;
 	// A baked lightmap contains traced static lights and sky/environment only.
 	// GetAmbientColor() is Wicked's runtime fallback for surfaces without baked
@@ -787,7 +853,7 @@ LightmapOutput main(Input input)
 	// every valid texel and produce a uniform color cast in the baked result.
 	float3 result = 0;
 	float3 energy = primary_throughput;
-	surface.P = ray.Origin;
+	surface.P = P;
 	// Bounce zero is incident irradiance for the original lightmapped surface;
 	// its material response is applied later by the runtime lighting shader.
 	const float3 original_direct = EvaluateLightmapDirectMIS(
@@ -892,6 +958,8 @@ LightmapOutput main(Input input)
 
 #endif // RTAPI
 
+		geometric_normal = LightmapSurfaceGeometricNormal(surface);
+		surface.facenormal = geometric_normal;
 		surface.update();
 
 		result += energy * surface.emissiveColor;
@@ -950,9 +1018,15 @@ LightmapOutput main(Input input)
 					(1 - specular_chance) * saturate(dot(ray.Direction, surface.N)) / PI;
 				energy *= surface.albedo * (1 - surface.F) / max(0.001, 1 - specular_chance) / max(0.001, 1 - surface.transmission);
 			}
-			
-			ray.Origin += surface.facenormal * 0.001; // NOTE: TMin on AMD doesn't handle CommittedTriangleFrontFace correctly, so origin is updated instead!
 		}
+
+		// TMin alone is not reliable on every DXR implementation. Offset from the
+		// actual geometric plane on the side selected by reflection/refraction.
+		ray.Origin = LightmapOffsetRayOrigin(
+			ray.Origin, geometric_normal,
+			bsdf_sample.x < surface.transmission ? -1.0 : 1.0,
+			geometry_distance);
+		ray.TMin = 0;
 
 		// Terminate ray's path or apply inverse termination bias:
 		const float termination_chance = saturate(max3(energy));

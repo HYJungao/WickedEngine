@@ -49,7 +49,52 @@ struct ClientLightmapAtlasAudit
             invalid_index_triangle_count > 0 || degenerate_triangle_count > 0 ||
             overlapping_triangle_pair_count > 0 || overlap_test_truncated;
     }
+    bool HasDensityRisk() const
+    {
+        // A sub-texel triangle can lose ownership to a neighbour during
+        // conservative rasterization, and an isolated chart smaller than one
+        // BC6H block has no stable interior footprint. This is advisory: smooth
+        // connected charts can still bake acceptably at this density.
+        return triangle_count > 0 && chart_count > 0 &&
+            (min_triangle_texels < 1.0f || min_chart_texels < 16.0f);
+    }
     std::string Summary(uint32_t width, uint32_t height) const;
+};
+
+// Diagnostic-only correlation between atlas triangles and the actual GPU
+// accumulation result. This distinguishes insufficient atlas density/content
+// normals from a baker coverage or accumulation failure without changing the
+// production bake output.
+struct ClientLightmapSamplingAudit
+{
+    bool valid = false;
+    uint32_t expected_samples = 0;
+    uint64_t covered_texel_count = 0;
+    uint64_t low_sample_texel_count = 0;
+    uint64_t excess_sample_texel_count = 0;
+    float sample_count_min = 0;
+    float sample_count_p05 = 0;
+    float sample_count_average = 0;
+    float sample_count_max = 0;
+    uint32_t rasterized_triangle_count = 0;
+    uint32_t zero_coverage_triangle_count = 0;
+    uint32_t undersized_zero_coverage_triangle_count = 0;
+    uint32_t adequate_zero_coverage_triangle_count = 0;
+    uint32_t sparse_coverage_triangle_count = 0;
+    uint32_t fully_dark_covered_triangle_count = 0;
+    uint32_t mostly_dark_covered_triangle_count = 0;
+    uint32_t dark_normal_defect_triangle_count = 0;
+    uint64_t near_black_texel_count = 0;
+    uint64_t largest_near_black_component_texels = 0;
+    float luminance_p05 = 0;
+    float luminance_median = 0;
+    float luminance_average = 0;
+    float luminance_max = 0;
+    uint32_t invalid_normal_triangle_count = 0;
+    uint32_t opposed_normal_triangle_count = 0;
+
+    const char* Classification() const;
+    std::string Summary() const;
 };
 
 struct ClientLightmapPackageResult
@@ -66,7 +111,10 @@ class ClientLightmapPackage
 {
 public:
     static constexpr const char* kObjectIdMetadataKey = "newpipeline.client_lightmap_id";
-    static constexpr uint32_t kPackageVersion = 3;
+    // Version 4 invalidates packages baked before geometric-normal ray bias was
+    // introduced. The byte layout is unchanged, but the transport contract is
+    // materially different and stale v3 lighting must not be reused silently.
+    static constexpr uint32_t kPackageVersion = 4;
     static constexpr uint32_t kDerivedSceneVersion = 2;
     static constexpr uint32_t kObjectMappingVersion = 1;
 
@@ -107,6 +155,14 @@ ClientLightmapAtlasAudit AuditClientLightmapAtlas(
     const wi::scene::MeshComponent& mesh,
     uint32_t width,
     uint32_t height);
+
+ClientLightmapSamplingAudit AuditClientLightmapSampling(
+    const wi::scene::MeshComponent& mesh,
+    uint32_t width,
+    uint32_t height,
+    uint32_t expected_samples,
+    const wi::vector<uint8_t>& accumulation_rgba32f,
+    const wi::vector<uint8_t>& strict_coverage_r8);
 
 // Returns the exact GPU/package dimension used by the Client lightmap path.
 // It never rounds an xatlas result down.

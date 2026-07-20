@@ -1097,7 +1097,7 @@ void NewPipelineClientRenderPath::RequestLightmapBake()
     if (!lightmap_diagnostic_session_active)
     {
         wi::backlog::post(
-            "Client lightmap production quality: integrator=vertex-nee-mis-v3"
+            "Client lightmap production quality: integrator=vertex-nee-mis-v4-geometric-bias"
             " sampler=independent-owen-sobol-batches"
             " light_selection=spatial-candidate-contribution-cdf"
             " guiding=first-bounce-tile-mixture denoiser=OIDN-required"
@@ -1408,6 +1408,7 @@ void NewPipelineClientRenderPath::RequestLightmapDiagnosticBake()
     lightmap_diagnostic_resume_requested = false;
     lightmap_diagnostic_atlas_regenerated = false;
     lightmap_diagnostic_atlas_audit = {};
+    lightmap_diagnostic_sampling_audit = {};
     lightmap_diagnostic_status = "Diagnostic: preparing selected object " +
         lightmap_diagnostic_object_name;
     RequestLightmapBake();
@@ -1694,7 +1695,7 @@ bool NewPipelineClientRenderPath::PrepareLightmapBake()
                 " bounces=" + std::to_string(lightmap_bake_settings.bounce_count) +
                 " static_lights=" + std::to_string(static_lights) +
                 " dynamic_lights=" + std::to_string(dynamic_lights) +
-                " integrator=vertex-nee-mis-v3" +
+                " integrator=vertex-nee-mis-v4-geometric-bias" +
                 " sampler=independent-owen-sobol-batches" +
                 " light_selection=spatial-candidate-contribution-cdf" +
                 " guiding=first-bounce-tile-mixture" +
@@ -1885,6 +1886,37 @@ bool NewPipelineClientRenderPath::FinalizeOnePendingLightmap()
     {
         FailLightmapBake("pending lightmap object disappeared: " + object_name);
         return false;
+    }
+
+    if (lightmap_diagnostic_session_active && entity == lightmap_diagnostic_entity)
+    {
+        wi::vector<uint8_t> accumulation_data;
+        wi::vector<uint8_t> coverage_data;
+        const wi::scene::MeshComponent* mesh = local_scene.meshes.GetComponent(object->meshID);
+        const bool accumulation_readback = object->lightmap_render.IsValid() &&
+            object->lightmap_render.GetDesc().format == wi::graphics::Format::R32G32B32A32_FLOAT &&
+            wi::helper::saveTextureToMemory(object->lightmap_render, accumulation_data);
+        const bool coverage_readback = object->lightmap_coverage.IsValid() &&
+            object->lightmap_coverage.GetDesc().format == wi::graphics::Format::R8_UNORM &&
+            wi::helper::saveTextureToMemory(object->lightmap_coverage, coverage_data);
+        if (mesh != nullptr && accumulation_readback && coverage_readback)
+        {
+            lightmap_diagnostic_sampling_audit = AuditClientLightmapSampling(
+                *mesh,
+                object->lightmapWidth,
+                object->lightmapHeight,
+                lightmap_bake_settings.sample_count,
+                accumulation_data,
+                coverage_data);
+        }
+        else
+        {
+            lightmap_diagnostic_sampling_audit = {};
+            lightmap_diagnostic_sampling_audit.expected_samples = lightmap_bake_settings.sample_count;
+        }
+        const std::string sampling_summary = lightmap_diagnostic_sampling_audit.Summary();
+        lightmap_diagnostic_status = "Diagnostic sampling: " + sampling_summary;
+        wi::backlog::post("Client lightmap diagnostic sampling audit: " + sampling_summary);
     }
 
     object->SaveLightmap();
@@ -2155,8 +2187,9 @@ void NewPipelineClientRenderPath::UpdateLightmapBake(float dt)
         render_settings.lightmap_bake_requested = false;
         lightmap_bake_state = LightmapBakeState::DiagnosticCompressed;
         lightmap_bake_status = "Lightmap diagnostic: temporary SaveLightmap result ready; Discard restores production package";
-        lightmap_diagnostic_status = "Diagnostic: SaveLightmap/OIDN+BC6H result ready in Local Lightmap Raw; "
-            "compare with the paused R16F capture, then Discard";
+        lightmap_diagnostic_status = "Diagnostic: sampling=" +
+            std::string{lightmap_diagnostic_sampling_audit.Classification()} +
+            "; SaveLightmap/OIDN+BC6H result ready in Local Lightmap Raw; compare with the paused R16F capture, then Discard";
         wi::backlog::post(lightmap_diagnostic_status);
         return;
     }

@@ -195,12 +195,101 @@ bool TrianglesOverlapWithPositiveArea(const AtlasTriangle& a, const AtlasTriangl
     return true;
 }
 
+bool TriangleIntersectsTexel(const AtlasTriangle& triangle, uint32_t x, uint32_t y)
+{
+    const float center_x = float(x) + 0.5f;
+    const float center_y = float(y) + 0.5f;
+    constexpr float half_extent = 0.5f;
+    const AtlasPoint axes[] = {
+        {1, 0},
+        {0, 1},
+        {-(triangle.points[1].y - triangle.points[0].y), triangle.points[1].x - triangle.points[0].x},
+        {-(triangle.points[2].y - triangle.points[1].y), triangle.points[2].x - triangle.points[1].x},
+        {-(triangle.points[0].y - triangle.points[2].y), triangle.points[0].x - triangle.points[2].x},
+    };
+    for (const AtlasPoint& axis : axes)
+    {
+        const float length_sq = axis.x * axis.x + axis.y * axis.y;
+        if (length_sq <= 1e-12f)
+            continue;
+        float triangle_min = std::numeric_limits<float>::max();
+        float triangle_max = -std::numeric_limits<float>::max();
+        for (const AtlasPoint& point : triangle.points)
+        {
+            const float projection = point.x * axis.x + point.y * axis.y;
+            triangle_min = std::min(triangle_min, projection);
+            triangle_max = std::max(triangle_max, projection);
+        }
+        const float box_center = center_x * axis.x + center_y * axis.y;
+        const float box_radius = half_extent * (std::abs(axis.x) + std::abs(axis.y));
+        if (triangle_max < box_center - box_radius || triangle_min > box_center + box_radius)
+            return false;
+    }
+    return true;
+}
+
+bool TriangleHasInvalidOrOpposedNormals(
+    const wi::scene::MeshComponent& mesh,
+    const AtlasTriangle& triangle,
+    bool& invalid,
+    bool& opposed)
+{
+    invalid = false;
+    opposed = false;
+    for (uint32_t index : triangle.indices)
+    {
+        if (index >= mesh.vertex_positions.size() || index >= mesh.vertex_normals.size())
+        {
+            invalid = true;
+            return false;
+        }
+    }
+    const XMFLOAT3& p0 = mesh.vertex_positions[triangle.indices[0]];
+    const XMFLOAT3& p1 = mesh.vertex_positions[triangle.indices[1]];
+    const XMFLOAT3& p2 = mesh.vertex_positions[triangle.indices[2]];
+    const XMFLOAT3& n0 = mesh.vertex_normals[triangle.indices[0]];
+    const XMFLOAT3& n1 = mesh.vertex_normals[triangle.indices[1]];
+    const XMFLOAT3& n2 = mesh.vertex_normals[triangle.indices[2]];
+    const XMVECTOR edge0 = XMLoadFloat3(&p1) - XMLoadFloat3(&p0);
+    const XMVECTOR edge1 = XMLoadFloat3(&p2) - XMLoadFloat3(&p0);
+    // Wicked mesh indices use the opposite winding from the conventional
+    // cross(edge0, edge1) expression used by this CPU audit.
+    const XMVECTOR geometric = XMVector3Cross(edge1, edge0);
+    const XMVECTOR shading = XMLoadFloat3(&n0) + XMLoadFloat3(&n1) + XMLoadFloat3(&n2);
+    const float geometric_length_sq = XMVectorGetX(XMVector3LengthSq(geometric));
+    const float shading_length_sq = XMVectorGetX(XMVector3LengthSq(shading));
+    if (!std::isfinite(geometric_length_sq) || !std::isfinite(shading_length_sq) ||
+        geometric_length_sq <= 1e-12f || shading_length_sq <= 1e-12f)
+    {
+        invalid = true;
+        return false;
+    }
+    const float alignment = XMVectorGetX(XMVector3Dot(
+        XMVector3Normalize(geometric), XMVector3Normalize(shading)));
+    if (!std::isfinite(alignment))
+    {
+        invalid = true;
+        return false;
+    }
+    opposed = alignment < -0.05f;
+    return true;
+}
+
 float Percentile05(wi::vector<float> values)
 {
     if (values.empty())
         return 0;
     std::sort(values.begin(), values.end());
     const size_t index = std::min(values.size() - 1, (values.size() - 1) / 20);
+    return values[index];
+}
+
+float Percentile50(wi::vector<float> values)
+{
+    if (values.empty())
+        return 0;
+    const size_t index = (values.size() - 1) / 2;
+    std::nth_element(values.begin(), values.begin() + index, values.end());
     return values[index];
 }
 
@@ -264,7 +353,8 @@ std::string ClientLightmapAtlasAudit::Summary(uint32_t width, uint32_t height) c
         p05_triangle_texels << "/" << average_triangle_texels <<
         " chart_texels[min/p05/avg]=" << min_chart_texels << "/" <<
         p05_chart_texels << "/" << average_chart_texels <<
-        " texels_per_world_unit=" << texels_per_world_unit;
+        " texels_per_world_unit=" << texels_per_world_unit <<
+        " density=" << (HasDensityRisk() ? "RISK" : "OK");
     return stream.str();
 }
 
@@ -477,6 +567,279 @@ ClientLightmapAtlasAudit AuditClientLightmapAtlas(
             break;
     }
 
+    return audit;
+}
+
+const char* ClientLightmapSamplingAudit::Classification() const
+{
+    if (!valid)
+        return "diagnostic-readback-invalid";
+    if (excess_sample_texel_count > 0 || adequate_zero_coverage_triangle_count > 0)
+        return "baker-coverage-or-accumulation-failure";
+    if (zero_coverage_triangle_count > 0 &&
+        zero_coverage_triangle_count == undersized_zero_coverage_triangle_count)
+        return "atlas-density-limited";
+    if (dark_normal_defect_triangle_count > 0)
+        return "model-normal-defect";
+    if (mostly_dark_covered_triangle_count > 0)
+        return "covered-but-near-black";
+    if (fully_dark_covered_triangle_count > 0)
+        return "covered-but-unlit-or-occluded";
+    if (sparse_coverage_triangle_count > 0 ||
+        (covered_texel_count > 0 && low_sample_texel_count * 10u > covered_texel_count))
+        return "coverage-edge-risk";
+    return "coverage-and-accumulation-pass";
+}
+
+std::string ClientLightmapSamplingAudit::Summary() const
+{
+    std::ostringstream stream;
+    stream << "classification=" << Classification() <<
+        " valid=" << (valid ? 1 : 0) <<
+        " samples[expected=" << expected_samples <<
+        " min/p05/avg/max=" << sample_count_min << "/" << sample_count_p05 << "/" <<
+            sample_count_average << "/" << sample_count_max <<
+        " low=" << low_sample_texel_count <<
+        " excess=" << excess_sample_texel_count << "]" <<
+        " coverage[texels=" << covered_texel_count <<
+        " tris=" << rasterized_triangle_count <<
+        " zero=" << zero_coverage_triangle_count <<
+        " zero_small=" << undersized_zero_coverage_triangle_count <<
+        " zero_adequate=" << adequate_zero_coverage_triangle_count <<
+        " sparse=" << sparse_coverage_triangle_count << "]" <<
+        " irradiance[luminance_p05/median/avg/max=" << luminance_p05 << "/" <<
+            luminance_median << "/" << luminance_average << "/" << luminance_max <<
+        " near_black_texels=" << near_black_texel_count <<
+        " largest_near_black_component=" << largest_near_black_component_texels <<
+        " fully_dark_tris=" << fully_dark_covered_triangle_count <<
+        " mostly_dark_tris=" << mostly_dark_covered_triangle_count <<
+        " dark_normal_defect=" << dark_normal_defect_triangle_count << "]" <<
+        " normals[invalid=" << invalid_normal_triangle_count <<
+        " opposed=" << opposed_normal_triangle_count << "]";
+    return stream.str();
+}
+
+ClientLightmapSamplingAudit AuditClientLightmapSampling(
+    const wi::scene::MeshComponent& mesh,
+    uint32_t width,
+    uint32_t height,
+    uint32_t expected_samples,
+    const wi::vector<uint8_t>& accumulation_rgba32f,
+    const wi::vector<uint8_t>& strict_coverage_r8)
+{
+    ClientLightmapSamplingAudit audit;
+    audit.expected_samples = expected_samples;
+    const uint64_t texel_count = uint64_t(width) * height;
+    if (width == 0 || height == 0 ||
+        texel_count > std::numeric_limits<size_t>::max() / sizeof(XMFLOAT4) ||
+        accumulation_rgba32f.size() < texel_count * sizeof(XMFLOAT4) ||
+        strict_coverage_r8.size() < texel_count || mesh.indices.empty() || mesh.vertex_atlas.empty())
+    {
+        return audit;
+    }
+
+    const XMFLOAT4* accumulation = reinterpret_cast<const XMFLOAT4*>(accumulation_rgba32f.data());
+    wi::vector<float> sample_counts;
+    wi::vector<float> luminances;
+    wi::vector<float> texel_luminance(static_cast<size_t>(texel_count), -1.0f);
+    sample_counts.reserve(static_cast<size_t>(texel_count));
+    luminances.reserve(static_cast<size_t>(texel_count));
+    double sample_count_sum = 0;
+    double luminance_sum = 0;
+    const float low_sample_threshold = std::max(1.0f, float(expected_samples) * 0.25f);
+    for (uint64_t index = 0; index < texel_count; ++index)
+    {
+        if (strict_coverage_r8[static_cast<size_t>(index)] == 0)
+            continue;
+        ++audit.covered_texel_count;
+        const float count = accumulation[index].w;
+        if (!std::isfinite(count) || count <= 0)
+            continue;
+        sample_counts.push_back(count);
+        sample_count_sum += count;
+        const XMFLOAT4& value = accumulation[index];
+        if (std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z))
+        {
+            const float luminance = std::max(0.0f,
+                (0.2126f * value.x + 0.7152f * value.y + 0.0722f * value.z) / count);
+            texel_luminance[static_cast<size_t>(index)] = luminance;
+            luminances.push_back(luminance);
+            luminance_sum += luminance;
+        }
+        if (count < low_sample_threshold)
+            ++audit.low_sample_texel_count;
+        if (count > float(expected_samples) + 0.5f)
+            ++audit.excess_sample_texel_count;
+    }
+    if (!sample_counts.empty())
+    {
+        audit.sample_count_min = *std::min_element(sample_counts.begin(), sample_counts.end());
+        audit.sample_count_p05 = Percentile05(sample_counts);
+        audit.sample_count_average = static_cast<float>(sample_count_sum / double(sample_counts.size()));
+        audit.sample_count_max = *std::max_element(sample_counts.begin(), sample_counts.end());
+    }
+    if (!luminances.empty())
+    {
+        audit.luminance_p05 = Percentile05(luminances);
+        audit.luminance_median = Percentile50(luminances);
+        audit.luminance_average = static_cast<float>(luminance_sum / double(luminances.size()));
+        audit.luminance_max = *std::max_element(luminances.begin(), luminances.end());
+    }
+
+    // Relative darkness is more useful than exact zero for HDR irradiance.
+    // A 2% median threshold identifies visually black islands while remaining
+    // exposure-independent. Connected extent distinguishes isolated noise from
+    // the stable blocks reported by the diagnostic screenshots.
+    const float near_black_threshold = std::max(1e-7f, audit.luminance_median * 0.02f);
+    wi::vector<uint8_t> near_black_visited(static_cast<size_t>(texel_count), 0);
+    std::deque<uint64_t> near_black_queue;
+    for (uint64_t seed = 0; seed < texel_count; ++seed)
+    {
+        if (near_black_visited[static_cast<size_t>(seed)] != 0 ||
+            texel_luminance[static_cast<size_t>(seed)] < 0 ||
+            texel_luminance[static_cast<size_t>(seed)] > near_black_threshold)
+            continue;
+        uint64_t component_size = 0;
+        near_black_visited[static_cast<size_t>(seed)] = 1;
+        near_black_queue.push_back(seed);
+        while (!near_black_queue.empty())
+        {
+            const uint64_t index = near_black_queue.front();
+            near_black_queue.pop_front();
+            ++component_size;
+            const uint32_t x = static_cast<uint32_t>(index % width);
+            const uint32_t y = static_cast<uint32_t>(index / width);
+            const uint64_t neighbors[4] = {
+                y > 0 ? index - width : index,
+                y + 1 < height ? index + width : index,
+                x > 0 ? index - 1 : index,
+                x + 1 < width ? index + 1 : index,
+            };
+            for (uint64_t neighbor : neighbors)
+            {
+                if (neighbor == index || near_black_visited[static_cast<size_t>(neighbor)] != 0 ||
+                    texel_luminance[static_cast<size_t>(neighbor)] < 0 ||
+                    texel_luminance[static_cast<size_t>(neighbor)] > near_black_threshold)
+                    continue;
+                near_black_visited[static_cast<size_t>(neighbor)] = 1;
+                near_black_queue.push_back(neighbor);
+            }
+        }
+        audit.near_black_texel_count += component_size;
+        audit.largest_near_black_component_texels = std::max(
+            audit.largest_near_black_component_texels, component_size);
+    }
+
+    constexpr float adequate_triangle_area = 4.0f;
+    constexpr float black_luminance_epsilon = 1e-7f;
+    const uint32_t triangle_count = static_cast<uint32_t>(mesh.indices.size() / 3u);
+    for (uint32_t triangle_index = 0; triangle_index < triangle_count; ++triangle_index)
+    {
+        AtlasTriangle triangle;
+        bool valid = true;
+        for (uint32_t corner = 0; corner < 3; ++corner)
+        {
+            const uint32_t vertex = mesh.indices[triangle_index * 3u + corner];
+            triangle.indices[corner] = vertex;
+            if (vertex >= mesh.vertex_atlas.size())
+            {
+                valid = false;
+                break;
+            }
+            const XMFLOAT2& uv = mesh.vertex_atlas[vertex];
+            triangle.points[corner] = {uv.x * float(width), uv.y * float(height)};
+            valid = valid && std::isfinite(triangle.points[corner].x) &&
+                std::isfinite(triangle.points[corner].y);
+        }
+        if (!valid)
+            continue;
+        triangle.pixel_area = std::abs(Cross2D(
+            triangle.points[0], triangle.points[1], triangle.points[2])) * 0.5f;
+        if (triangle.pixel_area <= 1e-6f)
+            continue;
+        triangle.valid = true;
+        ++audit.rasterized_triangle_count;
+
+        bool invalid_normal = false;
+        bool opposed_normal = false;
+        TriangleHasInvalidOrOpposedNormals(mesh, triangle, invalid_normal, opposed_normal);
+        if (invalid_normal)
+            ++audit.invalid_normal_triangle_count;
+        if (opposed_normal)
+            ++audit.opposed_normal_triangle_count;
+
+        float min_x = triangle.points[0].x;
+        float max_x = triangle.points[0].x;
+        float min_y = triangle.points[0].y;
+        float max_y = triangle.points[0].y;
+        for (uint32_t corner = 1; corner < 3; ++corner)
+        {
+            min_x = std::min(min_x, triangle.points[corner].x);
+            max_x = std::max(max_x, triangle.points[corner].x);
+            min_y = std::min(min_y, triangle.points[corner].y);
+            max_y = std::max(max_y, triangle.points[corner].y);
+        }
+        const int begin_x = std::max(0, static_cast<int>(std::floor(min_x)));
+        const int end_x = std::min(static_cast<int>(width) - 1, static_cast<int>(std::ceil(max_x)) - 1);
+        const int begin_y = std::max(0, static_cast<int>(std::floor(min_y)));
+        const int end_y = std::min(static_cast<int>(height) - 1, static_cast<int>(std::ceil(max_y)) - 1);
+        uint32_t intersected_texels = 0;
+        uint32_t covered_texels = 0;
+        uint32_t near_black_texels = 0;
+        bool any_nonblack = false;
+        for (int y = begin_y; y <= end_y; ++y)
+        {
+            for (int x = begin_x; x <= end_x; ++x)
+            {
+                if (!TriangleIntersectsTexel(triangle, uint32_t(x), uint32_t(y)))
+                    continue;
+                ++intersected_texels;
+                const uint64_t index = uint64_t(y) * width + uint32_t(x);
+                if (strict_coverage_r8[static_cast<size_t>(index)] == 0)
+                    continue;
+                ++covered_texels;
+                if (texel_luminance[static_cast<size_t>(index)] >= 0 &&
+                    texel_luminance[static_cast<size_t>(index)] <= near_black_threshold)
+                    ++near_black_texels;
+                const XMFLOAT4& value = accumulation[index];
+                if (std::isfinite(value.w) && value.w > 0 &&
+                    std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z))
+                {
+                    const float luminance = (0.2126f * value.x + 0.7152f * value.y +
+                        0.0722f * value.z) / value.w;
+                    any_nonblack = any_nonblack || luminance > black_luminance_epsilon;
+                }
+            }
+        }
+
+        if (covered_texels == 0)
+        {
+            ++audit.zero_coverage_triangle_count;
+            if (triangle.pixel_area < adequate_triangle_area || intersected_texels < 4)
+                ++audit.undersized_zero_coverage_triangle_count;
+            else
+                ++audit.adequate_zero_coverage_triangle_count;
+        }
+        else
+        {
+            if (intersected_texels >= 4 && covered_texels * 4u < intersected_texels)
+                ++audit.sparse_coverage_triangle_count;
+            const bool fully_dark = !any_nonblack;
+            const bool mostly_dark = near_black_texels * 4u >= covered_texels * 3u;
+            if (fully_dark)
+            {
+                ++audit.fully_dark_covered_triangle_count;
+            }
+            if (mostly_dark)
+            {
+                ++audit.mostly_dark_covered_triangle_count;
+            }
+            if ((fully_dark || mostly_dark) && (invalid_normal || opposed_normal))
+                ++audit.dark_normal_defect_triangle_count;
+        }
+    }
+
+    audit.valid = audit.covered_texel_count > 0 && !sample_counts.empty();
     return audit;
 }
 
