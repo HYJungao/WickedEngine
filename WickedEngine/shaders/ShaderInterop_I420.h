@@ -11,8 +11,6 @@ struct I420AtlasPackPush
     uint u_offset;
     uint v_offset;
     uint available_mask;
-    float log_hdr_maximum;
-    uint3 padding;
     uint4 tile_rects[4];
 };
 

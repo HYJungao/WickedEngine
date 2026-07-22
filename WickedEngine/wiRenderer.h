@@ -1135,11 +1135,10 @@ namespace wi::renderer
 		uint32_t u_offset = 0;
 		uint32_t v_offset = 0;
 		uint32_t available_mask = 0;
-		float log_hdr_maximum = 16.0f;
 		XMUINT4 tile_rects[4] = {};
 	};
 	void RGB_to_I420_Atlas(
-		const wi::graphics::Texture* const inputs[4],
+		const wi::graphics::Texture& input_atlas,
 		const wi::graphics::GPUBuffer& metadata_luma,
 		const wi::graphics::GPUBuffer& output_i420,
 		const I420AtlasPackDesc& desc,

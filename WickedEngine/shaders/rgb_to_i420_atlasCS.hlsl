@@ -3,27 +3,9 @@
 
 PUSHCONSTANT(i420, I420AtlasPackPush);
 
-Texture2D<float4> input0 : register(t0);
-Texture2D<float4> input1 : register(t1);
-Texture2D<float4> input2 : register(t2);
-Texture2D<float4> input3 : register(t3);
-ByteAddressBuffer metadata_luma : register(t4);
+Texture2D<float4> input_atlas : register(t0);
+ByteAddressBuffer metadata_luma : register(t1);
 RWByteAddressBuffer output_i420 : register(u0);
-
-float3 LoadTile(uint tile_index, uint2 coordinate)
-{
-    float3 rgb = 0;
-    switch (tile_index)
-    {
-    case 0: rgb = input0.Load(int3(coordinate, 0)).rgb; break;
-    case 1: rgb = input1.Load(int3(coordinate, 0)).rrr; break;
-    case 2: rgb = input2.Load(int3(coordinate, 0)).rgb; break;
-    case 3: rgb = input3.Load(int3(coordinate, 0)).rrr; break;
-    }
-    if (tile_index == 0 || tile_index == 2)
-        rgb = saturate(log2(1.0 + max(0, rgb)) / log2(1.0 + i420.log_hdr_maximum));
-    return rgb;
-}
 
 float3 LoadAtlasRGB(uint2 coordinate)
 {
@@ -34,7 +16,7 @@ float3 LoadAtlasRGB(uint2 coordinate)
             continue;
         const uint4 rect = i420.tile_rects[tile_index];
         if (all(coordinate >= rect.xy) && all(coordinate < rect.xy + rect.zw))
-            return LoadTile(tile_index, coordinate - rect.xy);
+            return saturate(input_atlas.Load(int3(coordinate, 0)).rgb);
     }
     return 0;
 }

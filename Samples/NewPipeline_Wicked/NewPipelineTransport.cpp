@@ -260,8 +260,9 @@ bool ValidateWireMetadata(RemoteVideoWireMetadata wire)
     for (size_t index = 0; index < std::size(wire.buffers); ++index)
     {
         const RemoteVideoWireBuffer& buffer = wire.buffers[index];
+        const RemoteBufferSemantic semantic = static_cast<RemoteBufferSemantic>(index);
         if (buffer.semantic != index || buffer.available > 1u ||
-            buffer.encoding > static_cast<uint32_t>(RemoteBufferEncoding::ScalarLuma8) ||
+            buffer.encoding != static_cast<uint32_t>(RemoteBufferTransportEncoding(semantic)) ||
             (buffer.available != 0u &&
              (buffer.width == 0 || buffer.height == 0 || buffer.width > wire.width || buffer.height > wire.height)))
         {
@@ -622,7 +623,10 @@ void SetError(std::string* error, const std::string& message)
 RemoteRawFrame::RemoteRawFrame()
 {
     for (size_t index = 0; index < buffers.size(); ++index)
+    {
         buffers[index].semantic = static_cast<RemoteBufferSemantic>(index);
+        buffers[index].encoding = RemoteBufferTransportEncoding(buffers[index].semantic);
+    }
 }
 
 RemoteRawBuffer* RemoteRawFrame::FindBuffer(RemoteBufferSemantic semantic)
@@ -658,7 +662,7 @@ bool BuildRemoteVideoFrameLayout(
     {
         const RemoteRawBuffer& buffer = frame.buffers[index];
         if (buffer.semantic != static_cast<RemoteBufferSemantic>(index) ||
-            buffer.encoding > RemoteBufferEncoding::ScalarLuma8 ||
+            buffer.encoding != RemoteBufferTransportEncoding(buffer.semantic) ||
             (buffer.available && (buffer.width == 0 || buffer.height == 0 ||
                 buffer.width > kMaxRemoteBufferDimension || buffer.height > kMaxRemoteBufferDimension)))
         {
@@ -751,7 +755,8 @@ bool EncodeRemoteVideoFrame(const RemoteRawFrame& frame, PackedRemoteVideoFrame&
     for (size_t index = 0; index < frame.buffers.size(); ++index)
     {
         const RemoteRawBuffer& buffer = frame.buffers[index];
-        if (buffer.semantic != static_cast<RemoteBufferSemantic>(index) || !ValidateBuffer(buffer))
+        if (buffer.semantic != static_cast<RemoteBufferSemantic>(index) ||
+            buffer.encoding != RemoteBufferTransportEncoding(buffer.semantic) || !ValidateBuffer(buffer))
         {
             SetError(error, "remote buffer contract is invalid");
             return false;
@@ -1098,6 +1103,61 @@ bool DecodeRemoteVideoFrame(const RetainedI420Frame& video, RemoteRawFrame& fram
         return false;
     }
     return true;
+}
+
+std::string DescribeRemoteI420TileLuma(
+    const RetainedI420Frame& video, const RemoteVideoFrameLayout& layout)
+{
+    if (!video.IsValid() || video.width != layout.video_width ||
+        video.height != layout.video_height)
+        return "invalid-frame";
+
+    std::ostringstream result;
+    for (size_t index = 0; index < layout.tiles.size(); ++index)
+    {
+        const RemoteVideoTileLayout& tile = layout.tiles[index];
+        if (index > 0)
+            result << " ";
+        result << ToString(tile.semantic) << "=";
+        if (!tile.available || tile.width == 0 || tile.height == 0 ||
+            tile.origin_x + tile.width > video.width ||
+            tile.origin_y + tile.height > video.height)
+        {
+            result << "unavailable";
+            continue;
+        }
+
+        // This audit runs once per stream generation. A bounded grid can
+        // distinguish an empty atlas tile from valid codec content without
+        // adding a full-frame CPU pass to steady-state transport.
+        const uint32_t step_x = std::max(1u, tile.width / 128u);
+        const uint32_t step_y = std::max(1u, tile.height / 128u);
+        uint8_t minimum = 255u;
+        uint8_t maximum = 0u;
+        uint64_t sum = 0;
+        uint64_t samples = 0;
+        uint64_t non_black = 0;
+        for (uint32_t y = 0; y < tile.height; y += step_y)
+        {
+            const uint8_t* row = video.y_plane +
+                static_cast<size_t>(tile.origin_y + y) * video.y_stride + tile.origin_x;
+            for (uint32_t x = 0; x < tile.width; x += step_x)
+            {
+                const uint8_t value = row[x];
+                minimum = std::min(minimum, value);
+                maximum = std::max(maximum, value);
+                sum += value;
+                ++samples;
+                non_black += value > 20u ? 1u : 0u;
+            }
+        }
+        result << "origin(" << tile.origin_x << "," << tile.origin_y << ")"
+            << " y[min=" << static_cast<uint32_t>(minimum)
+            << " avg=" << (samples > 0 ? sum / samples : 0)
+            << " max=" << static_cast<uint32_t>(maximum)
+            << " nonblack=" << non_black << "/" << samples << "]";
+    }
+    return result.str();
 }
 
 bool ValidateRemoteVideoV2RoundTrip(std::string* error)

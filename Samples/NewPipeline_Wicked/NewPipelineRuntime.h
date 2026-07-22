@@ -155,6 +155,17 @@ constexpr uint32_t RemoteBufferKindMask(RemoteBufferSemantic semantic)
     return 1u << static_cast<uint32_t>(semantic);
 }
 
+// The wire encoding is part of each semantic's protocol contract.  Keep this
+// centralized so producers, metadata validation, GPU unpack and debug views do
+// not infer the representation from an array position.
+constexpr RemoteBufferEncoding RemoteBufferTransportEncoding(RemoteBufferSemantic semantic)
+{
+    return semantic == RemoteBufferSemantic::RemoteIndirectDiffuse ||
+        semantic == RemoteBufferSemantic::RemoteSpecularIndirect
+        ? RemoteBufferEncoding::LogHDR16F
+        : RemoteBufferEncoding::ScalarLuma8;
+}
+
 const char* ToString(RemoteBufferSemantic semantic);
 const char* ToString(RemoteSourceMode mode);
 const char* ToString(RemoteDynamicRange range);

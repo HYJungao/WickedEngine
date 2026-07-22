@@ -47,6 +47,7 @@ private:
     void PublishRemotePayload(float dt);
     void MaintainWebRTC(float dt);
     bool EnsureTransportTexture(RemoteBufferSemantic semantic, uint32_t width, uint32_t height);
+    bool EnsureTransportAtlasTexture(uint32_t width, uint32_t height);
     void EncodeTransportTexture(RemoteBufferSemantic semantic, const wi::graphics::Texture& source,
         wi::graphics::Texture& destination, wi::graphics::CommandList cmd) const;
     bool EnsureShadowSliceTexture(uint32_t width, uint32_t height) const;
@@ -78,6 +79,7 @@ private:
     FileMockRemoteMailbox mock_remote_mailbox;
     WebRTCVideoTransport webrtc_transport;
     std::array<wi::graphics::Texture, static_cast<size_t>(RemoteBufferSemantic::Count)> transport_textures;
+    wi::graphics::Texture transport_atlas_texture;
     std::array<ReadbackSlot, kReadbackRingSize> readback_ring;
     size_t readback_write_index = 0;
     struct PackedReadbackStorage
@@ -140,6 +142,7 @@ private:
     uint64_t remote_capture_drops = 0;
     uint64_t gpu_readback_bytes = 0;
     uint64_t cpu_readback_copy_bytes = 0;
+    uint32_t audited_i420_generation = 0;
     WebRTCTransportState previous_webrtc_state = WebRTCTransportState::Disabled;
     bool publish_worker_stop = false;
 };

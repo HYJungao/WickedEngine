@@ -616,25 +616,32 @@ bool NewPipelineClientRenderPath::TryMatchRemoteVideoFrame(
     {
         size_t video_index = 0;
         size_t metadata_index = 0;
-        uint64_t timestamp_usec = 0;
+        uint64_t local_receive_timestamp_usec = 0;
         bool valid = false;
     } match;
 
     for (size_t video_index = 0; video_index < pending_remote_video_frames.size(); ++video_index)
     {
-        const int64_t timestamp = pending_remote_video_frames[video_index].frame.timestamp_usec;
-        if (timestamp <= 0)
-            continue;
+        const PendingRemoteVideoFrame& pending_video = pending_remote_video_frames[video_index];
+        const RemoteFrameMetadata& pixel_metadata = pending_video.pixel_layout.metadata;
         for (size_t metadata_index = 0; metadata_index < downstream_metadata_cache.size(); ++metadata_index)
         {
-            if (downstream_metadata_cache[metadata_index].metadata.timestamp_usec !=
-                static_cast<uint64_t>(timestamp))
+            const RemoteFrameMetadata& channel_metadata =
+                downstream_metadata_cache[metadata_index].metadata;
+            // WebRTC transports timestamps through RTP's clock domain, so the
+            // decoded frame timestamp is not an identity-preserving copy of
+            // the producer's microsecond timestamp. The metadata band is part
+            // of the encoded frame and therefore provides the stable key.
+            if (channel_metadata.frame_id != pixel_metadata.frame_id ||
+                channel_metadata.source_generation != pixel_metadata.source_generation)
                 continue;
-            if (!match.valid || static_cast<uint64_t>(timestamp) > match.timestamp_usec)
+            if (!match.valid || pending_video.local_receive_timestamp_usec >
+                    match.local_receive_timestamp_usec)
             {
                 match.video_index = video_index;
                 match.metadata_index = metadata_index;
-                match.timestamp_usec = static_cast<uint64_t>(timestamp);
+                match.local_receive_timestamp_usec =
+                    pending_video.local_receive_timestamp_usec;
                 match.valid = true;
             }
         }
@@ -2479,6 +2486,9 @@ bool NewPipelineClientRenderPath::UploadRemoteTextures(const RemoteRawFrame& fra
         const RemoteRawBuffer& buffer = frame.buffers[index];
         if (!buffer.available)
             continue;
+        const size_t semantic_index = static_cast<size_t>(buffer.semantic);
+        if (semantic_index >= uploaded.size())
+            return false;
         const size_t element_count = static_cast<size_t>(buffer.width) * buffer.height * 4u;
         const bool hdr = buffer.encoding == RemoteBufferEncoding::LogHDR16F;
         if (buffer.width == 0 || buffer.height == 0 ||
@@ -2497,7 +2507,8 @@ bool NewPipelineClientRenderPath::UploadRemoteTextures(const RemoteRawFrame& fra
             ? static_cast<void*>(const_cast<uint16_t*>(buffer.payload_rgba16f.data()))
             : static_cast<void*>(const_cast<uint8_t*>(buffer.payload_rgba8.data()));
         wi::graphics::CreateTextureSubresourceDatas(desc, texture_data, subresources);
-        if (!wi::graphics::GetDevice()->CreateTexture(&desc, subresources.data(), &uploaded[index]))
+        if (!wi::graphics::GetDevice()->CreateTexture(
+                &desc, subresources.data(), &uploaded[semantic_index]))
             return false;
         ++remote_texture_creation_count;
         remote_gpu_upload_bytes += hdr
@@ -2505,7 +2516,7 @@ bool NewPipelineClientRenderPath::UploadRemoteTextures(const RemoteRawFrame& fra
             : buffer.payload_rgba8.size();
         const std::string name = std::string{"newpipeline.client."} + ToString(buffer.semantic) +
             (hdr ? ".rgba16f" : ".rgba8");
-        wi::graphics::GetDevice()->SetName(&uploaded[index], name.c_str());
+        wi::graphics::GetDevice()->SetName(&uploaded[semantic_index], name.c_str());
         uploaded_mask |= RemoteBufferKindMask(buffer.semantic);
     }
     if ((uploaded_mask & static_cast<uint32_t>(RemoteBufferKind::IndirectDiffuse)) == 0)
@@ -2597,11 +2608,14 @@ bool NewPipelineClientRenderPath::UploadRemoteVideoTextures(
         const RemoteVideoTileLayout& tile = layout.tiles[index];
         if (!tile.available)
             continue;
+        const size_t semantic_index = static_cast<size_t>(tile.semantic);
+        if (semantic_index >= slot.semantic_outputs.size())
+            return false;
         const bool hdr = tile.encoding == RemoteBufferEncoding::LogHDR16F;
         const wi::graphics::Format format = hdr
             ? wi::graphics::Format::R16G16B16A16_FLOAT
             : wi::graphics::Format::R8G8B8A8_UNORM;
-        wi::graphics::Texture& output = slot.semantic_outputs[index];
+        wi::graphics::Texture& output = slot.semantic_outputs[semantic_index];
         if (!output.IsValid() || output.GetDesc().width != tile.width ||
             output.GetDesc().height != tile.height || output.GetDesc().format != format)
         {
@@ -2643,10 +2657,11 @@ bool NewPipelineClientRenderPath::UploadRemoteVideoTextures(
         const RemoteVideoTileLayout& tile = layout.tiles[index];
         if (!tile.available)
             continue;
+        const size_t semantic_index = static_cast<size_t>(tile.semantic);
         wi::renderer::YUV_to_RGB_Region(
             slot.gpu_y,
             slot.gpu_uv,
-            slot.semantic_outputs[index],
+            slot.semantic_outputs[semantic_index],
             XMUINT2(tile.origin_x, tile.origin_y),
             tile.encoding == RemoteBufferEncoding::ScalarLuma8,
             tile.encoding == RemoteBufferEncoding::LogHDR16F ? 16.0f : 0.0f,
@@ -2703,10 +2718,22 @@ bool NewPipelineClientRenderPath::ValidateRemoteFrame(const RemoteRawFrame& fram
         reason = "missing indirect diffuse video tile";
         return false;
     }
-    for (const RemoteRawBuffer& buffer : frame.buffers)
+    uint32_t observed_available_mask = 0;
+    for (size_t index = 0; index < frame.buffers.size(); ++index)
     {
+        const RemoteRawBuffer& buffer = frame.buffers[index];
+        const RemoteBufferSemantic expected_semantic =
+            static_cast<RemoteBufferSemantic>(index);
+        if (buffer.semantic != expected_semantic ||
+            buffer.encoding != RemoteBufferTransportEncoding(expected_semantic))
+        {
+            reason = std::string{"semantic/encoding contract mismatch at slot "} +
+                std::to_string(index);
+            return false;
+        }
         if (!buffer.available)
             continue;
+        observed_available_mask |= RemoteBufferKindMask(buffer.semantic);
         const size_t expected_size = static_cast<size_t>(buffer.width) * buffer.height * 4u;
         const bool valid_size = buffer.encoding == RemoteBufferEncoding::LogHDR16F
             ? buffer.payload_rgba16f.size() == expected_size
@@ -2716,6 +2743,12 @@ bool NewPipelineClientRenderPath::ValidateRemoteFrame(const RemoteRawFrame& fram
             reason = std::string{"payload size mismatch for "} + ToString(buffer.semantic);
             return false;
         }
+    }
+    if (observed_available_mask != metadata.available_buffer_mask ||
+        (metadata.continuity_mask & observed_available_mask) != observed_available_mask)
+    {
+        reason = "remote buffer availability mask mismatch";
+        return false;
     }
     if (metadata.confidence < 0.5f)
     {
@@ -2764,10 +2797,23 @@ bool NewPipelineClientRenderPath::ValidateRemoteVideoLayout(
         reason = "missing indirect diffuse video tile";
         return false;
     }
-    for (const RemoteVideoTileLayout& tile : layout.tiles)
+    uint32_t observed_available_mask = 0;
+    for (size_t index = 0; index < layout.tiles.size(); ++index)
     {
+        const RemoteVideoTileLayout& tile = layout.tiles[index];
+        const RemoteBufferSemantic expected_semantic =
+            static_cast<RemoteBufferSemantic>(index);
+        const RemoteBufferEncoding expected_encoding =
+            RemoteBufferTransportEncoding(expected_semantic);
+        if (tile.semantic != expected_semantic || tile.encoding != expected_encoding)
+        {
+            reason = std::string{"semantic/encoding contract mismatch at slot "} +
+                std::to_string(index);
+            return false;
+        }
         if (!tile.available)
             continue;
+        observed_available_mask |= RemoteBufferKindMask(tile.semantic);
         if (tile.width == 0 || tile.height == 0 ||
             tile.origin_x + tile.width > layout.video_width ||
             tile.origin_y + tile.height > layout.video_height)
@@ -2775,6 +2821,12 @@ bool NewPipelineClientRenderPath::ValidateRemoteVideoLayout(
             reason = std::string{"invalid video tile for "} + ToString(tile.semantic);
             return false;
         }
+    }
+    if (observed_available_mask != metadata.available_buffer_mask ||
+        (metadata.continuity_mask & observed_available_mask) != observed_available_mask)
+    {
+        reason = "video tile availability mask mismatch";
+        return false;
     }
     if (metadata.confidence < 0.5f)
     {
@@ -2885,16 +2937,26 @@ void NewPipelineClientRenderPath::AcquireRemoteVideoFrame(float dt)
             }
             else
             {
-                const int64_t timestamp = acquired_frame.timestamp_usec;
+                RemoteVideoFrameLayout pixel_layout;
+                if (!DecodeRemoteVideoFrameLayout(acquired_frame, pixel_layout, &error))
+                {
+                    InvalidateRemote(error.empty()
+                        ? "video metadata-band decode failed" : error);
+                    return;
+                }
                 auto duplicate = std::find_if(
                     pending_remote_video_frames.begin(), pending_remote_video_frames.end(),
-                    [timestamp](const PendingRemoteVideoFrame& pending) {
-                        return pending.frame.timestamp_usec == timestamp;
+                    [&pixel_layout](const PendingRemoteVideoFrame& pending) {
+                        return pending.pixel_layout.metadata.frame_id ==
+                                pixel_layout.metadata.frame_id &&
+                            pending.pixel_layout.metadata.source_generation ==
+                                pixel_layout.metadata.source_generation;
                     });
                 if (duplicate != pending_remote_video_frames.end())
                     pending_remote_video_frames.erase(duplicate);
                 PendingRemoteVideoFrame pending;
                 pending.frame = std::move(acquired_frame);
+                pending.pixel_layout = std::move(pixel_layout);
                 pending.local_receive_timestamp_usec = NowUsec();
                 pending_remote_video_frames.push_back(std::move(pending));
                 queued_video_without_metadata = true;
@@ -2912,12 +2974,20 @@ void NewPipelineClientRenderPath::AcquireRemoteVideoFrame(float dt)
             received = TryMatchRemoteVideoFrame(retained_frame, video_layout);
             if (!received)
             {
-                if (!pending_remote_video_frames.empty())
+                if (!pending_remote_video_frames.empty() && !downstream_metadata_cache.empty())
                 {
                     if (queued_video_without_metadata)
                         ++downstream_metadata_misses;
                     if (!remote_consume.accepted_valid)
-                        remote_consume.fallback_reason = "waiting for matching frame metadata";
+                        remote_consume.fallback_reason =
+                            "waiting for matching pixel-band frame identity";
+                }
+                else if (!pending_remote_video_frames.empty())
+                {
+                    if (queued_video_without_metadata)
+                        ++downstream_metadata_misses;
+                    if (!remote_consume.accepted_valid)
+                        remote_consume.fallback_reason = "waiting for frame metadata";
                 }
                 else if (!downstream_metadata_cache.empty() && !remote_consume.accepted_valid)
                 {
@@ -3017,6 +3087,14 @@ void NewPipelineClientRenderPath::AcquireRemoteVideoFrame(float dt)
         return;
     }
 
+    if (gpu_video_path &&
+        audited_remote_i420_generation != metadata.source_generation)
+    {
+        wi::backlog::post("Client post-codec I420 tile audit: " +
+            DescribeRemoteI420TileLuma(retained_frame, video_layout));
+        audited_remote_i420_generation = metadata.source_generation;
+    }
+
     const bool generation_reset =
         metadata.reset_this_frame ||
         (remote_consume.latest_generation != 0 && metadata.source_generation != remote_consume.latest_generation);
@@ -3098,13 +3176,33 @@ const wi::graphics::Texture* NewPipelineClientRenderPath::GetDebugPreviewTexture
     case DebugPreviewMode::LocalShadowVisibility:
         return nullptr; // Raster shadows live in the light shadow-map atlas.
     case DebugPreviewMode::RemoteIndirectDiffuse:
-        return remote_consume.accepted_valid && (accepted_remote_buffer_mask & RemoteBufferKindMask(RemoteBufferSemantic::RemoteIndirectDiffuse)) && accepted_remote_textures[0].IsValid() ? &accepted_remote_textures[0] : nullptr;
+    {
+        const RemoteBufferSemantic semantic = RemoteBufferSemantic::RemoteIndirectDiffuse;
+        const size_t index = static_cast<size_t>(semantic);
+        return remote_consume.accepted_valid && (accepted_remote_buffer_mask & RemoteBufferKindMask(semantic)) &&
+            accepted_remote_textures[index].IsValid() ? &accepted_remote_textures[index] : nullptr;
+    }
     case DebugPreviewMode::RemoteAO:
-        return remote_consume.accepted_valid && (accepted_remote_buffer_mask & RemoteBufferKindMask(RemoteBufferSemantic::RemoteAO)) && accepted_remote_textures[1].IsValid() ? &accepted_remote_textures[1] : nullptr;
+    {
+        const RemoteBufferSemantic semantic = RemoteBufferSemantic::RemoteAO;
+        const size_t index = static_cast<size_t>(semantic);
+        return remote_consume.accepted_valid && (accepted_remote_buffer_mask & RemoteBufferKindMask(semantic)) &&
+            accepted_remote_textures[index].IsValid() ? &accepted_remote_textures[index] : nullptr;
+    }
     case DebugPreviewMode::RemoteSpecularIndirect:
-        return remote_consume.accepted_valid && (accepted_remote_buffer_mask & RemoteBufferKindMask(RemoteBufferSemantic::RemoteSpecularIndirect)) && accepted_remote_textures[2].IsValid() ? &accepted_remote_textures[2] : nullptr;
+    {
+        const RemoteBufferSemantic semantic = RemoteBufferSemantic::RemoteSpecularIndirect;
+        const size_t index = static_cast<size_t>(semantic);
+        return remote_consume.accepted_valid && (accepted_remote_buffer_mask & RemoteBufferKindMask(semantic)) &&
+            accepted_remote_textures[index].IsValid() ? &accepted_remote_textures[index] : nullptr;
+    }
     case DebugPreviewMode::RemoteShadowVisibility:
-        return remote_consume.accepted_valid && (accepted_remote_buffer_mask & RemoteBufferKindMask(RemoteBufferSemantic::RemoteShadowVisibility)) && accepted_remote_textures[3].IsValid() ? &accepted_remote_textures[3] : nullptr;
+    {
+        const RemoteBufferSemantic semantic = RemoteBufferSemantic::RemoteShadowVisibility;
+        const size_t index = static_cast<size_t>(semantic);
+        return remote_consume.accepted_valid && (accepted_remote_buffer_mask & RemoteBufferKindMask(semantic)) &&
+            accepted_remote_textures[index].IsValid() ? &accepted_remote_textures[index] : nullptr;
+    }
     case DebugPreviewMode::ElasticIndirectDiffuse:
         return elastic_indirect_diffuse.IsValid() ? &elastic_indirect_diffuse : nullptr;
     case DebugPreviewMode::ElasticAO:

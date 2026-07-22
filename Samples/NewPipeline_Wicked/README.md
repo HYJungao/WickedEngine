@@ -221,8 +221,16 @@ the `[0,16]` range, then restored to `RGBA16F` by the Client. AO and Shadow use
 full-resolution I420 Y only with neutral chroma. Every tile has 16 pixels of
 padding to isolate chroma and codec block filtering.
 
-The live software-codec path performs one GPU atlas-to-I420 pass and one packed
-readback through a three-slot ring. WebRTC wraps the mapped planes and returns the
+The live software-codec path first produces four canonical RGBA8 transport
+surfaces (Log2 HDR for indirect buffers, replicated scalar for AO/shadow). These
+same resources drive the Server `Transport` previews and are copied into their
+authoritative rectangles in one canonical RGBA8 atlas; there is no separate
+preview-only conversion. The I420 pack consumes that atlas through one SRV, so
+semantic identity is expressed by atlas layout metadata rather than parallel SRV
+binding positions. The metadata semantic and encoding contract is validated before
+the Client publishes any unpacked texture. The path then performs one GPU
+atlas-to-I420 pass and one packed readback through a three-slot ring. WebRTC wraps
+the mapped planes and returns the
 slot through its release callback, so there is no second full-frame CPU copy or CPU
 RGB-to-YUV conversion. The Client retains the decoded WebRTC frame, uploads Y/U/V
 once through a buffered ring, and extracts all semantic textures with a GPU compute
@@ -231,8 +239,10 @@ pass. Semantic output textures are persistent at a stable generation/resolution.
 Frame metadata is dual-written to the legacy luma band and the unordered,
 unreliable `np.frame_meta` DataChannel. After the metadata channel becomes active,
 the Client retains video frames and metadata in separate bounded queues and accepts
-the newest pair with an exact timestamp match, regardless of which side arrived
-first. Unmatched entries expire after one second and each queue is capped at eight
+the newest pair whose pixel-band `frame_id` and `source_generation` match the
+DataChannel packet, regardless of which side arrived first. The decoded WebRTC/RTP
+timestamp is deliberately not used as a frame identity. Unmatched entries expire
+after one second and each queue is capped at eight
 entries; a transient unmatched frame does not discard the last accepted remote
 input. The legacy band remains for migration agreement checks, and a matched pair
 is still rejected if its DataChannel metadata disagrees with the pixel band.

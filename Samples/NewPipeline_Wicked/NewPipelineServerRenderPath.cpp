@@ -225,13 +225,25 @@ const wi::graphics::Texture* NewPipelineServerRenderPath::GetDebugPreviewTexture
     case DebugPreviewMode::LocalShadowVisibility:
         return shadow_snapshot_valid && shadow_slice_texture.IsValid() ? &shadow_slice_texture : nullptr;
     case DebugPreviewMode::TransportIndirectDiffuse:
-        return transport_textures[0].IsValid() ? &transport_textures[0] : nullptr;
+    {
+        const size_t index = static_cast<size_t>(RemoteBufferSemantic::RemoteIndirectDiffuse);
+        return transport_textures[index].IsValid() ? &transport_textures[index] : nullptr;
+    }
     case DebugPreviewMode::TransportAO:
-        return transport_textures[1].IsValid() ? &transport_textures[1] : nullptr;
+    {
+        const size_t index = static_cast<size_t>(RemoteBufferSemantic::RemoteAO);
+        return transport_textures[index].IsValid() ? &transport_textures[index] : nullptr;
+    }
     case DebugPreviewMode::TransportSpecularIndirect:
-        return transport_textures[2].IsValid() ? &transport_textures[2] : nullptr;
+    {
+        const size_t index = static_cast<size_t>(RemoteBufferSemantic::RemoteSpecularIndirect);
+        return transport_textures[index].IsValid() ? &transport_textures[index] : nullptr;
+    }
     case DebugPreviewMode::TransportShadowVisibility:
-        return transport_textures[3].IsValid() ? &transport_textures[3] : nullptr;
+    {
+        const size_t index = static_cast<size_t>(RemoteBufferSemantic::RemoteShadowVisibility);
+        return transport_textures[index].IsValid() ? &transport_textures[index] : nullptr;
+    }
     case DebugPreviewMode::Final:
     default:
         return nullptr;
@@ -373,6 +385,35 @@ bool NewPipelineServerRenderPath::EnsureTransportTexture(RemoteBufferSemantic se
     return true;
 }
 
+bool NewPipelineServerRenderPath::EnsureTransportAtlasTexture(uint32_t width, uint32_t height)
+{
+    if (transport_atlas_texture.IsValid())
+    {
+        const wi::graphics::TextureDesc& existing = transport_atlas_texture.GetDesc();
+        if (existing.width == width && existing.height == height &&
+            existing.format == wi::graphics::Format::R8G8B8A8_UNORM)
+            return true;
+    }
+
+    wi::graphics::TextureDesc desc;
+    desc.type = wi::graphics::TextureDesc::Type::TEXTURE_2D;
+    desc.width = width;
+    desc.height = height;
+    desc.format = wi::graphics::Format::R8G8B8A8_UNORM;
+    desc.bind_flags = wi::graphics::BindFlag::SHADER_RESOURCE;
+    desc.layout = wi::graphics::ResourceState::SHADER_RESOURCE_COMPUTE;
+    transport_atlas_texture = {};
+    if (!wi::graphics::GetDevice()->CreateTexture(&desc, nullptr, &transport_atlas_texture))
+    {
+        wi::backlog::post("Server remote: failed to create canonical transport atlas " +
+            std::to_string(width) + "x" + std::to_string(height));
+        return false;
+    }
+    wi::graphics::GetDevice()->SetName(
+        &transport_atlas_texture, "newpipeline.remote.canonical_atlas.rgba8");
+    return true;
+}
+
 void NewPipelineServerRenderPath::EncodeTransportTexture(
     RemoteBufferSemantic semantic,
     const wi::graphics::Texture& source,
@@ -466,12 +507,15 @@ void NewPipelineServerRenderPath::PublishRemotePayload(float dt)
         return;
     mock_publish_accumulator = 0.0f;
 
-    const std::array<const wi::graphics::Texture*, static_cast<size_t>(RemoteBufferSemantic::Count)> sources = {
-        settings.ddgi_enabled ? &GetDDGIRemoteIndirectDiffuseFormal() : nullptr,
-        local_ao_snapshot.IsValid() ? &local_ao_snapshot : nullptr,
-        rtSSR.IsValid() ? &rtSSR : nullptr,
-        shadow_snapshot_valid && shadow_slice_texture.IsValid() ? &shadow_slice_texture : nullptr,
-    };
+    std::array<const wi::graphics::Texture*, static_cast<size_t>(RemoteBufferSemantic::Count)> sources = {};
+    sources[static_cast<size_t>(RemoteBufferSemantic::RemoteIndirectDiffuse)] =
+        settings.ddgi_enabled ? &GetDDGIRemoteIndirectDiffuseFormal() : nullptr;
+    sources[static_cast<size_t>(RemoteBufferSemantic::RemoteAO)] =
+        local_ao_snapshot.IsValid() ? &local_ao_snapshot : nullptr;
+    sources[static_cast<size_t>(RemoteBufferSemantic::RemoteSpecularIndirect)] =
+        rtSSR.IsValid() ? &rtSSR : nullptr;
+    sources[static_cast<size_t>(RemoteBufferSemantic::RemoteShadowVisibility)] =
+        shadow_snapshot_valid && shadow_slice_texture.IsValid() ? &shadow_slice_texture : nullptr;
     if (config.remote_source == RemoteSourceMode::WebRTC)
     {
         CapturePackedRemoteFrame(sources);
@@ -583,16 +627,15 @@ void NewPipelineServerRenderPath::CapturePackedRemoteFrame(
         const wi::graphics::Texture* source = sources[index];
         RemoteRawBuffer& buffer = contract.buffers[index];
         buffer.semantic = static_cast<RemoteBufferSemantic>(index);
+        buffer.encoding = RemoteBufferTransportEncoding(buffer.semantic);
         if (source == nullptr || !source->IsValid())
             continue;
         const wi::graphics::TextureDesc& desc = source->GetDesc();
         buffer.width = desc.width;
         buffer.height = desc.height;
+        if (!EnsureTransportTexture(buffer.semantic, desc.width, desc.height))
+            continue;
         buffer.available = true;
-        buffer.encoding = index == static_cast<size_t>(RemoteBufferSemantic::RemoteIndirectDiffuse) ||
-            index == static_cast<size_t>(RemoteBufferSemantic::RemoteSpecularIndirect)
-            ? RemoteBufferEncoding::LogHDR16F
-            : RemoteBufferEncoding::ScalarLuma8;
         available_mask |= RemoteBufferKindMask(buffer.semantic);
     }
     if (available_mask == 0)
@@ -646,6 +689,8 @@ void NewPipelineServerRenderPath::CapturePackedRemoteFrame(
             return;
         }
     }
+    if (!EnsureTransportAtlasTexture(layout.video_width, layout.video_height))
+        return;
 
     const uint32_t y_stride = (layout.video_width + 3u) & ~3u;
     const uint32_t uv_stride = (layout.video_width / 2u + 3u) & ~3u;
@@ -716,7 +761,65 @@ void NewPipelineServerRenderPath::CapturePackedRemoteFrame(
     }
 
     wi::graphics::CommandList cmd = device->BeginCommandList();
-    wi::renderer::RGB_to_I420_Atlas(sources.data(), slot.metadata_upload, slot.packed_gpu, pack_desc, cmd);
+    // These are the canonical pre-I420 transport surfaces. The Server preview
+    // and the encoder now observe the same resources, so semantic inspection
+    // cannot diverge from the data actually submitted to WebRTC.
+    for (size_t index = 0; index < sources.size(); ++index)
+    {
+        const RemoteBufferSemantic semantic = static_cast<RemoteBufferSemantic>(index);
+        if ((available_mask & RemoteBufferKindMask(semantic)) == 0)
+            continue;
+        EncodeTransportTexture(
+            semantic,
+            *sources[index],
+            transport_textures[index],
+            cmd);
+    }
+
+    // Assemble one canonical RGBA8 atlas with exact GPU copies. The I420 pass
+    // consumes a single SRV, which makes the semantic-to-rectangle contract
+    // explicit and avoids backend-dependent parallel SRV binding behavior.
+    wi::graphics::GPUBarrier atlas_barriers[static_cast<size_t>(RemoteBufferSemantic::Count) + 1] = {};
+    uint32_t atlas_barrier_count = 0;
+    atlas_barriers[atlas_barrier_count++] = wi::graphics::GPUBarrier::Image(
+        &transport_atlas_texture,
+        transport_atlas_texture.GetDesc().layout,
+        wi::graphics::ResourceState::COPY_DST);
+    for (size_t index = 0; index < sources.size(); ++index)
+    {
+        const RemoteBufferSemantic semantic = static_cast<RemoteBufferSemantic>(index);
+        if ((available_mask & RemoteBufferKindMask(semantic)) == 0)
+            continue;
+        atlas_barriers[atlas_barrier_count++] = wi::graphics::GPUBarrier::Image(
+            &transport_textures[index],
+            transport_textures[index].GetDesc().layout,
+            wi::graphics::ResourceState::COPY_SRC);
+    }
+    device->Barrier(atlas_barriers, atlas_barrier_count, cmd);
+    for (size_t index = 0; index < sources.size(); ++index)
+    {
+        const RemoteBufferSemantic semantic = static_cast<RemoteBufferSemantic>(index);
+        if ((available_mask & RemoteBufferKindMask(semantic)) == 0)
+            continue;
+        const RemoteVideoTileLayout& tile = layout.tiles[index];
+        device->CopyTexture(
+            &transport_atlas_texture,
+            tile.origin_x,
+            tile.origin_y,
+            0,
+            0,
+            0,
+            &transport_textures[index],
+            0,
+            0,
+            cmd);
+    }
+    for (uint32_t index = 0; index < atlas_barrier_count; ++index)
+        std::swap(atlas_barriers[index].image.layout_before, atlas_barriers[index].image.layout_after);
+    device->Barrier(atlas_barriers, atlas_barrier_count, cmd);
+
+    wi::renderer::RGB_to_I420_Atlas(
+        transport_atlas_texture, slot.metadata_upload, slot.packed_gpu, pack_desc, cmd);
     device->Barrier(wi::graphics::GPUBarrier::Buffer(
         &slot.packed_gpu, wi::graphics::ResourceState::UNORDERED_ACCESS, wi::graphics::ResourceState::COPY_SRC), cmd);
     device->CopyResource(&slot.readback->buffer, &slot.packed_gpu, cmd);
@@ -773,6 +876,12 @@ void NewPipelineServerRenderPath::ConsumeCompletedPackedReadback()
     frame.timestamp_usec = static_cast<int64_t>(slot.layout.metadata.timestamp_usec);
     frame.frame_lifetime = slot.readback;
     slot.pending = false;
+    if (audited_i420_generation != slot.layout.metadata.source_generation)
+    {
+        wi::backlog::post("Server pre-codec I420 tile audit: " +
+            DescribeRemoteI420TileLuma(frame, slot.layout));
+        audited_i420_generation = slot.layout.metadata.source_generation;
+    }
     QueueI420FrameForPublish(std::move(frame), slot.layout);
 }
 
@@ -802,11 +911,7 @@ void NewPipelineServerRenderPath::ConsumeCompletedReadback()
         destination.width = desc.width;
         destination.height = desc.height;
         destination.available = true;
-        destination.encoding =
-            semantic == RemoteBufferSemantic::RemoteIndirectDiffuse ||
-            semantic == RemoteBufferSemantic::RemoteSpecularIndirect
-            ? RemoteBufferEncoding::LogHDR16F
-            : RemoteBufferEncoding::ScalarLuma8;
+        destination.encoding = RemoteBufferTransportEncoding(semantic);
         destination.payload_rgba8.resize(static_cast<size_t>(desc.width) * desc.height * 4);
         const uint8_t* source = static_cast<const uint8_t*>(readback.mapped_data);
         const uint32_t source_pitch = readback.mapped_subresources[0].row_pitch;

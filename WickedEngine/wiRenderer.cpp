@@ -51,6 +51,9 @@ using namespace wi::ecs;
 namespace wi::renderer
 {
 
+static_assert(sizeof(I420AtlasPackPush) == 96,
+	"I420 atlas push constants must remain byte-identical between C++ and HLSL");
+
 GraphicsDevice*& device = GetDevice();
 
 Shader				shaders[SHADERTYPE_COUNT];
@@ -19394,7 +19397,7 @@ void YUV_to_RGB_Region(
 }
 
 void RGB_to_I420_Atlas(
-	const Texture* const inputs[4],
+	const Texture& input_atlas,
 	const GPUBuffer& metadata_luma,
 	const GPUBuffer& output_i420,
 	const I420AtlasPackDesc& desc,
@@ -19413,14 +19416,12 @@ void RGB_to_I420_Atlas(
 	push.u_offset = desc.u_offset;
 	push.v_offset = desc.v_offset;
 	push.available_mask = desc.available_mask;
-	push.log_hdr_maximum = desc.log_hdr_maximum;
 	for (uint32_t index = 0; index < 4; ++index)
 		push.tile_rects[index] = desc.tile_rects[index];
 	device->PushConstants(&push, sizeof(push), cmd);
 
-	for (uint32_t index = 0; index < 4; ++index)
-		device->BindResource(inputs[index] != nullptr ? inputs[index] : wi::texturehelper::getBlack(), index, cmd);
-	device->BindResource(&metadata_luma, 4, cmd);
+	device->BindResource(&input_atlas, 0, cmd);
+	device->BindResource(&metadata_luma, 1, cmd);
 	device->BindUAV(&output_i420, 0, cmd);
 
 	const uint32_t y_store_count = (desc.video_resolution.x + 3u) / 4u;
