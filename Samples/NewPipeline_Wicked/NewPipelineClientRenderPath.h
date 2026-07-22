@@ -229,7 +229,6 @@ private:
     uint32_t accepted_remote_buffer_mask = 0;
     uint64_t remote_texture_creation_count = 0;
     uint64_t remote_gpu_upload_bytes = 0;
-    uint32_t audited_remote_i420_generation = 0;
     WebRTCTransportState previous_webrtc_state = WebRTCTransportState::Disabled;
     std::deque<RemoteVideoFrameLayout> downstream_metadata_cache;
     bool downstream_metadata_active = false;

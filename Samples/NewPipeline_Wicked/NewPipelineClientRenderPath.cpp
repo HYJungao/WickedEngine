@@ -3087,14 +3087,6 @@ void NewPipelineClientRenderPath::AcquireRemoteVideoFrame(float dt)
         return;
     }
 
-    if (gpu_video_path &&
-        audited_remote_i420_generation != metadata.source_generation)
-    {
-        wi::backlog::post("Client post-codec I420 tile audit: " +
-            DescribeRemoteI420TileLuma(retained_frame, video_layout));
-        audited_remote_i420_generation = metadata.source_generation;
-    }
-
     const bool generation_reset =
         metadata.reset_this_frame ||
         (remote_consume.latest_generation != 0 && metadata.source_generation != remote_consume.latest_generation);

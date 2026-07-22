@@ -142,7 +142,6 @@ private:
     uint64_t remote_capture_drops = 0;
     uint64_t gpu_readback_bytes = 0;
     uint64_t cpu_readback_copy_bytes = 0;
-    uint32_t audited_i420_generation = 0;
     WebRTCTransportState previous_webrtc_state = WebRTCTransportState::Disabled;
     bool publish_worker_stop = false;
 };

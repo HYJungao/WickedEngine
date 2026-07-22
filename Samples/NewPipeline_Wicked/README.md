@@ -1,8 +1,13 @@
 # NewPipeline_Wicked
 
-Client and Server use the real WebRTC path by default. Server-to-client frame
-pixels and metadata are carried only by `np.remote.video`; `np.control` remains
-client-to-server only. Mock mode must be selected explicitly.
+Client and Server use the real WebRTC path by default. Server-to-client pixels use
+the `np.remote.video` track; frame metadata is paired through the video metadata band
+and `np.frame_meta` DataChannel. `np.control` remains client-to-server only. Mock mode
+must be selected explicitly.
+
+This README is the source of truth for the current build, runtime and architecture.
+Only unfinished production work belongs in [`docs/ROADMAP.md`](docs/ROADMAP.md).
+The signaling relay has its own scoped [README](WebRTC/signaling/README.md).
 
 ## Signaling
 
@@ -259,5 +264,5 @@ The Server panel and Client remote status report DDGI frame/convergence state.
 Scene-generation and significant authoritative-sun changes clear Server DDGI
 history and publish the reset reason in the video metadata. `--transport_selftest`
 runs the CPU V2 LogHDR/luma/padding round-trip plus downstream metadata/checksum
-tests without opening a window. See `REMOTE_VIDEO_LOW_COPY_ROADMAP.md` for the
-native DX12 completion and validation matrix.
+tests without opening a window. See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the
+remaining production work and validation matrix.

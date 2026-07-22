@@ -876,12 +876,6 @@ void NewPipelineServerRenderPath::ConsumeCompletedPackedReadback()
     frame.timestamp_usec = static_cast<int64_t>(slot.layout.metadata.timestamp_usec);
     frame.frame_lifetime = slot.readback;
     slot.pending = false;
-    if (audited_i420_generation != slot.layout.metadata.source_generation)
-    {
-        wi::backlog::post("Server pre-codec I420 tile audit: " +
-            DescribeRemoteI420TileLuma(frame, slot.layout));
-        audited_i420_generation = slot.layout.metadata.source_generation;
-    }
     QueueI420FrameForPublish(std::move(frame), slot.layout);
 }
 
