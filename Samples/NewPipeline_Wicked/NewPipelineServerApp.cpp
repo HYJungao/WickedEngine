@@ -23,7 +23,8 @@ void NewPipelineServerApp::CreateDebugUI()
     preview_buffer_combo.AddItem("Final", static_cast<uint64_t>(DebugPreviewMode::Final));
     preview_buffer_combo.AddItem("Local Indirect Diffuse", static_cast<uint64_t>(DebugPreviewMode::LocalIndirectDiffuse));
     preview_buffer_combo.AddItem("Local AO", static_cast<uint64_t>(DebugPreviewMode::LocalAO));
-    preview_buffer_combo.AddItem("Local Specular Indirect", static_cast<uint64_t>(DebugPreviewMode::LocalSpecularIndirect));
+    preview_buffer_combo.AddItem("Local RT Reflection (Raw)", static_cast<uint64_t>(DebugPreviewMode::LocalSpecularIndirect));
+    preview_buffer_combo.AddItem("Local Specular Formal (Pre-AO)", static_cast<uint64_t>(DebugPreviewMode::LocalSpecularIndirectPreAO));
     preview_buffer_combo.AddItem("Local Shadow Visibility", static_cast<uint64_t>(DebugPreviewMode::LocalShadowVisibility));
     preview_buffer_combo.AddItem("Transport Indirect Diffuse", static_cast<uint64_t>(DebugPreviewMode::TransportIndirectDiffuse));
     preview_buffer_combo.AddItem("Transport AO", static_cast<uint64_t>(DebugPreviewMode::TransportAO));

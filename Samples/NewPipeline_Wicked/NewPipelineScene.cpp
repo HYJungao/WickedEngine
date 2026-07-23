@@ -447,15 +447,78 @@ const char* GetNewPipelineSunName()
 
 uint32_t GetNewPipelineSunShadowIndex(const wi::scene::Scene& scene)
 {
-    const wi::ecs::Entity sun = FindNewPipelineSun(scene);
-    if (sun == wi::ecs::INVALID_ENTITY)
+    return ResolveStableDirectionalLightShadowIndex(scene, GetNewPipelineSunStableId(scene));
+}
+
+uint64_t ComputeStableLightId(const wi::scene::Scene& scene, wi::ecs::Entity light_entity)
+{
+    const wi::scene::LightComponent* light = scene.lights.GetComponent(light_entity);
+    const wi::scene::NameComponent* name = scene.names.GetComponent(light_entity);
+    if (light == nullptr || name == nullptr || name->name.empty())
+        return 0;
+
+    // Entity handles and packed-light indices are process-local.  The authored
+    // persistent name plus light type is identical after scene serialization
+    // and therefore suitable as the V3 wire identity.  FNV-1a is fixed here so
+    // platform standard-library hash implementations cannot change the value.
+    uint64_t hash = 14695981039346656037ull;
+    const auto append_byte = [&hash](uint8_t value) {
+        hash ^= value;
+        hash *= 1099511628211ull;
+    };
+    constexpr char domain[] = "newpipeline.light.v1";
+    for (const char c : domain) append_byte(static_cast<uint8_t>(c));
+    for (const char c : name->name) append_byte(static_cast<uint8_t>(c));
+    const uint32_t type = static_cast<uint32_t>(light->GetType());
+    for (uint32_t shift = 0; shift < 32; shift += 8) append_byte(static_cast<uint8_t>(type >> shift));
+    return hash == 0 ? 1 : hash;
+}
+
+wi::ecs::Entity ResolveStableLightId(const wi::scene::Scene& scene, uint64_t stable_light_id)
+{
+    if (stable_light_id == 0)
+        return wi::ecs::INVALID_ENTITY;
+
+    wi::ecs::Entity resolved = wi::ecs::INVALID_ENTITY;
+    for (size_t i = 0; i < scene.lights.GetCount(); ++i)
+    {
+        const wi::ecs::Entity candidate = scene.lights.GetEntity(i);
+        if (ComputeStableLightId(scene, candidate) != stable_light_id)
+            continue;
+        // Names are not globally unique in Wicked scenes. Reject ambiguity
+        // instead of selecting a packed index by iteration order.
+        if (resolved != wi::ecs::INVALID_ENTITY)
+            return wi::ecs::INVALID_ENTITY;
+        resolved = candidate;
+    }
+    return resolved;
+}
+
+uint32_t ResolveStableDirectionalLightShadowIndex(
+    const wi::scene::Scene& scene, uint64_t stable_light_id)
+{
+    const wi::ecs::Entity entity = ResolveStableLightId(scene, stable_light_id);
+    const wi::scene::LightComponent* light = scene.lights.GetComponent(entity);
+    if (light == nullptr || light->GetType() != wi::scene::LightComponent::DIRECTIONAL ||
+        !light->IsCastingShadow())
+    {
         return std::numeric_limits<uint32_t>::max();
-    const size_t index = scene.lights.GetIndex(sun);
-    if (index == wi::ecs::INVALID_INDEX || index >= 16 || !scene.lights[index].IsCastingShadow())
+    }
+    const size_t index = scene.lights.GetIndex(entity);
+    if (index == wi::ecs::INVALID_INDEX || index >= 16)
         return std::numeric_limits<uint32_t>::max();
     // rtShadow slices use the light component offset from lights().first_item(),
     // which is the Scene::lights component index on the CPU.
     return static_cast<uint32_t>(index);
+}
+
+uint64_t GetNewPipelineSunStableId(const wi::scene::Scene& scene)
+{
+    const wi::ecs::Entity entity = FindNewPipelineSun(scene);
+    const wi::scene::LightComponent* light = scene.lights.GetComponent(entity);
+    if (light == nullptr || light->GetType() != wi::scene::LightComponent::DIRECTIONAL)
+        return 0;
+    return ComputeStableLightId(scene, entity);
 }
 
 NewPipelineSunState MakeSunStateFromAngles(bool enabled, float yaw_degrees, float pitch_degrees)

@@ -9,7 +9,7 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR command_line, int sh
         if (std::string{__argv[i]} == "--transport_selftest")
         {
             std::string error;
-            return wicked_newpipeline::ValidateRemoteVideoV2RoundTrip(&error) ? 0 : 1;
+            return wicked_newpipeline::ValidateRemoteTransportSelfTest(&error) ? 0 : 1;
         }
     }
     wicked_newpipeline::NewPipelineServerApp application;

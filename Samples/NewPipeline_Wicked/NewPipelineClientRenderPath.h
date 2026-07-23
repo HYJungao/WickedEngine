@@ -264,6 +264,8 @@ private:
     mutable wi::graphics::Texture local_ao_snapshot;
     wi::graphics::Texture local_indirect_final_input;
     wi::graphics::Texture local_specular_indirect;
+    wi::graphics::Texture local_specular_indirect_pre_ao;
+    wi::graphics::Texture local_primary_light_visibility;
     wi::graphics::Texture elastic_indirect_diffuse;
     wi::graphics::Texture elastic_ao;
     float elastic_remote_gi_weight = 0.0f;

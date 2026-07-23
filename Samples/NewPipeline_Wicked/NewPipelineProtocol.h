@@ -3,6 +3,9 @@
 #include "NewPipelineRuntime.h"
 
 #include <cstdint>
+#include <array>
+#include <string>
+#include <vector>
 
 namespace wicked_newpipeline
 {
@@ -11,6 +14,52 @@ constexpr const char* kRemoteVideoStreamName         = "np.remote.video";
 constexpr const char* kRemoteFrameStreamId            = "RemoteFrame.CloudBuffers.V2";
 constexpr uint32_t    kRemoteVideoWireMagic           = 0x3156504Eu; // NPV1
 constexpr uint32_t    kRemoteVideoWireVersion         = 2u;
+constexpr uint32_t    kRemoteVideoWireVersionV3       = 3u;
+constexpr uint32_t    kRemoteVideoWireMagicV3         = 0x3356504Eu; // NPV3
+constexpr uint8_t     kRemoteBufferDescriptorAvailableV3 = 1u << 0u;
+constexpr uint32_t    kRemoteEncodingProfileI420V3    = 1u;
+constexpr uint16_t    kRemoteVideoV3CodecAlignment    = 2u;
+constexpr uint16_t    kRemoteVideoV3MaxAtlasDimension = 8192u;
+constexpr uint16_t    kRemoteVideoV3MaxLogicalDimension = 4096u;
+
+struct RemoteBufferDescriptorV3
+{
+    RemoteBufferSemantic semantic = RemoteBufferSemantic::RemoteIndirectDiffuse;
+    RemoteBufferRepresentationV3 representation = RemoteBufferRepresentationV3::DiffuseIrradiance;
+    RemoteBufferEncoding encoding = RemoteBufferEncoding::LogHDR16F;
+    uint8_t flags = 0;
+    uint16_t logical_width = 0;
+    uint16_t logical_height = 0;
+    uint16_t atlas_x = 0;
+    uint16_t atlas_y = 0;
+    uint16_t atlas_width = 0;
+    uint16_t atlas_height = 0;
+    uint64_t content_frame_id = 0;
+    uint32_t content_generation = 0;
+    uint16_t confidence_unorm = 0;
+    uint16_t reserved = 0;
+    uint64_t stable_subject_id = 0;
+    uint32_t stable_subject_generation = 0;
+};
+
+struct RemoteFrameContractV3
+{
+    uint32_t protocol_version = kRemoteVideoWireVersionV3;
+    uint32_t encoding_profile_id = kRemoteEncodingProfileI420V3;
+    RemoteQualityTierV3 quality_tier = RemoteQualityTierV3::High;
+    uint16_t atlas_width = 0;
+    uint16_t atlas_height = 0;
+    uint64_t source_control_frame_id = 0;
+    std::array<RemoteBufferDescriptorV3,
+        static_cast<size_t>(RemoteBufferSemantic::Count)> descriptors = {};
+};
+
+bool ValidateRemoteFrameContractV3(const RemoteFrameContractV3& contract, std::string* error = nullptr);
+bool SerializeRemoteFrameContractV3(
+    const RemoteFrameContractV3& contract, std::vector<uint8_t>& bytes, std::string* error = nullptr);
+bool DeserializeRemoteFrameContractV3(
+    const uint8_t* bytes, size_t byte_count, RemoteFrameContractV3& contract, std::string* error = nullptr);
+bool ValidateRemoteFrameContractV3SelfTest(std::string* error = nullptr);
 
 struct NewPipelineSunState
 {

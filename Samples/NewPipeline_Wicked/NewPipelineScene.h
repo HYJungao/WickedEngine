@@ -45,6 +45,11 @@ struct SceneParityFingerprint
 const char* ToString(SceneInitializationKind kind);
 const char* GetNewPipelineSunName();
 uint32_t GetNewPipelineSunShadowIndex(const wi::scene::Scene& scene);
+uint64_t ComputeStableLightId(const wi::scene::Scene& scene, wi::ecs::Entity light_entity);
+wi::ecs::Entity ResolveStableLightId(const wi::scene::Scene& scene, uint64_t stable_light_id);
+uint32_t ResolveStableDirectionalLightShadowIndex(
+    const wi::scene::Scene& scene, uint64_t stable_light_id);
+uint64_t GetNewPipelineSunStableId(const wi::scene::Scene& scene);
 NewPipelineSunState MakeSunStateFromAngles(bool enabled, float yaw_degrees, float pitch_degrees);
 SceneInitializationResult InitializeDefaultScene(wi::scene::Scene& scene);
 SceneParityFingerprint ComputeSceneParityFingerprint(const wi::scene::Scene& scene);

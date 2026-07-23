@@ -85,6 +85,8 @@ std::string NewPipelineServerRenderPath::GetDebugStatusSummary() const
                 ? std::string{} : " fallback=" + transport.codec_fallback_reason)
         : std::string{};
     return GetEffectiveAlgorithmSummary() + "\nSun shadow slice: " + shadow +
+        " stable-id=" + std::to_string(authoritative_shadow_light_id) +
+        " generation=" + std::to_string(authoritative_shadow_light_generation) +
         "\nReadback: async ring 3, pending " + std::to_string(pending_count) +
         transport_status +
         "\nDDGI: frame " + std::to_string(local_scene.ddgi.frame_index) +
@@ -95,12 +97,15 @@ std::string NewPipelineServerRenderPath::GetDebugStatusSummary() const
 void NewPipelineServerRenderPath::Start()
 {
     std::string codec_test_error;
-    if (!ValidateRemoteVideoV2RoundTrip(&codec_test_error))
-        wi::backlog::post("Remote video V2 self-test failed: " + codec_test_error);
+    if (!ValidateRemoteTransportSelfTest(&codec_test_error))
+        wi::backlog::post("Remote transport self-test failed: " + codec_test_error);
     else
-        wi::backlog::post("Remote video V2 self-test passed: LogHDR + scalar luma + padding.");
+        wi::backlog::post("Remote transport self-test passed: V2 codec plus V3 formal contracts.");
     InitializeSceneIfNeeded();
     ConfigureDDGI();
+    // SpecularIndirectPreAO is emitted by Visibility_Shade. Keep Server and
+    // Client on the same formal-output stage.
+    setVisibilityComputeShadingEnabled(true);
     wi::RenderPath3D::Start();
     StartPublishWorker();
     if (config.remote_source == RemoteSourceMode::WebRTC)
@@ -146,6 +151,8 @@ void NewPipelineServerRenderPath::ResizeBuffers()
 {
     wi::RenderPath3D::ResizeBuffers();
     local_ao_snapshot = {};
+    local_specular_indirect_pre_ao = {};
+    visibilityResources.texture_specular_indirect_pre_ao = nullptr;
     if (rtAO.IsValid())
     {
         wi::graphics::TextureDesc desc = rtAO.GetDesc();
@@ -157,6 +164,27 @@ void NewPipelineServerRenderPath::ResizeBuffers()
     if (rtShadow.IsValid())
     {
         EnsureShadowSliceTexture(rtShadow.GetDesc().width, rtShadow.GetDesc().height);
+    }
+    const XMUINT2 internal_resolution = GetInternalResolution();
+    if (internal_resolution.x > 0 && internal_resolution.y > 0)
+    {
+        wi::graphics::TextureDesc desc;
+        desc.width = internal_resolution.x;
+        desc.height = internal_resolution.y;
+        desc.format = wi::graphics::Format::R16G16B16A16_FLOAT;
+        desc.bind_flags = wi::graphics::BindFlag::SHADER_RESOURCE | wi::graphics::BindFlag::UNORDERED_ACCESS;
+        desc.layout = wi::graphics::ResourceState::SHADER_RESOURCE_COMPUTE;
+        if (wi::graphics::GetDevice()->CreateTexture(&desc, nullptr, &local_specular_indirect_pre_ao))
+        {
+            wi::graphics::GetDevice()->SetName(
+                &local_specular_indirect_pre_ao, "newpipeline.server.local_specular_indirect_pre_ao");
+            visibilityResources.texture_specular_indirect_pre_ao = &local_specular_indirect_pre_ao;
+        }
+        else
+        {
+            wi::backlog::post("Server Local Specular Indirect Pre-AO texture creation failed: " +
+                std::to_string(internal_resolution.x) + "x" + std::to_string(internal_resolution.y));
+        }
     }
 }
 
@@ -182,7 +210,7 @@ void NewPipelineServerRenderPath::RenderPostprocessChain(wi::graphics::CommandLi
         shadow_snapshot_valid = false;
         return;
     }
-    authoritative_shadow_index = GetNewPipelineSunShadowIndex(local_scene);
+    RefreshAuthoritativeShadowIdentity();
     if (authoritative_shadow_index >= rtShadow.GetDesc().array_size)
     {
         shadow_snapshot_valid = false;
@@ -222,6 +250,8 @@ const wi::graphics::Texture* NewPipelineServerRenderPath::GetDebugPreviewTexture
         return local_ao_snapshot.IsValid() ? &local_ao_snapshot : nullptr;
     case DebugPreviewMode::LocalSpecularIndirect:
         return rtSSR.IsValid() ? &rtSSR : nullptr;
+    case DebugPreviewMode::LocalSpecularIndirectPreAO:
+        return local_specular_indirect_pre_ao.IsValid() ? &local_specular_indirect_pre_ao : nullptr;
     case DebugPreviewMode::LocalShadowVisibility:
         return shadow_snapshot_valid && shadow_slice_texture.IsValid() ? &shadow_slice_texture : nullptr;
     case DebugPreviewMode::TransportIndirectDiffuse:
@@ -275,7 +305,8 @@ void NewPipelineServerRenderPath::Compose(wi::graphics::CommandList cmd) const
         fx.quality = wi::image::QUALITY_NEAREST;
         fx.sampleFlag = wi::image::SAMPLEMODE_CLAMP;
         fx.enableFullScreen();
-        if (debug_preview_mode == DebugPreviewMode::LocalSpecularIndirect)
+        if (debug_preview_mode == DebugPreviewMode::LocalSpecularIndirect ||
+            debug_preview_mode == DebugPreviewMode::LocalSpecularIndirectPreAO)
             fx.enableDebugTonemap();
         if (debug_preview_mode == DebugPreviewMode::TransportIndirectDiffuse ||
             debug_preview_mode == DebugPreviewMode::TransportSpecularIndirect)
@@ -1078,8 +1109,34 @@ void NewPipelineServerRenderPath::InitializeSceneIfNeeded()
         std::to_string(local_scene.ddgi.grid_dimensions.y) + " x " +
         std::to_string(local_scene.ddgi.grid_dimensions.z) + " (scene/Editor setting).");
 
+    RefreshAuthoritativeShadowIdentity();
+    wi::backlog::post("Server primary light identity: stable-id=" +
+        std::to_string(authoritative_shadow_light_id) + " generation=" +
+        std::to_string(authoritative_shadow_light_generation) + " shadow-index=" +
+        (authoritative_shadow_index < 16
+            ? std::to_string(authoritative_shadow_index) : std::string{"unavailable"}));
+
     scene_initialized = true;
     ResetDDGI(DDGIResetReason::InitialScene);
+}
+
+void NewPipelineServerRenderPath::RefreshAuthoritativeShadowIdentity() const
+{
+    authoritative_shadow_light_id = GetNewPipelineSunStableId(local_scene);
+    const wi::ecs::Entity resolved =
+        ResolveStableLightId(local_scene, authoritative_shadow_light_id);
+    if (resolved != authoritative_shadow_light_entity)
+    {
+        authoritative_shadow_light_entity = resolved;
+        if (resolved != wi::ecs::INVALID_ENTITY)
+        {
+            ++authoritative_shadow_light_generation;
+            if (authoritative_shadow_light_generation == 0)
+                authoritative_shadow_light_generation = 1;
+        }
+    }
+    authoritative_shadow_index = ResolveStableDirectionalLightShadowIndex(
+        local_scene, authoritative_shadow_light_id);
 }
 
 void NewPipelineServerRenderPath::ConfigureDDGI()

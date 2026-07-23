@@ -52,6 +52,47 @@ enum class RemoteBufferEncoding : uint8_t
     ScalarLuma8,
 };
 
+// V3 names the physical representation independently from the legacy buffer
+// label.  These values are protocol constants; do not reorder or reuse them.
+enum class RemoteBufferRepresentationV3 : uint8_t
+{
+    DiffuseIrradiance = 0,
+    AmbientVisibility = 1,
+    SpecularIndirectPreAO = 2,
+    PrimaryLightVisibility = 3,
+};
+
+enum class RemoteQualityTierV3 : uint8_t
+{
+    High = 0,
+    Balanced = 1,
+    Low = 2,
+};
+
+struct FormalLightingBlendV3
+{
+    XMFLOAT3 diffuse_local = {};
+    XMFLOAT3 diffuse_remote = {};
+    XMFLOAT3 specular_pre_ao_local = {};
+    XMFLOAT3 specular_pre_ao_remote = {};
+    float ambient_visibility_local = 1.0f;
+    float ambient_visibility_remote = 1.0f;
+    float primary_visibility_local = 1.0f;
+    float primary_visibility_remote = 1.0f;
+    float diffuse_weight = 0.0f;
+    float ao_weight = 0.0f;
+    float specular_weight = 0.0f;
+    float primary_visibility_weight = 0.0f;
+};
+
+struct FormalLightingBlendV3Result
+{
+    XMFLOAT3 diffuse = {};
+    XMFLOAT3 specular_pre_ao = {};
+    float ambient_visibility = 1.0f;
+    float primary_visibility = 1.0f;
+};
+
 enum class DDGIResetReason : uint8_t
 {
     None,
@@ -78,6 +119,7 @@ enum class DebugPreviewMode : uint8_t
     LocalIndirectDiffuse,
     LocalAO,
     LocalSpecularIndirect,
+    LocalSpecularIndirectPreAO,
     LocalShadowVisibility,
     RemoteIndirectDiffuse,
     RemoteAO,
@@ -165,6 +207,25 @@ constexpr RemoteBufferEncoding RemoteBufferTransportEncoding(RemoteBufferSemanti
         ? RemoteBufferEncoding::LogHDR16F
         : RemoteBufferEncoding::ScalarLuma8;
 }
+
+constexpr RemoteBufferRepresentationV3 RemoteBufferRepresentationContractV3(RemoteBufferSemantic semantic)
+{
+    switch (semantic)
+    {
+    case RemoteBufferSemantic::RemoteIndirectDiffuse:
+        return RemoteBufferRepresentationV3::DiffuseIrradiance;
+    case RemoteBufferSemantic::RemoteAO:
+        return RemoteBufferRepresentationV3::AmbientVisibility;
+    case RemoteBufferSemantic::RemoteSpecularIndirect:
+        return RemoteBufferRepresentationV3::SpecularIndirectPreAO;
+    case RemoteBufferSemantic::RemoteShadowVisibility:
+    default:
+        return RemoteBufferRepresentationV3::PrimaryLightVisibility;
+    }
+}
+
+FormalLightingBlendV3Result EvaluateFormalLightingBlendV3(const FormalLightingBlendV3& input);
+bool ValidateFormalLightingBlendV3Reference(std::string* error = nullptr);
 
 const char* ToString(RemoteBufferSemantic semantic);
 const char* ToString(RemoteSourceMode mode);

@@ -322,6 +322,10 @@ std::string NewPipelineClientRenderPath::GetDebugStatusSummary() const
                 ? std::string{} : " fallback=" + transport.codec_fallback_reason)
         : std::string{};
     return GetEffectiveAlgorithmSummary() + "\n" + client_static_lighting.GetStatusSummary() + transport_status +
+        "\nPrimary light: stable-id=" + std::to_string(GetNewPipelineSunStableId(local_scene)) +
+        " shadow-index=" +
+            (GetNewPipelineSunShadowIndex(local_scene) < 16
+                ? std::to_string(GetNewPipelineSunShadowIndex(local_scene)) : std::string{"unavailable"}) +
         "\nRemote decoded: " +
         (remote_consume.accepted_valid ? std::string{"available"} :
             std::string{"unavailable ("} + remote_consume.fallback_reason + ")") +
@@ -380,6 +384,10 @@ void NewPipelineClientRenderPath::Start()
 {
     InitializeSceneIfNeeded();
     ConfigureLowEndLocalRendering();
+    // Formal local outputs and elastic Final fusion are implemented in
+    // Visibility_Shade. Make that renderer-supported path explicit instead of
+    // allocating outputs that are never dispatched.
+    setVisibilityComputeShadingEnabled(true);
     setVisibilitySurfaceResourcesForced(true);
     ApplyRenderSettings(true);
     wi::RenderPath3D::Start();
@@ -407,10 +415,15 @@ void NewPipelineClientRenderPath::ResizeBuffers()
     local_ao_snapshot = {};
     local_indirect_final_input = {};
     local_specular_indirect = {};
+    local_specular_indirect_pre_ao = {};
+    local_primary_light_visibility = {};
     elastic_indirect_diffuse = {};
     elastic_ao = {};
     visibilityResources.texture_local_indirect_diffuse = nullptr;
     visibilityResources.texture_specular_indirect = nullptr;
+    visibilityResources.texture_specular_indirect_pre_ao = nullptr;
+    visibilityResources.texture_primary_light_visibility = nullptr;
+    visibilityResources.primary_light_shadow_index = -1;
     visibilityResources.texture_elastic_indirect_diffuse = nullptr;
     visibilityResources.texture_elastic_ao = nullptr;
     if (rtAO.IsValid())
@@ -438,6 +451,33 @@ void NewPipelineClientRenderPath::ResizeBuffers()
         else
         {
             wi::backlog::post("Client Local Indirect Final Input texture creation failed: " +
+                std::to_string(internal_resolution.x) + "x" + std::to_string(internal_resolution.y));
+        }
+
+        if (wi::graphics::GetDevice()->CreateTexture(&desc, nullptr, &local_specular_indirect_pre_ao))
+        {
+            wi::graphics::GetDevice()->SetName(
+                &local_specular_indirect_pre_ao, "newpipeline.client.local_specular_indirect_pre_ao");
+            visibilityResources.texture_specular_indirect_pre_ao = &local_specular_indirect_pre_ao;
+        }
+        else
+        {
+            wi::backlog::post("Client Local Specular Indirect Pre-AO texture creation failed: " +
+                std::to_string(internal_resolution.x) + "x" + std::to_string(internal_resolution.y));
+        }
+
+        wi::graphics::TextureDesc primary_visibility_desc = desc;
+        primary_visibility_desc.format = wi::graphics::Format::R8G8B8A8_UNORM;
+        if (wi::graphics::GetDevice()->CreateTexture(
+            &primary_visibility_desc, nullptr, &local_primary_light_visibility))
+        {
+            wi::graphics::GetDevice()->SetName(
+                &local_primary_light_visibility, "newpipeline.client.local_primary_light_visibility");
+            visibilityResources.texture_primary_light_visibility = &local_primary_light_visibility;
+        }
+        else
+        {
+            wi::backlog::post("Client Local Primary Light Visibility texture creation failed: " +
                 std::to_string(internal_resolution.x) + "x" + std::to_string(internal_resolution.y));
         }
 
@@ -839,6 +879,15 @@ void NewPipelineClientRenderPath::ApplyElasticLightingResources()
     visibilityResources.texture_elastic_indirect_diffuse =
         elastic_indirect_diffuse.IsValid() ? &elastic_indirect_diffuse : nullptr;
     visibilityResources.texture_elastic_ao = elastic_ao.IsValid() ? &elastic_ao : nullptr;
+    visibilityResources.texture_specular_indirect_pre_ao = local_specular_indirect_pre_ao.IsValid()
+        ? &local_specular_indirect_pre_ao : nullptr;
+    visibilityResources.texture_primary_light_visibility = local_primary_light_visibility.IsValid()
+        ? &local_primary_light_visibility : nullptr;
+    const uint64_t primary_light_id = GetNewPipelineSunStableId(local_scene);
+    const uint32_t primary_shadow_index =
+        ResolveStableDirectionalLightShadowIndex(local_scene, primary_light_id);
+    visibilityResources.primary_light_shadow_index = primary_shadow_index < 16
+        ? static_cast<int>(primary_shadow_index) : -1;
 }
 
 void NewPipelineClientRenderPath::ApplyEnvironmentProbeSettings(bool log_changes)
@@ -3161,12 +3210,14 @@ const wi::graphics::Texture* NewPipelineClientRenderPath::GetDebugPreviewTexture
         return local_ao_snapshot.IsValid() ? &local_ao_snapshot : nullptr;
     case DebugPreviewMode::LocalSpecularIndirect:
         return local_specular_indirect.IsValid() ? &local_specular_indirect : nullptr;
+    case DebugPreviewMode::LocalSpecularIndirectPreAO:
+        return local_specular_indirect_pre_ao.IsValid() ? &local_specular_indirect_pre_ao : nullptr;
     case DebugPreviewMode::LocalReflectionProbe:
         if (const wi::scene::EnvironmentProbeComponent* probe = local_scene.probes.GetComponent(environment_probe_entity))
             return probe->texture.IsValid() ? &probe->texture : nullptr;
         return nullptr;
     case DebugPreviewMode::LocalShadowVisibility:
-        return nullptr; // Raster shadows live in the light shadow-map atlas.
+        return local_primary_light_visibility.IsValid() ? &local_primary_light_visibility : nullptr;
     case DebugPreviewMode::RemoteIndirectDiffuse:
     {
         const RemoteBufferSemantic semantic = RemoteBufferSemantic::RemoteIndirectDiffuse;
@@ -3280,6 +3331,7 @@ void NewPipelineClientRenderPath::Compose(wi::graphics::CommandList cmd) const
             fx.color = XMFLOAT4(0.0f, 0.0f, 4.0f, 1.0f);
         else if (debug_preview_mode == DebugPreviewMode::LocalIndirectFinalInput ||
             debug_preview_mode == DebugPreviewMode::LocalSpecularIndirect ||
+            debug_preview_mode == DebugPreviewMode::LocalSpecularIndirectPreAO ||
             debug_preview_mode == DebugPreviewMode::LocalReflectionProbe ||
             debug_preview_mode == DebugPreviewMode::RemoteIndirectDiffuse ||
             debug_preview_mode == DebugPreviewMode::RemoteSpecularIndirect ||

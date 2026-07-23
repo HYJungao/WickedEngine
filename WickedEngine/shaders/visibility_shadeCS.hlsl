@@ -26,19 +26,16 @@ struct VisibilityPushConstants
 {
 	uint global_tile_offset;
 	int specular_indirect_uav;
+	int specular_indirect_pre_ao_uav;
+	int primary_light_visibility_uav;
+	int primary_light_shadow_index;
 	int local_indirect_diffuse_uav;
-	int local_indirect_padding0;
-	int local_indirect_padding1;
-	int local_indirect_padding2;
 	int elastic_indirect_diffuse_uav;
 	int elastic_ao_uav;
 	int remote_indirect_diffuse_texture;
 	int remote_ao_texture;
 	float remote_indirect_diffuse_weight;
 	float remote_ao_weight;
-	float4 remote_clip_x;
-	float4 remote_clip_y;
-	float4 remote_clip_w;
 };
 PUSHCONSTANT(push, VisibilityPushConstants);
 
@@ -121,12 +118,12 @@ void main(uint Gid : SV_GroupID, uint groupIndex : SV_GroupIndex)
 		(push.remote_ao_texture >= 0 && push.remote_ao_weight > 0))
 	{
 		const float4 world_position = float4(surface.P, 1);
-		const float remote_clip_w = dot(push.remote_clip_w, world_position);
-		if (remote_clip_w > 0)
+		// The remote view-projection is bound through MiscCB. Keep the push
+		// constants within the default DX12 root signature's 12 DWORD limit.
+		const float4 remote_clip = mul(g_xTransform, world_position);
+		if (remote_clip.w > 0)
 		{
-			const float2 remote_ndc = float2(
-				dot(push.remote_clip_x, world_position),
-				dot(push.remote_clip_y, world_position)) / remote_clip_w;
+			const float2 remote_ndc = remote_clip.xy / remote_clip.w;
 			remote_uv = clipspace_to_uv(remote_ndc);
 			remote_reprojection_valid = all(remote_uv >= 0) && all(remote_uv <= 1);
 		}
@@ -151,7 +148,8 @@ void main(uint Gid : SV_GroupID, uint groupIndex : SV_GroupIndex)
 	Lighting lighting;
 	lighting.create(0, 0, elastic_indirect_diffuse, 0);
 
-	TiledLighting(surface, lighting, entity_flat_tile_index, camera);
+	const half primary_light_visibility = TiledLightingWithPrimaryVisibility(
+		surface, lighting, entity_flat_tile_index, camera, push.primary_light_shadow_index);
 
 	half elastic_screen_ao = 1;
 #ifndef CARTOON
@@ -183,6 +181,23 @@ void main(uint Gid : SV_GroupID, uint groupIndex : SV_GroupIndex)
 	}
 	surface.occlusion *= elastic_screen_ao;
 #endif // CARTOON
+
+	// Formal V3 specular is captured after reflection/environment resolution.
+	// Only surface.occlusion changed above, so this remains strictly pre-AO.
+	[branch]
+	if (push.specular_indirect_pre_ao_uav >= 0)
+	{
+		RWTexture2D<float4> output_specular_indirect_pre_ao =
+			bindless_rwtextures[descriptor_index(push.specular_indirect_pre_ao_uav)];
+		output_specular_indirect_pre_ao[pixel] = float4(max(0, lighting.indirect.specular), 1);
+	}
+	[branch]
+	if (push.primary_light_visibility_uav >= 0)
+	{
+		RWTexture2D<float4> output_primary_light_visibility =
+			bindless_rwtextures[descriptor_index(push.primary_light_visibility_uav)];
+		output_primary_light_visibility[pixel] = float4(saturate(primary_light_visibility).xxx, 1);
+	}
 
 	[branch]
 	if (push.elastic_indirect_diffuse_uav >= 0)

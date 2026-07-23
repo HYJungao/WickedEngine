@@ -1107,6 +1107,10 @@ bool DecodeRemoteVideoFrame(const RetainedI420Frame& video, RemoteRawFrame& fram
 
 bool ValidateRemoteVideoV2RoundTrip(std::string* error)
 {
+    if (!ValidateFormalLightingBlendV3Reference(error) ||
+        !ValidateRemoteFrameContractV3SelfTest(error))
+        return false;
+
     RemoteRawFrame source;
     source.metadata.frame_id = 1;
     source.metadata.timestamp_usec = 1;
@@ -1192,6 +1196,11 @@ bool ValidateRemoteVideoV2RoundTrip(std::string* error)
         return false;
     }
     return true;
+}
+
+bool ValidateRemoteTransportSelfTest(std::string* error)
+{
+    return ValidateRemoteVideoV2RoundTrip(error);
 }
 
 void InProcessControlMailbox::Publish(const ClientControlPacket& packet)

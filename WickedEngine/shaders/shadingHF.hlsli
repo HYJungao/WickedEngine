@@ -43,12 +43,18 @@ inline uint GetFlatTileIndex(min16uint2 pixel, ShaderCamera camera = GetCamera()
 	return flatten2D(tileIndex, camera.entity_culling_tilecount.xy) * SHADER_ENTITY_TILE_BUCKET_COUNT;
 }
 
-inline void TiledLighting(inout Surface surface, inout Lighting lighting, uint flatTileIndex, ShaderCamera camera = GetCamera())
+inline half TiledLightingWithPrimaryVisibility(
+	inout Surface surface,
+	inout Lighting lighting,
+	uint flatTileIndex,
+	ShaderCamera camera,
+	int primary_light_shadow_index)
 {
+	half primary_light_visibility = 1;
 	if (camera.buffer_entitytiles_index < 0)
-		return;
+		return primary_light_visibility;
 	if (camera.options & OPTION_BIT_FORCE_UNLIT)
-		return;
+		return primary_light_visibility;
 
 #ifndef DISABLE_ENVMAPS
 	// Apply environment maps:
@@ -166,13 +172,13 @@ inline void TiledLighting(inout Surface surface, inout Lighting lighting, uint f
 		for (uint entity_index = iterator.first_item(); entity_index < iterator.end_item(); ++entity_index)
 		{
 			ShaderEntity light = load_entity(entity_index);
+			const uint shadow_index = entity_index - lights().first_item();
 
 			half shadow_mask = 1;
 #if defined(SHADOW_MASK_ENABLED) && !defined(TRANSPARENT)
 			[branch]
 			if (surface.IsReceiveShadow() && light.IsCastingShadow() && (GetFrame().options & OPTION_BIT_SHADOW_MASK) && (camera.options & SHADERCAMERA_OPTION_USE_SHADOW_MASK) && camera.texture_rtshadow_index >= 0)
 			{
-				uint shadow_index = entity_index - lights().first_item();
 				if (shadow_index < 16)
 				{
 					shadow_mask = bindless_textures2DArray_half4[descriptor_index(camera.texture_rtshadow_index)][uint3(surface.pixel, shadow_index)].r;
@@ -180,7 +186,12 @@ inline void TiledLighting(inout Surface surface, inout Lighting lighting, uint f
 			}
 #endif // SHADOW_MASK_ENABLED && !TRANSPARENT
 
-			light_directional(light, surface, lighting, shadow_mask);
+			const bool is_primary_light =
+				primary_light_shadow_index >= 0 && shadow_index == (uint)primary_light_shadow_index;
+			const half directional_visibility = light_directional_with_visibility(
+				light, surface, lighting, shadow_mask, is_primary_light);
+			if (is_primary_light)
+				primary_light_visibility = directional_visibility;
 		}
 	}
 
@@ -370,7 +381,12 @@ inline void TiledLighting(inout Surface surface, inout Lighting lighting, uint f
 		lighting.indirect.specular *= capsulereflection;
 #endif // PLANARREFLECTION
 	}
+	return primary_light_visibility;
+}
 
+inline void TiledLighting(inout Surface surface, inout Lighting lighting, uint flatTileIndex, ShaderCamera camera = GetCamera())
+{
+	TiledLightingWithPrimaryVisibility(surface, lighting, flatTileIndex, camera, -1);
 }
 
 inline void TiledDecals(inout Surface surface, inout half4 surfaceMap, SamplerState sam, uint flatTileIndex, ShaderCamera camera)

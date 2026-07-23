@@ -7436,6 +7436,22 @@ std::mutex queue_locker;
 		assert(size % sizeof(uint32_t) == 0);
 		assert(offset % sizeof(uint32_t) == 0);
 
+		auto validate_range = [size, offset](const D3D12_ROOT_PARAMETER1& param)
+		{
+			const uint32_t capacity = param.Constants.Num32BitValues * uint32_t(sizeof(uint32_t));
+			if (offset > capacity || size > capacity - offset)
+			{
+				std::stringstream ss;
+				ss << "GraphicsDevice_DX12::PushConstants rejected "
+					<< size << " bytes at offset " << offset
+					<< " for a root-constant range of " << capacity << " bytes";
+				wi::backlog::post(ss.str(), wi::backlog::LogLevel::Error);
+				assert(0 && "Push constants exceed the active DX12 root signature");
+				return false;
+			}
+			return true;
+		};
+
 		CommandList_DX12& commandlist = GetCommandList(cmd);
 		auto& binder = commandlist.binder;
 		if (commandlist.active_pso != nullptr)
@@ -7443,7 +7459,8 @@ std::mutex queue_locker;
 			const RootSignatureOptimizer* optimizer = (const RootSignatureOptimizer*)binder.optimizer_graphics;
 			const D3D12_ROOT_PARAMETER1& param = optimizer->rootsig_desc->Desc_1_1.pParameters[optimizer->PUSH];
 			assert(param.ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS);
-			assert(size <= param.Constants.Num32BitValues * sizeof(uint32_t)); // if this fires, not enough root constants were declared in root signature!
+			if (!validate_range(param))
+				return;
 			commandlist.GetGraphicsCommandList()->SetGraphicsRoot32BitConstants(
 				optimizer->PUSH,
 				size / sizeof(uint32_t),
@@ -7457,7 +7474,8 @@ std::mutex queue_locker;
 			const RootSignatureOptimizer* optimizer = (const RootSignatureOptimizer*)binder.optimizer_compute;
 			const D3D12_ROOT_PARAMETER1& param = optimizer->rootsig_desc->Desc_1_1.pParameters[optimizer->PUSH];
 			assert(param.ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS);
-			assert(size <= param.Constants.Num32BitValues * sizeof(uint32_t)); // if this fires, not enough root constants were declared in root signature!
+			if (!validate_range(param))
+				return;
 			commandlist.GetGraphicsCommandList()->SetComputeRoot32BitConstants(
 				optimizer->PUSH,
 				size / sizeof(uint32_t),

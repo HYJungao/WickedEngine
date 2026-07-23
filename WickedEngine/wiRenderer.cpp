@@ -12250,6 +12250,30 @@ void Visibility_Shade(
 		device->Barrier(GPUBarrier::Memory(res.texture_specular_indirect), cmd);
 		specular_indirect_uav = device->GetDescriptorIndex(res.texture_specular_indirect, SubresourceType::UAV);
 	}
+	int specular_indirect_pre_ao_uav = -1;
+	if (res.texture_specular_indirect_pre_ao != nullptr && res.texture_specular_indirect_pre_ao->IsValid())
+	{
+		device->Barrier(GPUBarrier::Image(
+			res.texture_specular_indirect_pre_ao,
+			res.texture_specular_indirect_pre_ao->desc.layout,
+			ResourceState::UNORDERED_ACCESS), cmd);
+		device->ClearUAV(res.texture_specular_indirect_pre_ao, 0, cmd);
+		device->Barrier(GPUBarrier::Memory(res.texture_specular_indirect_pre_ao), cmd);
+		specular_indirect_pre_ao_uav = device->GetDescriptorIndex(
+			res.texture_specular_indirect_pre_ao, SubresourceType::UAV);
+	}
+	int primary_light_visibility_uav = -1;
+	if (res.texture_primary_light_visibility != nullptr && res.texture_primary_light_visibility->IsValid())
+	{
+		device->Barrier(GPUBarrier::Image(
+			res.texture_primary_light_visibility,
+			res.texture_primary_light_visibility->desc.layout,
+			ResourceState::UNORDERED_ACCESS), cmd);
+		device->ClearUAV(res.texture_primary_light_visibility, 0, cmd);
+		device->Barrier(GPUBarrier::Memory(res.texture_primary_light_visibility), cmd);
+		primary_light_visibility_uav = device->GetDescriptorIndex(
+			res.texture_primary_light_visibility, SubresourceType::UAV);
+	}
 	int local_indirect_diffuse_uav = -1;
 	if (res.texture_local_indirect_diffuse != nullptr && res.texture_local_indirect_diffuse->IsValid())
 	{
@@ -12289,21 +12313,25 @@ void Visibility_Shade(
 	{
 		uint32_t global_tile_offset;
 		int32_t specular_indirect_uav;
+		int32_t specular_indirect_pre_ao_uav;
+		int32_t primary_light_visibility_uav;
+		int32_t primary_light_shadow_index;
 		int32_t local_indirect_diffuse_uav;
-		int32_t local_indirect_padding[3];
 		int32_t elastic_indirect_diffuse_uav;
 		int32_t elastic_ao_uav;
 		int32_t remote_indirect_diffuse_texture;
 		int32_t remote_ao_texture;
 		float remote_indirect_diffuse_weight;
 		float remote_ao_weight;
-		XMFLOAT4 remote_clip_x;
-		XMFLOAT4 remote_clip_y;
-		XMFLOAT4 remote_clip_w;
 	};
-	static_assert(sizeof(VisibilityShadePushConstants) == 96);
+	// The default root signature exposes 12 DWORDs at b999. Remote reprojection
+	// data is carried by MiscCB instead of overflowing that fixed ABI.
+	static_assert(sizeof(VisibilityShadePushConstants) == 48);
 	VisibilityShadePushConstants push = {};
 	push.specular_indirect_uav = specular_indirect_uav;
+	push.specular_indirect_pre_ao_uav = specular_indirect_pre_ao_uav;
+	push.primary_light_visibility_uav = primary_light_visibility_uav;
+	push.primary_light_shadow_index = res.primary_light_shadow_index;
 	push.local_indirect_diffuse_uav = local_indirect_diffuse_uav;
 	push.elastic_indirect_diffuse_uav = elastic_indirect_diffuse_uav;
 	push.elastic_ao_uav = elastic_ao_uav;
@@ -12311,12 +12339,11 @@ void Visibility_Shade(
 	push.remote_ao_texture = device->GetDescriptorIndex(res.texture_remote_ao, SubresourceType::SRV);
 	push.remote_indirect_diffuse_weight = res.remote_indirect_diffuse_weight;
 	push.remote_ao_weight = res.remote_ao_weight;
-	const XMFLOAT4X4& remote_vp = res.remote_view_projection;
-	// DirectXMath stores row-vector matrices. HLSL consumes the same bytes as a
-	// column-major matrix, so clip x/y/w are the CPU matrix columns 0/1/3.
-	push.remote_clip_x = XMFLOAT4(remote_vp._11, remote_vp._21, remote_vp._31, remote_vp._41);
-	push.remote_clip_y = XMFLOAT4(remote_vp._12, remote_vp._22, remote_vp._32, remote_vp._42);
-	push.remote_clip_w = XMFLOAT4(remote_vp._14, remote_vp._24, remote_vp._34, remote_vp._44);
+
+	MiscCB visibility_misc = {};
+	visibility_misc.g_xTransform = res.remote_view_projection;
+	device->BindDynamicConstantBuffer(visibility_misc, CB_GETBINDSLOT(MiscCB), cmd);
+
 	uint64_t bins_offset = 0;
 
 	// shading dispatches per material type:
@@ -12349,6 +12376,20 @@ void Visibility_Shade(
 			res.texture_specular_indirect,
 			ResourceState::UNORDERED_ACCESS,
 			res.texture_specular_indirect->desc.layout));
+	}
+	if (res.texture_specular_indirect_pre_ao != nullptr && res.texture_specular_indirect_pre_ao->IsValid())
+	{
+		PushBarrier(GPUBarrier::Image(
+			res.texture_specular_indirect_pre_ao,
+			ResourceState::UNORDERED_ACCESS,
+			res.texture_specular_indirect_pre_ao->desc.layout));
+	}
+	if (res.texture_primary_light_visibility != nullptr && res.texture_primary_light_visibility->IsValid())
+	{
+		PushBarrier(GPUBarrier::Image(
+			res.texture_primary_light_visibility,
+			ResourceState::UNORDERED_ACCESS,
+			res.texture_primary_light_visibility->desc.layout));
 	}
 	if (res.texture_local_indirect_diffuse != nullptr && res.texture_local_indirect_diffuse->IsValid())
 	{

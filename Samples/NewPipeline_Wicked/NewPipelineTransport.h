@@ -151,6 +151,7 @@ bool DecodeRemoteVideoFrame(const RetainedI420Frame& video, RemoteRawFrame& fram
 bool DecodeRemoteVideoFrameLayout(
     const RetainedI420Frame& video, RemoteVideoFrameLayout& layout, std::string* error = nullptr);
 bool ValidateRemoteVideoV2RoundTrip(std::string* error = nullptr);
+bool ValidateRemoteTransportSelfTest(std::string* error = nullptr);
 
 class IRemoteTransport
 {

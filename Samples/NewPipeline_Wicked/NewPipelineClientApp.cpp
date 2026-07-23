@@ -60,8 +60,9 @@ void NewPipelineClientApp::CreateDebugUI()
     preview_buffer_combo.AddItem("Local Indirect (Final Input)", static_cast<uint64_t>(DebugPreviewMode::LocalIndirectFinalInput));
     preview_buffer_combo.AddItem("Local AO", static_cast<uint64_t>(DebugPreviewMode::LocalAO));
     preview_buffer_combo.AddItem("Local Probe Specular", static_cast<uint64_t>(DebugPreviewMode::LocalSpecularIndirect));
+    preview_buffer_combo.AddItem("Local Specular Formal (Pre-AO)", static_cast<uint64_t>(DebugPreviewMode::LocalSpecularIndirectPreAO));
     preview_buffer_combo.AddItem("Local Probe Cubemap", static_cast<uint64_t>(DebugPreviewMode::LocalReflectionProbe));
-    preview_buffer_combo.AddItem("Local Shadow Map (atlas only)", static_cast<uint64_t>(DebugPreviewMode::LocalShadowVisibility));
+    preview_buffer_combo.AddItem("Local Primary Visibility", static_cast<uint64_t>(DebugPreviewMode::LocalShadowVisibility));
     preview_buffer_combo.AddItem("Remote Indirect Diffuse", static_cast<uint64_t>(DebugPreviewMode::RemoteIndirectDiffuse));
     preview_buffer_combo.AddItem("Remote AO", static_cast<uint64_t>(DebugPreviewMode::RemoteAO));
     preview_buffer_combo.AddItem("Remote Specular Indirect", static_cast<uint64_t>(DebugPreviewMode::RemoteSpecularIndirect));

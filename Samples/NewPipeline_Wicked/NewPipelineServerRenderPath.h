@@ -42,6 +42,7 @@ private:
     void InitializeSceneIfNeeded();
     void ConfigureDDGI();
     void ApplyLatestControlPacket();
+    void RefreshAuthoritativeShadowIdentity() const;
     void ResetDDGI(DDGIResetReason reason);
     void LogDDGIStatusIfNeeded();
     void PublishRemotePayload(float dt);
@@ -105,6 +106,7 @@ private:
     uint32_t packed_layout_height = 0;
     mutable wi::graphics::Texture shadow_slice_texture;
     mutable wi::graphics::Texture local_ao_snapshot;
+    wi::graphics::Texture local_specular_indirect_pre_ao;
     DebugPreviewMode debug_preview_mode = DebugPreviewMode::Final;
     bool hardware_raytracing = false;
     float mock_publish_accumulator = 0.0f;
@@ -126,6 +128,9 @@ private:
     bool mock_remote_disabled_logged = false;
     mutable bool debug_preview_invalid_logged = false;
     mutable uint32_t authoritative_shadow_index = std::numeric_limits<uint32_t>::max();
+    mutable uint64_t authoritative_shadow_light_id = 0;
+    mutable uint32_t authoritative_shadow_light_generation = 0;
+    mutable wi::ecs::Entity authoritative_shadow_light_entity = wi::ecs::INVALID_ENTITY;
     mutable bool shadow_snapshot_valid = false;
     std::thread publish_worker;
     std::mutex publish_mutex;

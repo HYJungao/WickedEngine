@@ -11,7 +11,7 @@ int main(int argc, char* argv[])
         if (std::string{argv[i]} == "--transport_selftest")
         {
             std::string error;
-            return wicked_newpipeline::ValidateRemoteVideoV2RoundTrip(&error) ? 0 : 1;
+            return wicked_newpipeline::ValidateRemoteTransportSelfTest(&error) ? 0 : 1;
         }
     }
     wi::arguments::Parse(argc, argv);

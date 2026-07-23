@@ -55,19 +55,26 @@ inline void ApplyLighting(in Surface surface, in Lighting lighting, inout half4 
 }
 
 //#define CASCADE_DITHERING
-inline void light_directional(in ShaderEntity light, in Surface surface, inout Lighting lighting, in half shadow_mask = 1)
+inline half light_directional_with_visibility(
+	in ShaderEntity light,
+	in Surface surface,
+	inout Lighting lighting,
+	in half shadow_mask = 1,
+	in bool resolve_visibility_independent_of_brdf = false)
 {
-	if (shadow_mask <= 0.001)
-		return; // shadow mask zero
+	half light_visibility = shadow_mask;
 	if ((light.layerMask & surface.layerMask) == 0)
-		return; // layer mismatch
+		return 1; // layer mismatch is not occlusion
+	if (shadow_mask <= 0.001)
+		return 0; // shadow mask zero
 		
 	half3 L = light.GetDirection();
 	SurfaceToLight surface_to_light;
 	surface_to_light.create(surface, L);
 
-	if (!any(surface_to_light.NdotL_sss))
-		return; // facing away from light
+	const bool contributes_to_brdf = any(surface_to_light.NdotL_sss);
+	if (!contributes_to_brdf && !resolve_visibility_independent_of_brdf)
+		return 1; // N.L is deliberately excluded from visibility
 		
 	half3 light_color = light.GetColor().rgb * shadow_mask;
 
@@ -76,7 +83,9 @@ inline void light_directional(in ShaderEntity light, in Surface surface, inout L
 	{
 		if (GetFrame().options & OPTION_BIT_VOLUMETRICCLOUDS_CAST_SHADOW)
 		{
-			light_color *= shadow_2D_volumetricclouds(surface.P);
+			const half3 cloud_shadow = shadow_2D_volumetricclouds(surface.P);
+			light_color *= cloud_shadow;
+			light_visibility *= cloud_shadow.r;
 		}
 
 #if defined(SHADOW_MASK_ENABLED) && !defined(TRANSPARENT)
@@ -124,12 +133,18 @@ inline void light_directional(in ShaderEntity light, in Surface surface, inout L
 				}
 
 				light_color *= shadow;
+				light_visibility *= shadow.r;
 			}
 		}
 		
 		if (!any(light_color))
-			return; // light color lost after shadow
+			return light_visibility; // light color lost after shadow
 	}
+
+	// A formal visibility request must still resolve the shadow map on a
+	// back-facing surface. N.L controls direct lighting, not occlusion.
+	if (!contributes_to_brdf)
+		return saturate(light_visibility);
 
 	[branch]
 	if (GetFrame().options & OPTION_BIT_REALISTIC_SKY)
@@ -144,7 +159,12 @@ inline void light_directional(in ShaderEntity light, in Surface surface, inout L
 	const half scattering = ComputeScattering(saturate(dot(L, -surface.V)));
 	lighting.indirect.specular += scattering * light_color * (1 - surface.extinction) * (1 - sqr(1 - saturate(1 - surface.N.y)));
 #endif // LIGHTING_SCATTER
-		
+	return saturate(light_visibility);
+}
+
+inline void light_directional(in ShaderEntity light, in Surface surface, inout Lighting lighting, in half shadow_mask = 1)
+{
+	light_directional_with_visibility(light, surface, lighting, shadow_mask, false);
 }
 
 inline half attenuation_pointlight(in half dist2, in half range, in half range2_rcp)

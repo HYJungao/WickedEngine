@@ -17,8 +17,8 @@ int main(int argc, char* argv[])
         if (std::string{argv[i]} == "--transport_selftest")
         {
             std::string error;
-            const bool passed = wicked_newpipeline::ValidateRemoteVideoV2RoundTrip(&error);
-            fprintf(stderr, "%s\n", passed ? "Remote video V2 self-test passed" : error.c_str());
+            const bool passed = wicked_newpipeline::ValidateRemoteTransportSelfTest(&error);
+            fprintf(stderr, "%s\n", passed ? "Remote transport V2+V3 self-test passed" : error.c_str());
             return passed ? 0 : 1;
         }
     }

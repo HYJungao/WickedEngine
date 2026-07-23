@@ -449,6 +449,9 @@ namespace wi::renderer
 		wi::graphics::Texture texture_normal_roughness;
 		const wi::graphics::Texture* texture_local_indirect_diffuse = nullptr; // optional local Final GI input before remote blending (RGB includes PI)
 		const wi::graphics::Texture* texture_specular_indirect = nullptr; // optional final indirect-specular contribution for debugging
+		const wi::graphics::Texture* texture_specular_indirect_pre_ao = nullptr; // optional formal indirect specular before surface occlusion
+		const wi::graphics::Texture* texture_primary_light_visibility = nullptr; // optional scalar visibility for primary_light_shadow_index
+		int primary_light_shadow_index = -1; // per-frame Scene::lights index resolved from persistent identity
 		// Optional elastic-rendering inputs. These are screen-space results from
 		// another view; Visibility_Shade reprojects the current world-space
 		// surface into remote_view_projection before sampling them.
@@ -476,6 +479,9 @@ namespace wi::renderer
 			texture_normal_roughness = {};
 			texture_local_indirect_diffuse = nullptr;
 			texture_specular_indirect = nullptr;
+			texture_specular_indirect_pre_ao = nullptr;
+			texture_primary_light_visibility = nullptr;
+			primary_light_shadow_index = -1;
 			texture_remote_indirect_diffuse = nullptr;
 			texture_remote_ao = nullptr;
 			remote_indirect_diffuse_weight = 0;
