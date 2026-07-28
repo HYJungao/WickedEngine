@@ -69,7 +69,9 @@ void NewPipelineClientApp::CreateDebugUI()
     preview_buffer_combo.AddItem("Remote Shadow Visibility", static_cast<uint64_t>(DebugPreviewMode::RemoteShadowVisibility));
     preview_buffer_combo.AddItem("Elastic GI (Final Input)", static_cast<uint64_t>(DebugPreviewMode::ElasticIndirectDiffuse));
     preview_buffer_combo.AddItem("Elastic AO (Final Input)", static_cast<uint64_t>(DebugPreviewMode::ElasticAO));
-    preview_buffer_combo.AddItem("Remote 2x2 Overview", static_cast<uint64_t>(DebugPreviewMode::RemoteOverview));
+    preview_buffer_combo.AddItem("Elastic Specular (Pre-AO)", static_cast<uint64_t>(DebugPreviewMode::ElasticSpecularIndirectPreAO));
+    preview_buffer_combo.AddItem("Elastic Primary Visibility", static_cast<uint64_t>(DebugPreviewMode::ElasticPrimaryLightVisibility));
+    preview_buffer_combo.AddItem("Remote Atlas Overview", static_cast<uint64_t>(DebugPreviewMode::RemoteOverview));
     preview_buffer_combo.SetSelectedByUserdataWithoutCallback(static_cast<uint64_t>(render_path.GetDebugPreviewMode()));
     preview_buffer_combo.OnSelect([this](const wi::gui::EventArgs& args) {
         render_path.SetDebugPreviewMode(static_cast<DebugPreviewMode>(args.userdata));
@@ -204,10 +206,10 @@ void NewPipelineClientApp::CreateDebugUI()
     debug_window.AddWidget(&reflection_probe_progress_label);
 
     elastic_lighting_window.Create(
-        "Elastic GI / AO",
+        "Elastic Remote Lighting",
         wi::gui::Window::WindowControls::MOVE | wi::gui::Window::WindowControls::COLLAPSE);
     elastic_lighting_window.SetPos(XMFLOAT2(375.0f, 80.0f));
-    elastic_lighting_window.SetSize(XMFLOAT2(340.0f, 190.0f));
+    elastic_lighting_window.SetSize(XMFLOAT2(340.0f, 310.0f));
 
     remote_gi_checkbox.Create("Remote DDGI: ");
     remote_gi_checkbox.SetPos(XMFLOAT2(150.0f, 10.0f));
@@ -253,10 +255,70 @@ void NewPipelineClientApp::CreateDebugUI()
     });
     elastic_lighting_window.AddWidget(&remote_ao_weight_slider);
 
+    remote_specular_checkbox.Create("Remote Specular: ");
+    remote_specular_checkbox.SetPos(XMFLOAT2(150.0f, 126.0f));
+    remote_specular_checkbox.SetSize(XMFLOAT2(18.0f, 18.0f));
+    remote_specular_checkbox.SetCheck(
+        initial_render_settings.remote_specular_enabled);
+    remote_specular_checkbox.OnClick(
+        [this](const wi::gui::EventArgs& args) {
+            NewPipelineClientRenderSettings settings =
+                render_path.GetRenderSettings();
+            settings.remote_specular_enabled = args.bValue;
+            render_path.SetRenderSettings(settings);
+        });
+    elastic_lighting_window.AddWidget(&remote_specular_checkbox);
+
+    remote_specular_weight_slider.Create(
+        0.0f, 1.0f,
+        initial_render_settings.remote_specular_max_weight,
+        100.0f, "Spec Remote Max: ");
+    remote_specular_weight_slider.SetPos(XMFLOAT2(150.0f, 154.0f));
+    remote_specular_weight_slider.SetSize(XMFLOAT2(150.0f, 18.0f));
+    remote_specular_weight_slider.valueInputField.SetFloatPrecision(2);
+    remote_specular_weight_slider.OnSlide(
+        [this](const wi::gui::EventArgs& args) {
+            NewPipelineClientRenderSettings settings =
+                render_path.GetRenderSettings();
+            settings.remote_specular_max_weight = args.fValue;
+            render_path.SetRenderSettings(settings);
+        });
+    elastic_lighting_window.AddWidget(&remote_specular_weight_slider);
+
+    remote_shadow_checkbox.Create("Remote Primary Shadow: ");
+    remote_shadow_checkbox.SetPos(XMFLOAT2(150.0f, 184.0f));
+    remote_shadow_checkbox.SetSize(XMFLOAT2(18.0f, 18.0f));
+    remote_shadow_checkbox.SetCheck(
+        initial_render_settings.remote_shadow_enabled);
+    remote_shadow_checkbox.OnClick(
+        [this](const wi::gui::EventArgs& args) {
+            NewPipelineClientRenderSettings settings =
+                render_path.GetRenderSettings();
+            settings.remote_shadow_enabled = args.bValue;
+            render_path.SetRenderSettings(settings);
+        });
+    elastic_lighting_window.AddWidget(&remote_shadow_checkbox);
+
+    remote_shadow_weight_slider.Create(
+        0.0f, 1.0f,
+        initial_render_settings.remote_shadow_max_weight,
+        100.0f, "Shadow Remote Max: ");
+    remote_shadow_weight_slider.SetPos(XMFLOAT2(150.0f, 212.0f));
+    remote_shadow_weight_slider.SetSize(XMFLOAT2(150.0f, 18.0f));
+    remote_shadow_weight_slider.valueInputField.SetFloatPrecision(2);
+    remote_shadow_weight_slider.OnSlide(
+        [this](const wi::gui::EventArgs& args) {
+            NewPipelineClientRenderSettings settings =
+                render_path.GetRenderSettings();
+            settings.remote_shadow_max_weight = args.fValue;
+            render_path.SetRenderSettings(settings);
+        });
+    elastic_lighting_window.AddWidget(&remote_shadow_weight_slider);
+
     elastic_lighting_status_label.Create("Elastic Lighting Status");
     elastic_lighting_status_label.SetText(render_path.GetElasticLightingStatus());
-    elastic_lighting_status_label.SetPos(XMFLOAT2(10.0f, 126.0f));
-    elastic_lighting_status_label.SetSize(XMFLOAT2(310.0f, 45.0f));
+    elastic_lighting_status_label.SetPos(XMFLOAT2(10.0f, 242.0f));
+    elastic_lighting_status_label.SetSize(XMFLOAT2(310.0f, 55.0f));
     elastic_lighting_window.AddWidget(&elastic_lighting_status_label);
 
     render_path.GetGUI().AddWidget(&debug_window);

@@ -19,8 +19,12 @@ struct NewPipelineClientRenderSettings
     bool lightmap_bake_requested = false;
     bool remote_gi_enabled = true;
     bool remote_ao_enabled = true;
+    bool remote_specular_enabled = true;
+    bool remote_shadow_enabled = true;
     float remote_gi_max_weight = 1.0f;
     float remote_ao_max_weight = 1.0f;
+    float remote_specular_max_weight = 1.0f;
+    float remote_shadow_max_weight = 1.0f;
 };
 
 struct RemoteConsumeState
@@ -34,7 +38,7 @@ struct RemoteConsumeState
     uint32_t height = 0;
     float confidence = 0.0f;
     float stale_timer = 0.0f;
-    std::string fallback_reason = "no remote frame";
+    std::string invalid_reason = "no remote frame";
     bool accepted_valid = false;
     bool history_valid = false;
     bool placeholder = false;
@@ -93,11 +97,9 @@ private:
     bool ValidateRemoteFrame(const RemoteRawFrame& frame, std::string& reason) const;
     bool ValidateRemoteVideoLayout(const RemoteVideoFrameLayout& layout, std::string& reason) const;
     bool IsControlPacketChanged(const ClientControlPacket& packet) const;
-    void AcceptRemoteFrame(const RemoteRawFrame& frame);
     void AcceptRemoteVideoFrame(const RetainedI420Frame& frame, const RemoteVideoFrameLayout& layout);
     void CommitAcceptedRemoteMetadata(const RemoteFrameMetadata& metadata);
     void InvalidateRemote(const std::string& reason);
-    bool UploadRemoteTextures(const RemoteRawFrame& frame);
     bool UploadRemoteVideoTextures(const RetainedI420Frame& frame, const RemoteVideoFrameLayout& layout);
     const wi::graphics::Texture* GetDebugPreviewTexture() const;
     void DrawUnavailablePreview(wi::graphics::CommandList cmd) const;
@@ -107,6 +109,9 @@ private:
     void ApplySSAOSettings(bool log_changes);
     void UpdateElasticLighting(float dt);
     void ApplyElasticLightingResources();
+    void ResetRemoteGBufferHistory();
+    void AdvanceSceneGeneration(const char* reason);
+    void CaptureRemoteGBufferHistory(wi::graphics::CommandList cmd) const;
     void ApplyEnvironmentProbeSettings(bool log_changes);
     void LoadStaticLightingAssets();
     void LoadEnvironmentProbeAsset();
@@ -229,6 +234,9 @@ private:
     uint32_t accepted_remote_buffer_mask = 0;
     uint64_t remote_texture_creation_count = 0;
     uint64_t remote_gpu_upload_bytes = 0;
+    float transport_telemetry_window_seconds = 0.0f;
+    uint64_t transport_telemetry_previous_bytes = 0;
+    uint64_t transport_bitrate_bps = 0;
     WebRTCTransportState previous_webrtc_state = WebRTCTransportState::Disabled;
     std::deque<RemoteVideoFrameLayout> downstream_metadata_cache;
     bool downstream_metadata_active = false;
@@ -238,7 +246,34 @@ private:
     uint64_t downstream_metadata_first_matches = 0;
     uint64_t downstream_video_first_matches = 0;
     uint64_t downstream_pair_expirations = 0;
+    uint64_t downstream_out_of_order_drops = 0;
+    uint64_t downstream_stale_status_drops = 0;
     RemoteFrameMetadata accepted_remote_metadata;
+    RemoteFrameContractV3 accepted_remote_contract_v3;
+    uint64_t accepted_remote_source_control_frame_id = 0;
+    bool accepted_remote_contract_v3_valid = false;
+    RemoteStreamSelection negotiated_stream_selection = {};
+    uint64_t negotiated_stream_control_frame_id = 0;
+    bool negotiated_stream_selection_valid = false;
+    static constexpr size_t kRemoteGBufferHistoryCapacity = 12;
+    struct RemoteGBufferHistoryEntry
+    {
+        wi::graphics::Texture depth;
+        wi::graphics::Texture normal_roughness;
+        XMFLOAT4X4 view_projection = wi::math::IDENTITY_MATRIX;
+        XMFLOAT3 view_origin = {};
+        uint64_t control_frame_id = 0;
+        uint64_t lighting_fingerprint = 0;
+        uint32_t scene_generation = 0;
+        float near_plane = 0.1f;
+        float far_plane = 1000.0f;
+        bool valid = false;
+    };
+    mutable std::array<RemoteGBufferHistoryEntry, kRemoteGBufferHistoryCapacity>
+        remote_gbuffer_history;
+    mutable size_t remote_gbuffer_history_active_capacity = 0;
+    mutable size_t remote_gbuffer_history_write_index = 0;
+    mutable uint64_t remote_gbuffer_history_last_capture = 0;
     wi::ecs::Entity environment_probe_entity = wi::ecs::INVALID_ENTITY;
     bool environment_probe_created_by_client = false;
     bool environment_probe_load_attempted = false;
@@ -268,9 +303,15 @@ private:
     wi::graphics::Texture local_primary_light_visibility;
     wi::graphics::Texture elastic_indirect_diffuse;
     wi::graphics::Texture elastic_ao;
+    wi::graphics::Texture elastic_specular_indirect_pre_ao;
+    wi::graphics::Texture elastic_primary_light_visibility;
     float elastic_remote_gi_weight = 0.0f;
     float elastic_remote_ao_weight = 0.0f;
+    float elastic_remote_specular_weight = 0.0f;
+    float elastic_remote_shadow_weight = 0.0f;
     float elastic_remote_quality = 0.0f;
+    wi::ecs::Entity primary_light_entity = wi::ecs::INVALID_ENTITY;
+    uint32_t primary_light_generation = 0;
     bool          status_logged = false;
     uint32_t remote_ddgi_frame_index = 0;
     DDGIResetReason remote_ddgi_reset_reason = DDGIResetReason::None;

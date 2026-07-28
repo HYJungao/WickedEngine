@@ -8666,8 +8666,14 @@ using namespace vulkan_internal;
 			desc->depth
 		);
 	}
-	void GraphicsDevice_Vulkan::PushConstants(const void* data, uint32_t size, CommandList cmd, uint32_t offset)
+	bool GraphicsDevice_Vulkan::PushConstants(
+		const void* data,
+		uint32_t size,
+		CommandList cmd,
+		uint32_t offset,
+		bool require_exact_capacity)
 	{
+		(void)require_exact_capacity;
 		CommandList_Vulkan& commandlist = GetCommandList(cmd);
 		assert(commandlist.layout.pipeline_layout != VK_NULL_HANDLE); // No pipeline was set!
 
@@ -8679,6 +8685,7 @@ using namespace vulkan_internal;
 			size,
 			data
 		);
+		return true;
 	}
 	void GraphicsDevice_Vulkan::PredicationBegin(const GPUBuffer* buffer, uint64_t offset, PredicationOp op, CommandList cmd)
 	{

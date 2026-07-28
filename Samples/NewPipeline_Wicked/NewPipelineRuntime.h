@@ -127,6 +127,8 @@ enum class DebugPreviewMode : uint8_t
     RemoteShadowVisibility,
     ElasticIndirectDiffuse,
     ElasticAO,
+    ElasticSpecularIndirectPreAO,
+    ElasticPrimaryLightVisibility,
     RemoteOverview,
     TransportIndirectDiffuse,
     TransportAO,
@@ -188,6 +190,7 @@ struct RuntimeConfig
     RemoteDebugMode         remote_debug_mode = RemoteDebugMode::Local;
     std::string             signaling_url = "ws://127.0.0.1:39876";
     std::string             room_id = "NewPipeline.Wicked.V1";
+    RemoteQualityTierV3     remote_quality_tier = RemoteQualityTierV3::High;
     bool                    use_internet_ice = false;
     std::vector<std::string> parse_warnings;
 };
@@ -233,6 +236,7 @@ const char* ToString(RemoteDynamicRange range);
 const char* ToString(RemoteDebugMode mode);
 const char* ToString(DebugPreviewMode mode);
 const char* ToString(RemoteBufferEncoding encoding);
+const char* ToString(RemoteQualityTierV3 tier);
 const char* ToString(DDGIResetReason reason);
 
 RemoteSourceMode ParseRemoteSourceMode(const std::string& value, RemoteSourceMode fallback);

@@ -10,8 +10,13 @@ struct I420AtlasPackPush
     uint uv_stride;
     uint u_offset;
     uint v_offset;
+    // Keep this 48-byte prefix compatible with already deployed pack shaders.
+    // Current shaders also verify the explicit ABI tail before writing output.
     uint available_mask;
-    uint4 tile_rects[4];
+    uint tile_padding;
+    uint abi_version;
+    uint struct_size;
+    uint padding;
 };
 
 #endif // WI_SHADERINTEROP_I420_H

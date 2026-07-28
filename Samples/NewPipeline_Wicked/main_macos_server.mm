@@ -3,6 +3,10 @@
 
 #import <AppKit/AppKit.h>
 #include <Carbon/Carbon.h>
+#include <filesystem>
+
+#include "wiHelper.h"
+#include "wiRenderer.h"
 
 wicked_newpipeline::NewPipelineServerApp application;
 bool running = true;
@@ -24,6 +28,12 @@ int main(int argc, char* argv[])
     }
     @autoreleasepool
     {
+        const std::filesystem::path bundled_shader_source =
+            std::filesystem::path(wi::helper::GetCurrentPath()) /
+            ".." / "WickedEngine" / "shaders";
+        wi::renderer::SetShaderSourcePath(
+            bundled_shader_source.lexically_normal().generic_string() + "/");
+
         wi::arguments::Parse(argc, argv);
         application.ConfigureFromCommandLine(argc, argv);
 

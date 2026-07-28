@@ -50,6 +50,8 @@ wi::ecs::Entity ResolveStableLightId(const wi::scene::Scene& scene, uint64_t sta
 uint32_t ResolveStableDirectionalLightShadowIndex(
     const wi::scene::Scene& scene, uint64_t stable_light_id);
 uint64_t GetNewPipelineSunStableId(const wi::scene::Scene& scene);
+uint32_t ComputeStableLightGeneration(
+    const wi::scene::Scene& scene, uint64_t stable_light_id);
 NewPipelineSunState MakeSunStateFromAngles(bool enabled, float yaw_degrees, float pitch_degrees);
 SceneInitializationResult InitializeDefaultScene(wi::scene::Scene& scene);
 SceneParityFingerprint ComputeSceneParityFingerprint(const wi::scene::Scene& scene);

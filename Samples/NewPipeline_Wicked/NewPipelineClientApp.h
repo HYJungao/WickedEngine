@@ -47,6 +47,10 @@ private:
     wi::gui::Slider              remote_gi_weight_slider;
     wi::gui::CheckBox            remote_ao_checkbox;
     wi::gui::Slider              remote_ao_weight_slider;
+    wi::gui::CheckBox            remote_specular_checkbox;
+    wi::gui::Slider              remote_specular_weight_slider;
+    wi::gui::CheckBox            remote_shadow_checkbox;
+    wi::gui::Slider              remote_shadow_weight_slider;
     wi::gui::Label               elastic_lighting_status_label;
     bool                         configured = false;
     bool                         debug_ui_created = false;

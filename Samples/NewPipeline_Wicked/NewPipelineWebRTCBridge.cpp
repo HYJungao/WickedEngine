@@ -78,6 +78,59 @@ constexpr int kBufferVideoMinBitrateBps = 20'000'000;
 constexpr int kBufferVideoMaxBitrateBps = 120'000'000;
 constexpr double kBufferVideoMaxFramerate = 30.0;
 
+class RetainedI420Buffer : public webrtc::I420BufferInterface
+{
+public:
+    RetainedI420Buffer(
+        int width,
+        int height,
+        const uint8_t* y_plane,
+        int y_stride,
+        const uint8_t* u_plane,
+        int u_stride,
+        const uint8_t* v_plane,
+        int v_stride,
+        std::function<void()> release)
+        : width_(width)
+        , height_(height)
+        , y_plane_(y_plane)
+        , y_stride_(y_stride)
+        , u_plane_(u_plane)
+        , u_stride_(u_stride)
+        , v_plane_(v_plane)
+        , v_stride_(v_stride)
+        , release_(std::move(release))
+    {
+    }
+
+    int width() const override { return width_; }
+    int height() const override { return height_; }
+    const uint8_t* DataY() const override { return y_plane_; }
+    const uint8_t* DataU() const override { return u_plane_; }
+    const uint8_t* DataV() const override { return v_plane_; }
+    int StrideY() const override { return y_stride_; }
+    int StrideU() const override { return u_stride_; }
+    int StrideV() const override { return v_stride_; }
+
+protected:
+    ~RetainedI420Buffer() override
+    {
+        if (release_)
+            release_();
+    }
+
+private:
+    int width_ = 0;
+    int height_ = 0;
+    const uint8_t* y_plane_ = nullptr;
+    int y_stride_ = 0;
+    const uint8_t* u_plane_ = nullptr;
+    int u_stride_ = 0;
+    const uint8_t* v_plane_ = nullptr;
+    int v_stride_ = 0;
+    std::function<void()> release_;
+};
+
 std::vector<std::string> SplitTokens(const std::string& value, char delimiter)
 {
     std::vector<std::string> tokens;
@@ -796,7 +849,7 @@ public:
             release_once();
             return false;
         }
-        auto buffer = webrtc::WrapI420Buffer(
+        auto buffer = webrtc::make_ref_counted<RetainedI420Buffer>(
             static_cast<int>(width),
             static_cast<int>(height),
             y_plane,

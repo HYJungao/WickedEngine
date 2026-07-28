@@ -941,7 +941,10 @@
     <FxCompile Include="$(MSBuildThisFileDirectory)yuv_to_rgb_regionCS.hlsl">
       <Filter>CS</Filter>
     </FxCompile>
-    <FxCompile Include="$(MSBuildThisFileDirectory)rgb_to_i420_atlasCS.hlsl">
+    <FxCompile Include="$(MSBuildThisFileDirectory)rgb_to_i420_atlas_v1CS.hlsl">
+      <Filter>CS</Filter>
+    </FxCompile>
+    <FxCompile Include="$(MSBuildThisFileDirectory)lighting_downsample_jointCS.hlsl">
       <Filter>CS</Filter>
     </FxCompile>
     <ClInclude Include="$(MSBuildThisFileDirectory)ShaderInterop_I420.h">

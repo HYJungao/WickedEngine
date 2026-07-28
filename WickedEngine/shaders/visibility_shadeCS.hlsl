@@ -32,10 +32,6 @@ struct VisibilityPushConstants
 	int local_indirect_diffuse_uav;
 	int elastic_indirect_diffuse_uav;
 	int elastic_ao_uav;
-	int remote_indirect_diffuse_texture;
-	int remote_ao_texture;
-	float remote_indirect_diffuse_weight;
-	float remote_ao_weight;
 };
 PUSHCONSTANT(push, VisibilityPushConstants);
 
@@ -43,6 +39,149 @@ StructuredBuffer<VisibilityTile> binned_tiles : register(t0);
 StructuredBuffer<PrimitiveVisibilityTile> primitive_binned_tiles : register(t1);
 
 RWTexture2D<float4> output : register(u0);
+
+inline bool external_project_surface(
+	in Surface surface,
+	out float2 remote_uv,
+	out float expected_linear_depth)
+{
+	remote_uv = 0;
+	expected_linear_depth = 0;
+	if (external_history_depth_texture < 0 ||
+		external_history_normal_roughness_texture < 0)
+		return false;
+
+	const float4 remote_clip = mul(external_view_projection, float4(surface.P, 1));
+	if (remote_clip.w <= 0)
+		return false;
+	const float3 remote_ndc = remote_clip.xyz / remote_clip.w;
+	remote_uv = clipspace_to_uv(remote_ndc.xy);
+	if (any(remote_uv < 0) || any(remote_uv > 1))
+		return false;
+	expected_linear_depth = compute_lineardepth(
+		remote_ndc.z,
+		external_reprojection_params.x,
+		external_reprojection_params.y);
+	return isfinite(expected_linear_depth) && expected_linear_depth > 0;
+}
+
+inline half4 sample_external_joint(
+	int texture_index,
+	float2 remote_uv,
+	float expected_linear_depth,
+	half3 current_normal,
+	half current_roughness,
+	float3 current_position,
+	out bool valid)
+{
+	valid = false;
+	if (texture_index < 0)
+		return 0;
+	if (texture_index == external_specular_texture)
+	{
+		const float3 current_view_delta =
+			GetCamera().position - current_position;
+		const float3 remote_view_delta =
+			external_remote_view_origin.xyz - current_position;
+		const float current_view_length_sq =
+			dot(current_view_delta, current_view_delta);
+		const float remote_view_length_sq =
+			dot(remote_view_delta, remote_view_delta);
+		if (current_view_length_sq < 1e-8 ||
+			remote_view_length_sq < 1e-8)
+			return 0;
+		const float3 current_view = current_view_delta *
+			rsqrt(current_view_length_sq);
+		const float3 remote_view = remote_view_delta *
+			rsqrt(remote_view_length_sq);
+		if (dot(current_view, remote_view) <
+			external_remote_view_origin.w)
+			return 0;
+	}
+
+	Texture2D<half4> remote_texture =
+		bindless_textures_half4[descriptor_index(texture_index)];
+	Texture2D<float> history_depth =
+		bindless_textures_float[descriptor_index(external_history_depth_texture)];
+	Texture2D<half4> history_normal_roughness =
+		bindless_textures_half4[descriptor_index(external_history_normal_roughness_texture)];
+
+	uint remote_width = 0;
+	uint remote_height = 0;
+	remote_texture.GetDimensions(remote_width, remote_height);
+	if (remote_width == 0 || remote_height == 0)
+		return 0;
+
+	const float2 remote_size = float2(remote_width, remote_height);
+	const float2 texel_position = remote_uv * remote_size - 0.5;
+	const int2 base_coord = int2(floor(texel_position));
+	const float2 fraction = frac(texel_position);
+	half4 accumulated = 0;
+	float weight_sum = 0;
+
+	[unroll]
+	for (int y = 0; y < 2; ++y)
+	{
+		[unroll]
+		for (int x = 0; x < 2; ++x)
+		{
+			const int2 coord = clamp(
+				base_coord + int2(x, y),
+				int2(0, 0),
+				int2(remote_width - 1, remote_height - 1));
+			const float2 sample_uv = (float2(coord) + 0.5) / remote_size;
+			const float stored_linear_depth = compute_lineardepth(
+				history_depth.SampleLevel(sampler_point_clamp, sample_uv, 0),
+				external_reprojection_params.x,
+				external_reprojection_params.y);
+			const half4 stored_normal_roughness =
+				history_normal_roughness.SampleLevel(
+					sampler_point_clamp, sample_uv, 0);
+			const half3 stored_normal =
+				decode_normal(stored_normal_roughness.rg);
+			const float relative_depth_delta =
+				abs(stored_linear_depth - expected_linear_depth) /
+				max(0.01, expected_linear_depth);
+			const float normal_dot = dot(current_normal, stored_normal);
+			const bool view_sensitive =
+				texture_index == external_specular_texture ||
+				texture_index == external_primary_visibility_texture;
+			const bool specular_sensitive =
+				texture_index == external_specular_texture;
+			const float roughness_delta =
+				abs(stored_normal_roughness.b -
+					current_roughness);
+			const float depth_threshold = view_sensitive
+				? external_reprojection_params.z * 0.5
+				: external_reprojection_params.z;
+			const float normal_threshold = view_sensitive
+				? max(0.9, external_reprojection_params.w)
+				: external_reprojection_params.w;
+			if (relative_depth_delta > depth_threshold ||
+				normal_dot < normal_threshold ||
+				(specular_sensitive &&
+					roughness_delta > 0.25))
+				continue;
+
+			const float2 bilinear_axis = float2(
+				x == 0 ? 1 - fraction.x : fraction.x,
+				y == 0 ? 1 - fraction.y : fraction.y);
+			const float spatial_weight = bilinear_axis.x * bilinear_axis.y;
+			const float geometry_weight =
+				exp2(-64.0 * relative_depth_delta) *
+				pow(saturate(normal_dot), 16.0) *
+				(specular_sensitive
+					? exp2(-8.0 * roughness_delta)
+					: 1.0);
+			const float weight = spatial_weight * geometry_weight;
+			accumulated += remote_texture.Load(int3(coord, 0)) * weight;
+			weight_sum += weight;
+		}
+	}
+
+	valid = weight_sum > 1e-4;
+	return valid ? accumulated / weight_sum : 0;
+}
 
 [numthreads(VISIBILITY_BLOCKSIZE * VISIBILITY_BLOCKSIZE, 1, 1)]
 void main(uint Gid : SV_GroupID, uint groupIndex : SV_GroupIndex)
@@ -106,50 +245,73 @@ void main(uint Gid : SV_GroupID, uint groupIndex : SV_GroupIndex)
 		output_local_indirect_diffuse[pixel] = float4(max(0, surface.gi * PI), 1);
 	}
 
-	// Remote DDGI and RTAO are generated in the Server frame's screen space.
-	// Reproject this frame's world-space surface into that view instead of
-	// sampling with the current screen UV. A source-depth companion is not part
-	// of the V2 transport yet, so this validates projected viewport coverage but cannot
-	// reject every old-view disocclusion.
+	// Remote lighting is generated in the Server frame's screen space. Match
+	// source_control_frame_id to the Client's bounded GBuffer history before
+	// binding this block; then use that history for depth/normal rejection and
+	// joint upscale at each semantic's negotiated resolution.
 	float2 remote_uv = 0;
-	bool remote_reprojection_valid = false;
+	float expected_remote_depth = 0;
+	bool remote_projection_valid = false;
 	[branch]
-	if ((push.remote_indirect_diffuse_texture >= 0 && push.remote_indirect_diffuse_weight > 0) ||
-		(push.remote_ao_texture >= 0 && push.remote_ao_weight > 0))
+	if (any(external_weights > 0))
 	{
-		const float4 world_position = float4(surface.P, 1);
-		// The remote view-projection is bound through MiscCB. Keep the push
-		// constants within the default DX12 root signature's 12 DWORD limit.
-		const float4 remote_clip = mul(g_xTransform, world_position);
-		if (remote_clip.w > 0)
-		{
-			const float2 remote_ndc = remote_clip.xy / remote_clip.w;
-			remote_uv = clipspace_to_uv(remote_ndc);
-			remote_reprojection_valid = all(remote_uv >= 0) && all(remote_uv <= 1);
-		}
+		remote_projection_valid = external_project_surface(
+			surface, remote_uv, expected_remote_depth);
 	}
 
 	half3 elastic_indirect_diffuse = surface.gi;
 	[branch]
-	if (remote_reprojection_valid && push.remote_indirect_diffuse_texture >= 0 &&
-		push.remote_indirect_diffuse_weight > 0)
+	if (remote_projection_valid && external_diffuse_texture >= 0 &&
+		external_weights.x > 0)
 	{
-		Texture2D<half4> remote_indirect_diffuse =
-			bindless_textures_half4[descriptor_index(push.remote_indirect_diffuse_texture)];
+		bool valid = false;
+		const half4 remote_indirect_diffuse = sample_external_joint(
+			external_diffuse_texture,
+			remote_uv,
+			expected_remote_depth,
+			surface.N,
+			surface.roughness,
+			surface.P,
+			valid);
 		// RemoteIndirectDiffuseFormal is irradiance (includes PI), while Wicked's
 		// internal diffuse GI term is stored after the Lambert PI divide.
-		half3 remote_gi = remote_indirect_diffuse.SampleLevel(sampler_linear_clamp, remote_uv, 0).rgb / PI;
-		elastic_indirect_diffuse = lerp(
-			elastic_indirect_diffuse,
-			remote_gi,
-			saturate(push.remote_indirect_diffuse_weight));
+		if (valid)
+		{
+			elastic_indirect_diffuse = lerp(
+				elastic_indirect_diffuse,
+				remote_indirect_diffuse.rgb / PI,
+				saturate(external_weights.x));
+		}
 	}
 
 	Lighting lighting;
 	lighting.create(0, 0, elastic_indirect_diffuse, 0);
 
+	half remote_primary_visibility = 1;
+	bool remote_primary_visibility_valid = false;
+	if (remote_projection_valid && external_primary_visibility_texture >= 0 &&
+		external_weights.w > 0)
+	{
+		remote_primary_visibility = sample_external_joint(
+			external_primary_visibility_texture,
+			remote_uv,
+			expected_remote_depth,
+			surface.N,
+			surface.roughness,
+			surface.P,
+			remote_primary_visibility_valid).r;
+	}
 	const half primary_light_visibility = TiledLightingWithPrimaryVisibility(
-		surface, lighting, entity_flat_tile_index, camera, push.primary_light_shadow_index);
+		surface,
+		lighting,
+		entity_flat_tile_index,
+		camera,
+		push.primary_light_shadow_index,
+		remote_primary_visibility,
+		remote_primary_visibility_valid ? external_weights.w : 0);
+	const half elastic_primary_light_visibility = remote_primary_visibility_valid
+		? lerp(primary_light_visibility, remote_primary_visibility, saturate(external_weights.w))
+		: primary_light_visibility;
 
 	half elastic_screen_ao = 1;
 #ifndef CARTOON
@@ -171,25 +333,59 @@ void main(uint Gid : SV_GroupID, uint groupIndex : SV_GroupIndex)
 			sampler_linear_clamp, surface.screenUV, 0).r;
 	}
 	[branch]
-	if (remote_reprojection_valid && push.remote_ao_texture >= 0 && push.remote_ao_weight > 0)
+	if (remote_projection_valid && external_ao_texture >= 0 && external_weights.y > 0)
 	{
-		Texture2D<half4> remote_ao = bindless_textures_half4[descriptor_index(push.remote_ao_texture)];
-		elastic_screen_ao = lerp(
-			elastic_screen_ao,
-			remote_ao.SampleLevel(sampler_linear_clamp, remote_uv, 0).r,
-			saturate(push.remote_ao_weight));
+		bool valid = false;
+		const half remote_ao = sample_external_joint(
+			external_ao_texture,
+			remote_uv,
+			expected_remote_depth,
+			surface.N,
+			surface.roughness,
+			surface.P,
+			valid).r;
+		if (valid)
+		{
+			elastic_screen_ao = lerp(
+				elastic_screen_ao,
+				remote_ao,
+				saturate(external_weights.y));
+		}
 	}
-	surface.occlusion *= elastic_screen_ao;
 #endif // CARTOON
 
-	// Formal V3 specular is captured after reflection/environment resolution.
-	// Only surface.occlusion changed above, so this remains strictly pre-AO.
+	const half3 local_specular_indirect_pre_ao = lighting.indirect.specular;
+	if (remote_projection_valid && external_specular_texture >= 0 &&
+		external_weights.z > 0)
+	{
+		bool valid = false;
+		const half3 remote_specular = sample_external_joint(
+			external_specular_texture,
+			remote_uv,
+			expected_remote_depth,
+			surface.N,
+			surface.roughness,
+			surface.P,
+			valid).rgb;
+		if (valid)
+		{
+			lighting.indirect.specular = lerp(
+				local_specular_indirect_pre_ao,
+				remote_specular,
+				saturate(external_weights.z));
+		}
+	}
+	surface.occlusion *= elastic_screen_ao;
+
+	// Formal V3 specular is captured after reflection/environment resolution
+	// and before screen/material occlusion or external blending.
 	[branch]
 	if (push.specular_indirect_pre_ao_uav >= 0)
 	{
 		RWTexture2D<float4> output_specular_indirect_pre_ao =
 			bindless_rwtextures[descriptor_index(push.specular_indirect_pre_ao_uav)];
-		output_specular_indirect_pre_ao[pixel] = float4(max(0, lighting.indirect.specular), 1);
+		output_specular_indirect_pre_ao[pixel] =
+			float4(max(0, local_specular_indirect_pre_ao), 1);
 	}
 	[branch]
 	if (push.primary_light_visibility_uav >= 0)
@@ -197,6 +393,21 @@ void main(uint Gid : SV_GroupID, uint groupIndex : SV_GroupIndex)
 		RWTexture2D<float4> output_primary_light_visibility =
 			bindless_rwtextures[descriptor_index(push.primary_light_visibility_uav)];
 		output_primary_light_visibility[pixel] = float4(saturate(primary_light_visibility).xxx, 1);
+	}
+	[branch]
+	if (external_elastic_specular_uav >= 0)
+	{
+		RWTexture2D<float4> output_elastic_specular =
+			bindless_rwtextures[descriptor_index(external_elastic_specular_uav)];
+		output_elastic_specular[pixel] = float4(max(0, lighting.indirect.specular), 1);
+	}
+	[branch]
+	if (external_elastic_primary_visibility_uav >= 0)
+	{
+		RWTexture2D<float4> output_elastic_primary_visibility =
+			bindless_rwtextures[descriptor_index(external_elastic_primary_visibility_uav)];
+		output_elastic_primary_visibility[pixel] =
+			float4(saturate(elastic_primary_light_visibility).xxx, 1);
 	}
 
 	[branch]
@@ -223,7 +434,8 @@ void main(uint Gid : SV_GroupID, uint groupIndex : SV_GroupIndex)
 	{
 		RWTexture2D<float4> output_specular_indirect =
 			bindless_rwtextures[descriptor_index(push.specular_indirect_uav)];
-		output_specular_indirect[pixel] = float4(max(0, lighting.indirect.specular * surface.occlusion), 1);
+		output_specular_indirect[pixel] =
+			float4(max(0, local_specular_indirect_pre_ao * surface.occlusion), 1);
 	}
 
 	half4 color = 0;

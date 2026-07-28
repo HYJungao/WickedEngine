@@ -4290,7 +4290,7 @@ using namespace metal_internal;
 					}
 				}
 			}
-			else if(src_internal->texture.get() != nullptr && dst_internal->buffer.get() != nullptr)
+			else if(src_internal->buffer.get() != nullptr && dst_internal->texture.get() != nullptr)
 			{
 				// Linear->texture copy:
 				const uint64_t data_begin = (uint64_t)srctex.mapped_subresources[0].data_ptr;
@@ -4546,12 +4546,27 @@ using namespace metal_internal;
 	{
 		// TODO
 	}
-	void GraphicsDevice_Metal::PushConstants(const void* data, uint32_t size, CommandList cmd, uint32_t offset)
+	bool GraphicsDevice_Metal::PushConstants(
+		const void* data,
+		uint32_t size,
+		CommandList cmd,
+		uint32_t offset,
+		bool require_exact_capacity)
 	{
-		assert(offset + size < sizeof(RootLayout::constants));
+		(void)require_exact_capacity;
+		if (offset > sizeof(RootLayout::constants) ||
+			size > sizeof(RootLayout::constants) - offset)
+		{
+			wi::backlog::post(
+				"GraphicsDevice_Metal::PushConstants rejected an out-of-range write",
+				wi::backlog::LogLevel::Error);
+			assert(0 && "Push constants exceed the Metal root layout");
+			return false;
+		}
 		CommandList_Metal& commandlist = GetCommandList(cmd);
 		std::memcpy((uint8_t*)commandlist.root.constants + offset, data, size);
 		commandlist.dirty_root = true;
+		return true;
 	}
 	void GraphicsDevice_Metal::PredicationBegin(const GPUBuffer* buffer, uint64_t offset, PredicationOp op, CommandList cmd)
 	{

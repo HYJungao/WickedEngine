@@ -7431,22 +7431,30 @@ std::mutex queue_locker;
 
 		commandlist.GetGraphicsCommandListLatest()->DispatchRays(&dispatchrays_desc);
 	}
-	void GraphicsDevice_DX12::PushConstants(const void* data, uint32_t size, CommandList cmd, uint32_t offset)
+	bool GraphicsDevice_DX12::PushConstants(
+		const void* data,
+		uint32_t size,
+		CommandList cmd,
+		uint32_t offset,
+		bool require_exact_capacity)
 	{
 		assert(size % sizeof(uint32_t) == 0);
 		assert(offset % sizeof(uint32_t) == 0);
 
-		auto validate_range = [size, offset](const D3D12_ROOT_PARAMETER1& param)
+		auto validate_range = [size, offset, require_exact_capacity](
+			const D3D12_ROOT_PARAMETER1& param)
 		{
 			const uint32_t capacity = param.Constants.Num32BitValues * uint32_t(sizeof(uint32_t));
-			if (offset > capacity || size > capacity - offset)
+			if (offset > capacity || size > capacity - offset ||
+				(require_exact_capacity && (offset != 0 || size != capacity)))
 			{
 				std::stringstream ss;
 				ss << "GraphicsDevice_DX12::PushConstants rejected "
 					<< size << " bytes at offset " << offset
-					<< " for a root-constant range of " << capacity << " bytes";
+					<< " for a root-constant range of " << capacity << " bytes"
+					<< (require_exact_capacity ? " (exact ABI required)" : "");
 				wi::backlog::post(ss.str(), wi::backlog::LogLevel::Error);
-				assert(0 && "Push constants exceed the active DX12 root signature");
+				assert(0 && "Push constants are incompatible with the active DX12 root signature");
 				return false;
 			}
 			return true;
@@ -7460,14 +7468,14 @@ std::mutex queue_locker;
 			const D3D12_ROOT_PARAMETER1& param = optimizer->rootsig_desc->Desc_1_1.pParameters[optimizer->PUSH];
 			assert(param.ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS);
 			if (!validate_range(param))
-				return;
+				return false;
 			commandlist.GetGraphicsCommandList()->SetGraphicsRoot32BitConstants(
 				optimizer->PUSH,
 				size / sizeof(uint32_t),
 				data,
 				offset / sizeof(uint32_t)
 			);
-			return;
+			return true;
 		}
 		if (commandlist.active_cs != nullptr)
 		{
@@ -7475,16 +7483,17 @@ std::mutex queue_locker;
 			const D3D12_ROOT_PARAMETER1& param = optimizer->rootsig_desc->Desc_1_1.pParameters[optimizer->PUSH];
 			assert(param.ParameterType == D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS);
 			if (!validate_range(param))
-				return;
+				return false;
 			commandlist.GetGraphicsCommandList()->SetComputeRoot32BitConstants(
 				optimizer->PUSH,
 				size / sizeof(uint32_t),
 				data,
 				offset / sizeof(uint32_t)
 			);
-			return;
+			return true;
 		}
 		assert(0); // there was no active pipeline!
+		return false;
 	}
 	void GraphicsDevice_DX12::PredicationBegin(const GPUBuffer* buffer, uint64_t offset, PredicationOp op, CommandList cmd)
 	{

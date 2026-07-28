@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
+#include <cstring>
 #include <limits>
 
 namespace wicked_newpipeline
@@ -32,6 +34,13 @@ void WriteU64(std::vector<uint8_t>& bytes, uint64_t value)
 {
     for (uint32_t shift = 0; shift < 64; shift += 8) bytes.push_back(static_cast<uint8_t>(value >> shift));
 }
+void WriteFloat(std::vector<uint8_t>& bytes, float value)
+{
+    uint32_t bits = 0;
+    static_assert(sizeof(bits) == sizeof(value));
+    std::memcpy(&bits, &value, sizeof(bits));
+    WriteU32(bytes, bits);
+}
 
 bool ReadU8(const uint8_t*& cursor, const uint8_t* end, uint8_t& value)
 {
@@ -58,6 +67,39 @@ bool ReadU64(const uint8_t*& cursor, const uint8_t* end, uint64_t& value)
     if (static_cast<size_t>(end - cursor) < 8) return false;
     value = 0;
     for (uint32_t shift = 0; shift < 64; shift += 8) value |= static_cast<uint64_t>(*cursor++) << shift;
+    return true;
+}
+bool ReadFloat(const uint8_t*& cursor, const uint8_t* end, float& value)
+{
+    uint32_t bits = 0;
+    if (!ReadU32(cursor, end, bits)) return false;
+    std::memcpy(&value, &bits, sizeof(value));
+    return std::isfinite(value);
+}
+
+void WriteFloat3(std::vector<uint8_t>& bytes, const XMFLOAT3& value)
+{
+    WriteFloat(bytes, value.x);
+    WriteFloat(bytes, value.y);
+    WriteFloat(bytes, value.z);
+}
+bool ReadFloat3(const uint8_t*& cursor, const uint8_t* end, XMFLOAT3& value)
+{
+    return ReadFloat(cursor, end, value.x) && ReadFloat(cursor, end, value.y) &&
+        ReadFloat(cursor, end, value.z);
+}
+void WriteMatrix(std::vector<uint8_t>& bytes, const XMFLOAT4X4& value)
+{
+    const float* elements = &value._11;
+    for (size_t i = 0; i < 16; ++i) WriteFloat(bytes, elements[i]);
+}
+bool ReadMatrix(const uint8_t*& cursor, const uint8_t* end, XMFLOAT4X4& value)
+{
+    float* elements = &value._11;
+    for (size_t i = 0; i < 16; ++i)
+    {
+        if (!ReadFloat(cursor, end, elements[i])) return false;
+    }
     return true;
 }
 
@@ -126,6 +168,360 @@ bool ReadDescriptor(const uint8_t*& cursor, const uint8_t* end, RemoteBufferDesc
 }
 } // namespace
 
+bool SerializeClientControlPacket(
+    const ClientControlPacket& packet, std::vector<uint8_t>& bytes, std::string* error)
+{
+    if (packet.control_frame_id == 0 || packet.frame_id == 0 ||
+        packet.viewport_width == 0 || packet.viewport_height == 0 ||
+        packet.near_plane <= 0 || packet.far_plane <= packet.near_plane ||
+        packet.supported_protocol_versions == 0)
+    {
+        SetError(error, "invalid client control identity, viewport, clip planes, or capabilities");
+        return false;
+    }
+
+    bytes.clear();
+    bytes.reserve(320);
+    WriteU32(bytes, kControlWireMagicV2);
+    WriteU32(bytes, kControlWireVersionV2);
+    WriteU32(bytes, 0); // byte size
+    WriteU32(bytes, 0); // checksum
+    WriteU64(bytes, packet.control_frame_id);
+    WriteU64(bytes, packet.frame_id);
+    WriteU64(bytes, packet.timestamp_usec);
+    WriteU32(bytes, packet.viewport_width);
+    WriteU32(bytes, packet.viewport_height);
+    WriteU32(bytes, packet.scene_generation);
+    WriteFloat(bytes, packet.near_plane);
+    WriteFloat(bytes, packet.far_plane);
+    WriteFloat3(bytes, packet.eye);
+    WriteFloat3(bytes, packet.at);
+    WriteFloat3(bytes, packet.up);
+    WriteMatrix(bytes, packet.view);
+    WriteMatrix(bytes, packet.projection);
+    WriteU8(bytes, packet.sun_enabled ? 1u : 0u);
+    WriteU8(bytes, 0);
+    WriteU16(bytes, 0);
+    WriteFloat3(bytes, packet.sun_direction);
+    WriteFloat3(bytes, packet.sun_color);
+    WriteFloat(bytes, packet.sun_intensity);
+    WriteFloat3(bytes, packet.ambient);
+    WriteFloat3(bytes, packet.horizon);
+    WriteFloat3(bytes, packet.zenith);
+    WriteU32(bytes, packet.supported_protocol_versions);
+    WriteU32(bytes, packet.supported_quality_tiers);
+    WriteU32(bytes, packet.supported_encoding_profiles);
+    WriteU32(bytes, packet.preferred_protocol_version);
+    WriteU8(bytes, static_cast<uint8_t>(packet.preferred_quality_tier));
+    WriteU8(bytes, 0);
+    WriteU16(bytes, 0);
+
+    const uint32_t encoded_size = static_cast<uint32_t>(bytes.size());
+    bytes[8] = static_cast<uint8_t>(encoded_size);
+    bytes[9] = static_cast<uint8_t>(encoded_size >> 8u);
+    bytes[10] = static_cast<uint8_t>(encoded_size >> 16u);
+    bytes[11] = static_cast<uint8_t>(encoded_size >> 24u);
+    const uint32_t checksum = FNV1a32(bytes.data() + 16, bytes.size() - 16);
+    bytes[12] = static_cast<uint8_t>(checksum);
+    bytes[13] = static_cast<uint8_t>(checksum >> 8u);
+    bytes[14] = static_cast<uint8_t>(checksum >> 16u);
+    bytes[15] = static_cast<uint8_t>(checksum >> 24u);
+    return true;
+}
+
+bool DeserializeClientControlPacket(
+    const uint8_t* bytes, size_t byte_count, ClientControlPacket& packet, std::string* error)
+{
+    if (bytes == nullptr || byte_count < 16)
+    {
+        SetError(error, "client control packet is truncated");
+        return false;
+    }
+    const uint8_t* cursor = bytes;
+    const uint8_t* end = bytes + byte_count;
+    uint32_t magic = 0, version = 0, encoded_size = 0, checksum = 0;
+    uint8_t sun_enabled = 0, quality = 0, reserved8 = 0;
+    uint16_t reserved16 = 0;
+    ClientControlPacket decoded;
+    if (!ReadU32(cursor, end, magic) || !ReadU32(cursor, end, version) ||
+        !ReadU32(cursor, end, encoded_size) || !ReadU32(cursor, end, checksum) ||
+        magic != kControlWireMagicV2 || version != kControlWireVersionV2 ||
+        encoded_size != byte_count || checksum != FNV1a32(bytes + 16, byte_count - 16) ||
+        !ReadU64(cursor, end, decoded.control_frame_id) ||
+        !ReadU64(cursor, end, decoded.frame_id) ||
+        !ReadU64(cursor, end, decoded.timestamp_usec) ||
+        !ReadU32(cursor, end, decoded.viewport_width) ||
+        !ReadU32(cursor, end, decoded.viewport_height) ||
+        !ReadU32(cursor, end, decoded.scene_generation) ||
+        !ReadFloat(cursor, end, decoded.near_plane) ||
+        !ReadFloat(cursor, end, decoded.far_plane) ||
+        !ReadFloat3(cursor, end, decoded.eye) ||
+        !ReadFloat3(cursor, end, decoded.at) ||
+        !ReadFloat3(cursor, end, decoded.up) ||
+        !ReadMatrix(cursor, end, decoded.view) ||
+        !ReadMatrix(cursor, end, decoded.projection) ||
+        !ReadU8(cursor, end, sun_enabled) || !ReadU8(cursor, end, reserved8) ||
+        !ReadU16(cursor, end, reserved16) || reserved8 != 0 || reserved16 != 0 ||
+        !ReadFloat3(cursor, end, decoded.sun_direction) ||
+        !ReadFloat3(cursor, end, decoded.sun_color) ||
+        !ReadFloat(cursor, end, decoded.sun_intensity) ||
+        !ReadFloat3(cursor, end, decoded.ambient) ||
+        !ReadFloat3(cursor, end, decoded.horizon) ||
+        !ReadFloat3(cursor, end, decoded.zenith) ||
+        !ReadU32(cursor, end, decoded.supported_protocol_versions) ||
+        !ReadU32(cursor, end, decoded.supported_quality_tiers) ||
+        !ReadU32(cursor, end, decoded.supported_encoding_profiles) ||
+        !ReadU32(cursor, end, decoded.preferred_protocol_version) ||
+        !ReadU8(cursor, end, quality) || !ReadU8(cursor, end, reserved8) ||
+        !ReadU16(cursor, end, reserved16) || reserved8 != 0 || reserved16 != 0 ||
+        cursor != end || sun_enabled > 1 ||
+        quality > static_cast<uint8_t>(RemoteQualityTierV3::Low))
+    {
+        SetError(error, "invalid client control wire packet");
+        return false;
+    }
+    decoded.sun_enabled = sun_enabled != 0;
+    decoded.preferred_quality_tier = static_cast<RemoteQualityTierV3>(quality);
+    if (decoded.control_frame_id == 0 || decoded.frame_id == 0 ||
+        decoded.viewport_width == 0 || decoded.viewport_height == 0 ||
+        decoded.near_plane <= 0 || decoded.far_plane <= decoded.near_plane ||
+        decoded.supported_protocol_versions == 0)
+    {
+        SetError(error, "client control payload violates the protocol contract");
+        return false;
+    }
+    packet = decoded;
+    return true;
+}
+
+RemoteStreamSelection NegotiateRemoteStream(const ClientControlPacket& packet)
+{
+    RemoteStreamSelection selection;
+    const bool v2 = (packet.supported_protocol_versions & kRemoteProtocolCapabilityV2) != 0;
+    const bool v3 = (packet.supported_protocol_versions & kRemoteProtocolCapabilityV3) != 0 &&
+        (packet.supported_encoding_profiles & (1u << kRemoteEncodingProfileI420V3)) != 0;
+    if (packet.preferred_protocol_version == kRemoteVideoWireVersion && v2)
+        return selection;
+    if (!v3)
+    {
+        if (!v2)
+            selection.protocol_version = 0;
+        return selection;
+    }
+
+    selection.protocol_version = kRemoteVideoWireVersionV3;
+    selection.encoding_profile_id = kRemoteEncodingProfileI420V3;
+    const uint32_t preferred = static_cast<uint32_t>(packet.preferred_quality_tier);
+    if (preferred <= static_cast<uint32_t>(RemoteQualityTierV3::Low) &&
+        (packet.supported_quality_tiers & (1u << preferred)) != 0)
+    {
+        selection.quality_tier = packet.preferred_quality_tier;
+    }
+    else if ((packet.supported_quality_tiers & kRemoteQualityCapabilityBalanced) != 0)
+    {
+        selection.quality_tier = RemoteQualityTierV3::Balanced;
+    }
+    else if ((packet.supported_quality_tiers & kRemoteQualityCapabilityHigh) != 0)
+    {
+        selection.quality_tier = RemoteQualityTierV3::High;
+    }
+    else if ((packet.supported_quality_tiers & kRemoteQualityCapabilityLow) != 0)
+    {
+        selection.quality_tier = RemoteQualityTierV3::Low;
+    }
+    else
+    {
+        selection.protocol_version = v2 ? kRemoteVideoWireVersion : 0;
+        selection.encoding_profile_id = 0;
+        selection.quality_tier = RemoteQualityTierV3::High;
+    }
+    return selection;
+}
+
+RemoteStreamStatus BuildRemoteStreamStatus(const ClientControlPacket& packet)
+{
+    RemoteStreamStatus status;
+    status.control_frame_id = packet.control_frame_id;
+    status.selection = NegotiateRemoteStream(packet);
+    if (status.selection.protocol_version != 0)
+    {
+        status.code = RemoteStreamStatusCode::Selected;
+        return status;
+    }
+
+    const bool supports_v2 =
+        (packet.supported_protocol_versions & kRemoteProtocolCapabilityV2) != 0;
+    const bool supports_v3 =
+        (packet.supported_protocol_versions & kRemoteProtocolCapabilityV3) != 0;
+    if (!supports_v2 && !supports_v3)
+    {
+        status.code = RemoteStreamStatusCode::NoCommonProtocol;
+    }
+    else if (supports_v3 &&
+        (packet.supported_encoding_profiles &
+            (1u << kRemoteEncodingProfileI420V3)) == 0)
+    {
+        status.code = RemoteStreamStatusCode::NoCommonEncodingProfile;
+    }
+    else
+    {
+        status.code = RemoteStreamStatusCode::NoCommonQualityTier;
+    }
+    return status;
+}
+
+bool SerializeRemoteStreamStatus(
+    const RemoteStreamStatus& status,
+    std::vector<uint8_t>& bytes,
+    std::string* error)
+{
+    if (status.control_frame_id == 0 ||
+        static_cast<uint8_t>(status.code) >
+            static_cast<uint8_t>(RemoteStreamStatusCode::NoCommonQualityTier) ||
+        static_cast<uint8_t>(status.selection.quality_tier) >
+            static_cast<uint8_t>(RemoteQualityTierV3::Low) ||
+        (status.code == RemoteStreamStatusCode::Selected &&
+            status.selection.protocol_version == 0) ||
+        (status.code != RemoteStreamStatusCode::Selected &&
+            status.selection.protocol_version != 0))
+    {
+        SetError(error, "invalid remote stream status");
+        return false;
+    }
+
+    bytes.clear();
+    bytes.reserve(40);
+    WriteU32(bytes, kStreamStatusWireMagicV3);
+    WriteU32(bytes, kStreamStatusWireVersionV3);
+    WriteU32(bytes, 0);
+    WriteU32(bytes, 0);
+    WriteU64(bytes, status.control_frame_id);
+    WriteU8(bytes, static_cast<uint8_t>(status.code));
+    WriteU8(bytes, static_cast<uint8_t>(status.selection.quality_tier));
+    WriteU16(bytes, 0);
+    WriteU32(bytes, status.selection.protocol_version);
+    WriteU32(bytes, status.selection.encoding_profile_id);
+    const uint32_t encoded_size = static_cast<uint32_t>(bytes.size());
+    bytes[8] = static_cast<uint8_t>(encoded_size);
+    bytes[9] = static_cast<uint8_t>(encoded_size >> 8u);
+    bytes[10] = static_cast<uint8_t>(encoded_size >> 16u);
+    bytes[11] = static_cast<uint8_t>(encoded_size >> 24u);
+    const uint32_t checksum = FNV1a32(bytes.data() + 16, bytes.size() - 16);
+    bytes[12] = static_cast<uint8_t>(checksum);
+    bytes[13] = static_cast<uint8_t>(checksum >> 8u);
+    bytes[14] = static_cast<uint8_t>(checksum >> 16u);
+    bytes[15] = static_cast<uint8_t>(checksum >> 24u);
+    return true;
+}
+
+bool DeserializeRemoteStreamStatus(
+    const uint8_t* bytes,
+    size_t byte_count,
+    RemoteStreamStatus& status,
+    std::string* error)
+{
+    if (bytes == nullptr || byte_count < 16)
+    {
+        SetError(error, "remote stream status is truncated");
+        return false;
+    }
+    const uint8_t* cursor = bytes;
+    const uint8_t* end = bytes + byte_count;
+    uint32_t magic = 0, version = 0, encoded_size = 0, checksum = 0;
+    uint8_t code = 0, quality = 0;
+    uint16_t reserved = 0;
+    RemoteStreamStatus decoded;
+    if (!ReadU32(cursor, end, magic) || !ReadU32(cursor, end, version) ||
+        !ReadU32(cursor, end, encoded_size) || !ReadU32(cursor, end, checksum) ||
+        magic != kStreamStatusWireMagicV3 ||
+        version != kStreamStatusWireVersionV3 ||
+        encoded_size != byte_count ||
+        checksum != FNV1a32(bytes + 16, byte_count - 16) ||
+        !ReadU64(cursor, end, decoded.control_frame_id) ||
+        !ReadU8(cursor, end, code) || !ReadU8(cursor, end, quality) ||
+        !ReadU16(cursor, end, reserved) ||
+        !ReadU32(cursor, end, decoded.selection.protocol_version) ||
+        !ReadU32(cursor, end, decoded.selection.encoding_profile_id) ||
+        cursor != end || reserved != 0 ||
+        code > static_cast<uint8_t>(RemoteStreamStatusCode::NoCommonQualityTier) ||
+        quality > static_cast<uint8_t>(RemoteQualityTierV3::Low))
+    {
+        SetError(error, "invalid remote stream status wire packet");
+        return false;
+    }
+    decoded.code = static_cast<RemoteStreamStatusCode>(code);
+    decoded.selection.quality_tier =
+        static_cast<RemoteQualityTierV3>(quality);
+    if (decoded.control_frame_id == 0 ||
+        (decoded.code == RemoteStreamStatusCode::Selected &&
+            decoded.selection.protocol_version == 0) ||
+        (decoded.code != RemoteStreamStatusCode::Selected &&
+            decoded.selection.protocol_version != 0))
+    {
+        SetError(error, "remote stream status violates the protocol contract");
+        return false;
+    }
+    status = decoded;
+    return true;
+}
+
+bool ValidateRemoteProtocolNegotiationSelfTest(std::string* error)
+{
+    ClientControlPacket source;
+    source.control_frame_id = 11;
+    source.frame_id = 12;
+    source.timestamp_usec = 13;
+    source.viewport_width = 1280;
+    source.viewport_height = 720;
+    std::vector<uint8_t> bytes;
+    ClientControlPacket decoded;
+    if (!SerializeClientControlPacket(source, bytes, error) ||
+        !DeserializeClientControlPacket(bytes.data(), bytes.size(), decoded, error) ||
+        decoded.control_frame_id != source.control_frame_id ||
+        decoded.preferred_quality_tier != RemoteQualityTierV3::High ||
+        NegotiateRemoteStream(decoded).protocol_version != kRemoteVideoWireVersionV3)
+    {
+        SetError(error, "V3 control negotiation round trip failed");
+        return false;
+    }
+    bytes.back() ^= 1u;
+    if (DeserializeClientControlPacket(bytes.data(), bytes.size(), decoded, nullptr))
+    {
+        SetError(error, "corrupt control checksum was accepted");
+        return false;
+    }
+    source.supported_protocol_versions = kRemoteProtocolCapabilityV2;
+    if (NegotiateRemoteStream(source).protocol_version != kRemoteVideoWireVersion)
+    {
+        SetError(error, "V2-only control did not negotiate V2");
+        return false;
+    }
+    source.supported_protocol_versions = kRemoteProtocolCapabilityV3;
+    source.supported_encoding_profiles = 0;
+    const RemoteStreamStatus mismatch = BuildRemoteStreamStatus(source);
+    std::vector<uint8_t> status_bytes;
+    RemoteStreamStatus decoded_status;
+    if (mismatch.code != RemoteStreamStatusCode::NoCommonEncodingProfile ||
+        mismatch.selection.protocol_version != 0 ||
+        !SerializeRemoteStreamStatus(mismatch, status_bytes, error) ||
+        !DeserializeRemoteStreamStatus(
+            status_bytes.data(), status_bytes.size(), decoded_status, error) ||
+        decoded_status.code != mismatch.code ||
+        decoded_status.control_frame_id != mismatch.control_frame_id)
+    {
+        SetError(error, "V3 mismatch status round trip failed");
+        return false;
+    }
+    status_bytes.back() ^= 1u;
+    if (DeserializeRemoteStreamStatus(
+        status_bytes.data(), status_bytes.size(), decoded_status, nullptr))
+    {
+        SetError(error, "corrupt stream status checksum was accepted");
+        return false;
+    }
+    return true;
+}
+
 bool ValidateRemoteFrameContractV3(const RemoteFrameContractV3& contract, std::string* error)
 {
     if (contract.protocol_version != kRemoteVideoWireVersionV3)
@@ -151,6 +547,43 @@ bool ValidateRemoteFrameContractV3(const RemoteFrameContractV3& contract, std::s
     }
 
     std::array<bool, static_cast<size_t>(RemoteBufferSemantic::Count)> seen = {};
+    const auto expected_atlas_dimension =
+        [&contract](RemoteBufferSemantic semantic,
+            uint16_t logical_dimension) {
+            uint32_t divisor = 1;
+            if (contract.quality_tier ==
+                RemoteQualityTierV3::Balanced)
+            {
+                divisor = semantic ==
+                        RemoteBufferSemantic::RemoteAO
+                    ? 4u
+                    : (semantic ==
+                            RemoteBufferSemantic::RemoteShadowVisibility
+                        ? 1u
+                        : 2u);
+            }
+            else if (contract.quality_tier ==
+                RemoteQualityTierV3::Low)
+            {
+                divisor = semantic ==
+                        RemoteBufferSemantic::RemoteAO
+                    ? 8u
+                    : (semantic ==
+                            RemoteBufferSemantic::RemoteShadowVisibility
+                        ? 1u
+                        : 4u);
+            }
+            const uint32_t scaled = std::max(
+                2u,
+                (static_cast<uint32_t>(logical_dimension) +
+                    divisor - 1u) /
+                    divisor);
+            return static_cast<uint16_t>(
+                (scaled +
+                    kRemoteVideoV3CodecAlignment - 1u) /
+                    kRemoteVideoV3CodecAlignment *
+                kRemoteVideoV3CodecAlignment);
+        };
     for (const RemoteBufferDescriptorV3& descriptor : contract.descriptors)
     {
         const size_t semantic_index = static_cast<size_t>(descriptor.semantic);
@@ -207,6 +640,20 @@ bool ValidateRemoteFrameContractV3(const RemoteFrameContractV3& contract, std::s
             static_cast<uint32_t>(descriptor.atlas_y) + descriptor.atlas_height > contract.atlas_height)
         {
             SetError(error, "V3 descriptor has invalid dimensions, alignment, generation, or atlas bounds");
+            return false;
+        }
+        if (descriptor.atlas_width !=
+                expected_atlas_dimension(
+                    descriptor.semantic,
+                    descriptor.logical_width) ||
+            descriptor.atlas_height !=
+                expected_atlas_dimension(
+                    descriptor.semantic,
+                    descriptor.logical_height))
+        {
+            SetError(
+                error,
+                "V3 descriptor resolution does not match negotiated quality tier");
             return false;
         }
     }
@@ -428,6 +875,15 @@ bool ValidateRemoteFrameContractV3SelfTest(std::string* error)
     if (ValidateRemoteFrameContractV3(invalid, nullptr))
     {
         SetError(error, "V3 codec-misaligned rectangle was accepted");
+        return false;
+    }
+    invalid = source;
+    invalid.descriptors[0].atlas_width = 6;
+    if (ValidateRemoteFrameContractV3(invalid, nullptr))
+    {
+        SetError(
+            error,
+            "V3 quality-tier resolution mismatch was accepted");
         return false;
     }
     invalid = source;

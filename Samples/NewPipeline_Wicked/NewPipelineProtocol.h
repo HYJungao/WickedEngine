@@ -21,6 +21,15 @@ constexpr uint32_t    kRemoteEncodingProfileI420V3    = 1u;
 constexpr uint16_t    kRemoteVideoV3CodecAlignment    = 2u;
 constexpr uint16_t    kRemoteVideoV3MaxAtlasDimension = 8192u;
 constexpr uint16_t    kRemoteVideoV3MaxLogicalDimension = 4096u;
+constexpr uint32_t    kControlWireMagicV2               = 0x3243504Eu; // NPC2
+constexpr uint32_t    kControlWireVersionV2             = 2u;
+constexpr uint32_t    kStreamStatusWireMagicV3          = 0x3353504Eu; // NPS3
+constexpr uint32_t    kStreamStatusWireVersionV3        = 1u;
+constexpr uint32_t    kRemoteProtocolCapabilityV2       = 1u << kRemoteVideoWireVersion;
+constexpr uint32_t    kRemoteProtocolCapabilityV3       = 1u << kRemoteVideoWireVersionV3;
+constexpr uint32_t    kRemoteQualityCapabilityHigh      = 1u << static_cast<uint32_t>(RemoteQualityTierV3::High);
+constexpr uint32_t    kRemoteQualityCapabilityBalanced  = 1u << static_cast<uint32_t>(RemoteQualityTierV3::Balanced);
+constexpr uint32_t    kRemoteQualityCapabilityLow       = 1u << static_cast<uint32_t>(RemoteQualityTierV3::Low);
 
 struct RemoteBufferDescriptorV3
 {
@@ -73,6 +82,9 @@ struct NewPipelineSunState
 
 struct ClientControlPacket
 {
+    // control_frame_id is the identity consumed by V3 reprojection/history.
+    // It is intentionally separate from transport sequence numbers.
+    uint64_t control_frame_id = 0;
     uint64_t frame_id         = 0;
     uint64_t timestamp_usec   = 0;
     uint32_t viewport_width   = 0;
@@ -92,5 +104,56 @@ struct ClientControlPacket
     XMFLOAT3 ambient          = XMFLOAT3(0.2f, 0.2f, 0.2f);
     XMFLOAT3 horizon          = XMFLOAT3(0.38f, 0.38f, 0.38f);
     XMFLOAT3 zenith           = XMFLOAT3(0.42f, 0.42f, 0.42f);
+    uint32_t supported_protocol_versions =
+        kRemoteProtocolCapabilityV2 | kRemoteProtocolCapabilityV3;
+    uint32_t supported_quality_tiers =
+        kRemoteQualityCapabilityHigh | kRemoteQualityCapabilityBalanced | kRemoteQualityCapabilityLow;
+    uint32_t supported_encoding_profiles = 1u << kRemoteEncodingProfileI420V3;
+    uint32_t preferred_protocol_version = kRemoteVideoWireVersionV3;
+    // High remains the production default. Balanced and Low are negotiated
+    // opt-in tiers; the implementation never changes quality tier implicitly.
+    RemoteQualityTierV3 preferred_quality_tier = RemoteQualityTierV3::High;
 };
+
+struct RemoteStreamSelection
+{
+    uint32_t protocol_version = kRemoteVideoWireVersion;
+    uint32_t encoding_profile_id = 0;
+    RemoteQualityTierV3 quality_tier = RemoteQualityTierV3::High;
+
+    bool operator==(const RemoteStreamSelection& other) const
+    {
+        return protocol_version == other.protocol_version &&
+            encoding_profile_id == other.encoding_profile_id &&
+            quality_tier == other.quality_tier;
+    }
+    bool operator!=(const RemoteStreamSelection& other) const { return !(*this == other); }
+};
+
+enum class RemoteStreamStatusCode : uint8_t
+{
+    Selected = 0,
+    NoCommonProtocol = 1,
+    NoCommonEncodingProfile = 2,
+    NoCommonQualityTier = 3,
+};
+
+struct RemoteStreamStatus
+{
+    uint64_t control_frame_id = 0;
+    RemoteStreamStatusCode code = RemoteStreamStatusCode::NoCommonProtocol;
+    RemoteStreamSelection selection = {};
+};
+
+bool SerializeClientControlPacket(
+    const ClientControlPacket& packet, std::vector<uint8_t>& bytes, std::string* error = nullptr);
+bool DeserializeClientControlPacket(
+    const uint8_t* bytes, size_t byte_count, ClientControlPacket& packet, std::string* error = nullptr);
+RemoteStreamSelection NegotiateRemoteStream(const ClientControlPacket& packet);
+RemoteStreamStatus BuildRemoteStreamStatus(const ClientControlPacket& packet);
+bool SerializeRemoteStreamStatus(
+    const RemoteStreamStatus& status, std::vector<uint8_t>& bytes, std::string* error = nullptr);
+bool DeserializeRemoteStreamStatus(
+    const uint8_t* bytes, size_t byte_count, RemoteStreamStatus& status, std::string* error = nullptr);
+bool ValidateRemoteProtocolNegotiationSelfTest(std::string* error = nullptr);
 } // namespace wicked_newpipeline

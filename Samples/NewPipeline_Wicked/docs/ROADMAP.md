@@ -17,16 +17,24 @@ notes are intentionally not repeated here.
 - Client `Remote` previews and final consumers must use the same accepted semantic
   textures.
 - Metadata and video pixels are accepted only as a matching frame/generation pair.
+- Server capture runs after the matching frame's formal lighting outputs are recorded,
+  so pixels and `source_control_frame_id` never straddle two camera frames.
 - Software I420/VP8 remains the portable compatibility path until a native codec path
   passes the same correctness and lifecycle tests.
 
-## Priority 1: remote semantic fusion and compact atlas
+## Completed implementation: remote V3 semantic path
 
-Implement the versioned four-buffer contract, same-stage local/remote blending and
-descriptor-driven compact atlas defined in
+The versioned four-buffer contract, explicit negotiation status,
+descriptor-driven compact atlas, bounded control-frame GBuffer history,
+geometry-aware reprojection/upscale, four-way Final fusion, quality tiers and
+fixed-atlas per-semantic cadence are implemented as defined in
 [`REMOTE_BUFFER_BLEND_V3_PLAN.md`](REMOTE_BUFFER_BLEND_V3_PLAN.md).
 
-## Priority 2: Windows DX12 native video path
+High is the production default. Balanced/Low and cadence remain explicit opt-in
+until the production-validation matrix below records acceptable visual, bitrate
+and latency results on both target platforms.
+
+## Priority 1: Windows DX12 native video path
 
 The current WebRTC bridge uses software I420 codec surfaces. The next production
 performance step is a capability-driven native Windows path that keeps uncompressed
@@ -57,7 +65,7 @@ Acceptance criteria:
 - all retained surfaces and fences are released after disconnect, resize and device
   reset.
 
-## Priority 3: profile direct Client consumption
+## Priority 2: profile direct Client consumption
 
 The current Client uploads I420 once and unpacks it into persistent semantic GPU
 textures. A later optimization may let render consumers sample a native decoded
@@ -75,7 +83,7 @@ Required evidence:
 Direct sampling is optional. The persistent semantic-texture path remains the default
 when it is faster or easier to synchronize.
 
-## Priority 4: production validation
+## Priority 3: production validation
 
 Run the following matrix before declaring the remote path production-ready:
 
@@ -99,7 +107,7 @@ semantic buffers.
 
 These are not approved implementation requirements:
 
-- multiple remote shadow slots or per-region update cadence;
+- multiple remote shadow slots;
 - multiple video tracks;
 - direct sampling as the default without profiling;
 - removal of the legacy pixel metadata band before the paired metadata channel has

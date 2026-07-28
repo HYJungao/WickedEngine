@@ -70,7 +70,9 @@ namespace wi::shadercompiler
 			const std::string library = "./libdxcompiler" + modifier + ".so";
 			HMODULE dxcompiler = wiLoadLibrary(library.c_str());
 #elif defined(PLATFORM_APPLE)
-			const std::string library = "./libdxcompiler" + modifier + ".dylib";
+			const std::string library =
+				wi::helper::GetCurrentPath() +
+				"/libdxcompiler" + modifier + ".dylib";
 			HMODULE dxcompiler = wiLoadLibrary(library.c_str());
 #endif
 			if (dxcompiler != nullptr)
@@ -598,7 +600,9 @@ namespace wi::shadercompiler
 #ifdef SHADERCOMPILER_APPLE_INCLUDED
 			if (input.format == ShaderFormat::METAL)
 			{
-				static HMODULE irconverter = wiLoadLibrary("libmetalirconverter.dylib");
+				static HMODULE irconverter = wiLoadLibrary(
+					(wi::helper::GetCurrentPath() +
+						"/libmetalirconverter.dylib").c_str());
 				assert(irconverter); // You must install the metal shader converter
 				if (irconverter != nullptr)
 				{

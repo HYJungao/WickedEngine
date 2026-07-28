@@ -10,6 +10,7 @@
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <filesystem>
 #include <iterator>
 #include <limits>
@@ -197,6 +198,21 @@ bool NearlyEqual(const XMFLOAT3& a, const XMFLOAT3& b, float epsilon = 0.0001f)
         NearlyEqual(a.z, b.z, epsilon);
 }
 
+bool NearlyEqual(
+    const XMFLOAT4X4& a,
+    const XMFLOAT4X4& b,
+    float epsilon = 0.0001f)
+{
+    const float* left = &a._11;
+    const float* right = &b._11;
+    for (size_t index = 0; index < 16; ++index)
+    {
+        if (!NearlyEqual(left[index], right[index], epsilon))
+            return false;
+    }
+    return true;
+}
+
 bool SunMatches(const NewPipelineSunState& a, const NewPipelineSunState& b)
 {
     return a.enabled == b.enabled && NearlyEqual(a.direction, b.direction) &&
@@ -213,6 +229,46 @@ float SmoothWeight(float current, float target, float dt)
     const float speed = target > current ? kElasticBlendAttackSpeed : kElasticBlendReleaseSpeed;
     const float blend = 1.0f - std::exp(-std::max(0.0f, dt) * speed);
     return std::lerp(current, target, blend);
+}
+
+uint64_t ComputeControlLightingFingerprint(
+    const ClientControlPacket& packet)
+{
+    uint64_t hash = 14695981039346656037ull;
+    const auto append_byte = [&hash](uint8_t value) {
+        hash ^= value;
+        hash *= 1099511628211ull;
+    };
+    const auto append_u32 = [&append_byte](uint32_t value) {
+        for (uint32_t shift = 0; shift < 32; shift += 8)
+            append_byte(static_cast<uint8_t>(value >> shift));
+    };
+    const auto append_float = [&append_u32](float value) {
+        uint32_t bits = 0;
+        std::memcpy(&bits, &value, sizeof(bits));
+        append_u32(bits);
+    };
+    constexpr char domain[] = "newpipeline.control-lighting.v1";
+    for (const char character : domain)
+        append_byte(static_cast<uint8_t>(character));
+    append_u32(packet.sun_enabled ? 1u : 0u);
+    append_float(packet.sun_direction.x);
+    append_float(packet.sun_direction.y);
+    append_float(packet.sun_direction.z);
+    append_float(packet.sun_color.x);
+    append_float(packet.sun_color.y);
+    append_float(packet.sun_color.z);
+    append_float(packet.sun_intensity);
+    append_float(packet.ambient.x);
+    append_float(packet.ambient.y);
+    append_float(packet.ambient.z);
+    append_float(packet.horizon.x);
+    append_float(packet.horizon.y);
+    append_float(packet.horizon.z);
+    append_float(packet.zenith.x);
+    append_float(packet.zenith.y);
+    append_float(packet.zenith.z);
+    return hash == 0 ? 1 : hash;
 }
 } // namespace
 
@@ -303,8 +359,13 @@ std::string NewPipelineClientRenderPath::GetDebugStatusSummary() const
             " retained=" + std::to_string(transport.retained_frame_acquires) +
             " decode-q=" + std::to_string(transport.decoded_queue_depth) +
             " impl=" + transport.codec_implementation +
-            " decode=" + std::to_string(transport.total_decode_time_usec / 1000u) + " ms" +
+            " decode-avg=" + std::to_string(
+                transport.frames_decoded > 0
+                    ? transport.total_decode_time_usec /
+                        transport.frames_decoded / 1000u
+                    : 0u) + " ms" +
             " net=" + std::to_string(transport.compressed_bytes_received / 1024u) + " KiB" +
+            " bitrate=" + std::to_string(transport_bitrate_bps / 1000u) + " kbps" +
             " I420=" + std::to_string(transport.retained_i420_bytes / 1024u) + " KiB" +
             " cpu-copy=" + std::to_string(transport.cpu_full_frame_copy_bytes / 1024u) + " KiB" +
             " convert=" + std::to_string(transport.cpu_conversion_usec / 1000u) + " ms" +
@@ -316,6 +377,9 @@ std::string NewPipelineClientRenderPath::GetDebugStatusSummary() const
             " pair[m/v/x]=" + std::to_string(downstream_metadata_first_matches) + "/" +
                 std::to_string(downstream_video_first_matches) + "/" +
                 std::to_string(downstream_pair_expirations) +
+            " drop[old/status]=" +
+                std::to_string(downstream_out_of_order_drops) + "/" +
+                std::to_string(downstream_stale_status_drops) +
             " pending=" + std::to_string(downstream_metadata_cache.size()) + "/" +
                 std::to_string(pending_remote_video_frames.size()) +
             (transport.native_codec || transport.codec_fallback_reason.empty()
@@ -328,10 +392,22 @@ std::string NewPipelineClientRenderPath::GetDebugStatusSummary() const
                 ? std::to_string(GetNewPipelineSunShadowIndex(local_scene)) : std::string{"unavailable"}) +
         "\nRemote decoded: " +
         (remote_consume.accepted_valid ? std::string{"available"} :
-            std::string{"unavailable ("} + remote_consume.fallback_reason + ")") +
+            std::string{"unavailable ("} + remote_consume.invalid_reason + ")") +
         "\nRemote DDGI: frame " + std::to_string(remote_ddgi_frame_index) +
         (remote_consume.history_valid ? " converged" : " warming") +
         " reset=" + ToString(remote_ddgi_reset_reason) +
+        "\nNegotiation: " +
+        (negotiated_stream_selection_valid
+            ? "selected protocol=" +
+                std::to_string(
+                    negotiated_stream_selection.protocol_version) +
+                " quality=" +
+                ToString(negotiated_stream_selection.quality_tier)
+            : "pending/rejected") +
+        "\nRemote GBuffer history: " +
+        std::to_string(remote_gbuffer_history_active_capacity) + "/" +
+        std::to_string(kRemoteGBufferHistoryCapacity) +
+        " slots (384 MiB budget)" +
         "\n" + GetElasticLightingStatus();
 }
 
@@ -340,9 +416,39 @@ std::string NewPipelineClientRenderPath::GetElasticLightingStatus() const
     const int quality_percent = static_cast<int>(std::round(std::clamp(elastic_remote_quality, 0.0f, 1.0f) * 100.0f));
     const int gi_percent = static_cast<int>(std::round(std::clamp(elastic_remote_gi_weight, 0.0f, 1.0f) * 100.0f));
     const int ao_percent = static_cast<int>(std::round(std::clamp(elastic_remote_ao_weight, 0.0f, 1.0f) * 100.0f));
+    const int specular_percent = static_cast<int>(std::round(
+        std::clamp(elastic_remote_specular_weight, 0.0f, 1.0f) * 100.0f));
+    const int shadow_percent = static_cast<int>(std::round(
+        std::clamp(elastic_remote_shadow_weight, 0.0f, 1.0f) * 100.0f));
+    std::string semantic_status;
+    if (accepted_remote_contract_v3_valid &&
+        remote_consume.accepted_valid)
+    {
+        semantic_status = "\nSemantic age/confidence:";
+        for (const RemoteBufferDescriptorV3& descriptor :
+            accepted_remote_contract_v3.descriptors)
+        {
+            if ((descriptor.flags &
+                    kRemoteBufferDescriptorAvailableV3) == 0)
+                continue;
+            const uint64_t age =
+                remote_consume.accepted_frame_id >=
+                    descriptor.content_frame_id
+                ? remote_consume.accepted_frame_id -
+                    descriptor.content_frame_id
+                : 0;
+            semantic_status += " " +
+                std::string{ToString(descriptor.semantic)} +
+                "=" + std::to_string(age) + "/" +
+                std::to_string(descriptor.confidence_unorm);
+        }
+    }
     return "Elastic quality " + std::to_string(quality_percent) + "% | GI remote " +
         std::to_string(gi_percent) + "% | AO remote " + std::to_string(ao_percent) +
-        "%\nAlignment: world reprojection (no remote depth)";
+        "% | Spec remote " + std::to_string(specular_percent) +
+        "% | Shadow remote " + std::to_string(shadow_percent) +
+        "%\nAlignment: control-frame GBuffer depth/normal/roughness reprojection" +
+        semantic_status;
 }
 
 void NewPipelineClientRenderPath::SetInputActive(bool active)
@@ -363,6 +469,10 @@ void NewPipelineClientRenderPath::SetRenderSettings(const NewPipelineClientRende
     const bool probe_changed = previous.environment_probe_enabled != render_settings.environment_probe_enabled;
     render_settings.remote_gi_max_weight = std::clamp(render_settings.remote_gi_max_weight, 0.0f, 1.0f);
     render_settings.remote_ao_max_weight = std::clamp(render_settings.remote_ao_max_weight, 0.0f, 1.0f);
+    render_settings.remote_specular_max_weight =
+        std::clamp(render_settings.remote_specular_max_weight, 0.0f, 1.0f);
+    render_settings.remote_shadow_max_weight =
+        std::clamp(render_settings.remote_shadow_max_weight, 0.0f, 1.0f);
 
     if (scene_initialized)
     {
@@ -419,6 +529,8 @@ void NewPipelineClientRenderPath::ResizeBuffers()
     local_primary_light_visibility = {};
     elastic_indirect_diffuse = {};
     elastic_ao = {};
+    elastic_specular_indirect_pre_ao = {};
+    elastic_primary_light_visibility = {};
     visibilityResources.texture_local_indirect_diffuse = nullptr;
     visibilityResources.texture_specular_indirect = nullptr;
     visibilityResources.texture_specular_indirect_pre_ao = nullptr;
@@ -426,6 +538,10 @@ void NewPipelineClientRenderPath::ResizeBuffers()
     visibilityResources.primary_light_shadow_index = -1;
     visibilityResources.texture_elastic_indirect_diffuse = nullptr;
     visibilityResources.texture_elastic_ao = nullptr;
+    visibilityResources.texture_elastic_specular_indirect_pre_ao = nullptr;
+    visibilityResources.texture_elastic_primary_light_visibility = nullptr;
+    visibilityResources.texture_remote_history_depth = nullptr;
+    visibilityResources.texture_remote_history_normal_roughness = nullptr;
     if (rtAO.IsValid())
     {
         wi::graphics::TextureDesc desc = rtAO.GetDesc();
@@ -505,9 +621,167 @@ void NewPipelineClientRenderPath::ResizeBuffers()
             wi::backlog::post("Client Elastic AO texture creation failed: " +
                 std::to_string(internal_resolution.x) + "x" + std::to_string(internal_resolution.y));
         }
+
+        if (wi::graphics::GetDevice()->CreateTexture(
+            &desc, nullptr, &elastic_specular_indirect_pre_ao))
+        {
+            wi::graphics::GetDevice()->SetName(
+                &elastic_specular_indirect_pre_ao,
+                "newpipeline.client.elastic_specular_indirect_pre_ao");
+            visibilityResources.texture_elastic_specular_indirect_pre_ao =
+                &elastic_specular_indirect_pre_ao;
+        }
+        else
+        {
+            wi::backlog::post("Client Elastic Specular Pre-AO texture creation failed: " +
+                std::to_string(internal_resolution.x) + "x" +
+                std::to_string(internal_resolution.y));
+        }
+
+        if (wi::graphics::GetDevice()->CreateTexture(
+            &primary_visibility_desc, nullptr, &elastic_primary_light_visibility))
+        {
+            wi::graphics::GetDevice()->SetName(
+                &elastic_primary_light_visibility,
+                "newpipeline.client.elastic_primary_light_visibility");
+            visibilityResources.texture_elastic_primary_light_visibility =
+                &elastic_primary_light_visibility;
+        }
+        else
+        {
+            wi::backlog::post("Client Elastic Primary Visibility texture creation failed: " +
+                std::to_string(internal_resolution.x) + "x" +
+                std::to_string(internal_resolution.y));
+        }
     }
+    ResetRemoteGBufferHistory();
+    ClearPendingRemoteFrames();
+    accepted_remote_contract_v3_valid = false;
+    accepted_remote_source_control_frame_id = 0;
+    accepted_remote_buffer_mask = 0;
+    InvalidateRemote("render buffers resized");
     EnsureSpecularIndirectDebugTexture();
     ApplyElasticLightingResources();
+}
+
+void NewPipelineClientRenderPath::ResetRemoteGBufferHistory()
+{
+    remote_gbuffer_history_active_capacity = 0;
+    remote_gbuffer_history_write_index = 0;
+    remote_gbuffer_history_last_capture = 0;
+    for (RemoteGBufferHistoryEntry& entry : remote_gbuffer_history)
+    {
+        entry.control_frame_id = 0;
+        entry.lighting_fingerprint = 0;
+        entry.scene_generation = 0;
+        entry.view_origin = {};
+        entry.valid = false;
+    }
+
+    if (!depthBuffer_Copy.IsValid() ||
+        !visibilityResources.texture_normal_roughness.IsValid())
+        return;
+
+    wi::graphics::TextureDesc depth_desc = depthBuffer_Copy.GetDesc();
+    // Reprojection samples only the base level. Do not clone Wicked's depth
+    // pyramid into every history entry; at high resolutions that would add a
+    // large, unused 5-mip allocation per control frame.
+    depth_desc.mip_levels = 1;
+    depth_desc.bind_flags =
+        wi::graphics::BindFlag::SHADER_RESOURCE |
+        wi::graphics::BindFlag::UNORDERED_ACCESS;
+    depth_desc.layout = wi::graphics::ResourceState::SHADER_RESOURCE_COMPUTE;
+    wi::graphics::TextureDesc normal_desc =
+        visibilityResources.texture_normal_roughness.GetDesc();
+    normal_desc.bind_flags =
+        wi::graphics::BindFlag::SHADER_RESOURCE |
+        wi::graphics::BindFlag::UNORDERED_ACCESS;
+    normal_desc.layout = wi::graphics::ResourceState::SHADER_RESOURCE_COMPUTE;
+
+    constexpr uint64_t history_budget_bytes = 384ull * 1024ull * 1024ull;
+    const uint64_t texel_count =
+        static_cast<uint64_t>(depth_desc.width) * depth_desc.height;
+    const uint64_t bytes_per_entry = texel_count *
+        (wi::graphics::GetFormatStride(depth_desc.format) +
+            wi::graphics::GetFormatStride(normal_desc.format));
+    if (bytes_per_entry == 0 ||
+        bytes_per_entry > history_budget_bytes)
+        return;
+    remote_gbuffer_history_active_capacity = static_cast<size_t>(
+        std::clamp<uint64_t>(
+            history_budget_bytes / bytes_per_entry,
+            1u,
+            remote_gbuffer_history.size()));
+
+    wi::graphics::GraphicsDevice* device = wi::graphics::GetDevice();
+    for (size_t index = 0; index < remote_gbuffer_history.size(); ++index)
+    {
+        RemoteGBufferHistoryEntry& entry = remote_gbuffer_history[index];
+        if (index >= remote_gbuffer_history_active_capacity)
+        {
+            entry.depth = {};
+            entry.normal_roughness = {};
+            continue;
+        }
+        const bool depth_matches =
+            entry.depth.IsValid() &&
+            entry.depth.GetDesc().width == depth_desc.width &&
+            entry.depth.GetDesc().height == depth_desc.height &&
+            entry.depth.GetDesc().format == depth_desc.format;
+        if (!depth_matches)
+        {
+            entry.depth = {};
+            if (device->CreateTexture(&depth_desc, nullptr, &entry.depth))
+            {
+                device->SetName(&entry.depth,
+                    ("newpipeline.client.remote_history_depth[" +
+                        std::to_string(index) + "]").c_str());
+            }
+        }
+        const bool normal_matches =
+            entry.normal_roughness.IsValid() &&
+            entry.normal_roughness.GetDesc().width == normal_desc.width &&
+            entry.normal_roughness.GetDesc().height == normal_desc.height &&
+            entry.normal_roughness.GetDesc().format == normal_desc.format;
+        if (!normal_matches)
+        {
+            entry.normal_roughness = {};
+            if (device->CreateTexture(
+                &normal_desc, nullptr, &entry.normal_roughness))
+            {
+                device->SetName(&entry.normal_roughness,
+                    ("newpipeline.client.remote_history_normal_roughness[" +
+                        std::to_string(index) + "]").c_str());
+            }
+        }
+        if (!entry.depth.IsValid() ||
+            !entry.normal_roughness.IsValid())
+        {
+            // Keep the usable ring contiguous so the capture writer can
+            // never become stuck on a failed allocation.
+            entry.depth = {};
+            entry.normal_roughness = {};
+            remote_gbuffer_history_active_capacity = index;
+        }
+    }
+}
+
+void NewPipelineClientRenderPath::AdvanceSceneGeneration(
+    const char* reason)
+{
+    ++scene_generation;
+    if (scene_generation == 0)
+        scene_generation = 1;
+    ResetRemoteGBufferHistory();
+    ClearPendingRemoteFrames();
+    accepted_remote_contract_v3_valid = false;
+    accepted_remote_source_control_frame_id = 0;
+    InvalidateRemote(
+        std::string{"scene generation changed: "} +
+        (reason != nullptr ? reason : "unspecified"));
+    wi::backlog::post(
+        "Client scene generation advanced to " +
+        std::to_string(scene_generation));
 }
 
 void NewPipelineClientRenderPath::EnsureSpecularIndirectDebugTexture()
@@ -549,6 +823,45 @@ void NewPipelineClientRenderPath::RenderAO(wi::graphics::CommandList cmd) const
     wi::RenderPath3D::RenderAO(cmd);
     if (rtAO.IsValid() && local_ao_snapshot.IsValid())
         wi::renderer::CopyTexture2D(local_ao_snapshot, rtAO, cmd);
+    CaptureRemoteGBufferHistory(cmd);
+}
+
+void NewPipelineClientRenderPath::CaptureRemoteGBufferHistory(
+    wi::graphics::CommandList cmd) const
+{
+    if (!has_published_control_packet ||
+        last_published_control_packet.control_frame_id == 0 ||
+        last_published_control_packet.control_frame_id ==
+            remote_gbuffer_history_last_capture ||
+        !depthBuffer_Copy.IsValid() ||
+        !visibilityResources.texture_normal_roughness.IsValid() ||
+        remote_gbuffer_history_active_capacity == 0)
+        return;
+
+    RemoteGBufferHistoryEntry& entry =
+        remote_gbuffer_history[remote_gbuffer_history_write_index];
+    if (!entry.depth.IsValid() || !entry.normal_roughness.IsValid())
+        return;
+    wi::renderer::CopyTexture2D(entry.depth, depthBuffer_Copy, cmd);
+    wi::renderer::CopyTexture2D(
+        entry.normal_roughness,
+        visibilityResources.texture_normal_roughness,
+        cmd);
+    entry.control_frame_id = last_published_control_packet.control_frame_id;
+    entry.lighting_fingerprint =
+        ComputeControlLightingFingerprint(
+            last_published_control_packet);
+    entry.scene_generation = last_published_control_packet.scene_generation;
+    XMStoreFloat4x4(
+        &entry.view_projection, local_camera.GetViewProjection());
+    entry.view_origin = local_camera.Eye;
+    entry.near_plane = local_camera.zNearP;
+    entry.far_plane = local_camera.zFarP;
+    entry.valid = true;
+    remote_gbuffer_history_last_capture = entry.control_frame_id;
+    remote_gbuffer_history_write_index =
+        (remote_gbuffer_history_write_index + 1u) %
+        remote_gbuffer_history_active_capacity;
 }
 
 void NewPipelineClientRenderPath::Update(float dt)
@@ -579,11 +892,25 @@ void NewPipelineClientRenderPath::Update(float dt)
 
 void NewPipelineClientRenderPath::MaintainWebRTC(float dt)
 {
-    (void)dt;
     webrtc_transport.Tick();
     if (config.remote_source != RemoteSourceMode::WebRTC)
         return;
     const WebRTCTransportStats stats = webrtc_transport.GetStats();
+    transport_telemetry_window_seconds += std::max(0.0f, dt);
+    if (transport_telemetry_window_seconds >= 1.0f)
+    {
+        const uint64_t delta = stats.compressed_bytes_received >=
+                transport_telemetry_previous_bytes
+            ? stats.compressed_bytes_received -
+                transport_telemetry_previous_bytes
+            : 0;
+        transport_bitrate_bps = static_cast<uint64_t>(
+            static_cast<double>(delta) * 8.0 /
+            transport_telemetry_window_seconds);
+        transport_telemetry_previous_bytes =
+            stats.compressed_bytes_received;
+        transport_telemetry_window_seconds = 0.0f;
+    }
     if (stats.state == previous_webrtc_state)
         return;
     wi::backlog::post("Client WebRTC " + std::string{ToString(previous_webrtc_state)} + " -> " +
@@ -603,8 +930,34 @@ void NewPipelineClientRenderPath::PollRemoteFrameMetadata()
     if (config.remote_source != RemoteSourceMode::WebRTC)
         return;
     RemoteVideoFrameLayout layout;
-    if (!webrtc_transport.TryReceiveFrameMetadata(layout))
+    RemoteStreamStatus stream_status;
+    if (!webrtc_transport.TryReceiveFrameMetadata(layout, &stream_status))
+    {
+        if (stream_status.control_frame_id == 0)
+            return;
+        if (stream_status.control_frame_id <=
+            negotiated_stream_control_frame_id)
+        {
+            ++downstream_stale_status_drops;
+            return;
+        }
+        negotiated_stream_control_frame_id = stream_status.control_frame_id;
+        negotiated_stream_selection = stream_status.selection;
+        negotiated_stream_selection_valid =
+            stream_status.code == RemoteStreamStatusCode::Selected;
+        if (!negotiated_stream_selection_valid)
+        {
+            const char* reason = "no common protocol";
+            if (stream_status.code ==
+                RemoteStreamStatusCode::NoCommonEncodingProfile)
+                reason = "no common encoding profile";
+            else if (stream_status.code ==
+                RemoteStreamStatusCode::NoCommonQualityTier)
+                reason = "no common quality tier";
+            InvalidateRemote(std::string{"remote negotiation rejected: "} + reason);
+        }
         return;
+    }
     downstream_metadata_active = true;
     for (auto iterator = downstream_metadata_cache.begin(); iterator != downstream_metadata_cache.end();)
     {
@@ -835,28 +1188,143 @@ void NewPipelineClientRenderPath::UpdateElasticLighting(float dt)
     }
     elastic_remote_quality = quality;
 
-    const bool gi_available =
-        (accepted_remote_buffer_mask & RemoteBufferKindMask(RemoteBufferSemantic::RemoteIndirectDiffuse)) != 0 &&
-        accepted_remote_textures[static_cast<size_t>(RemoteBufferSemantic::RemoteIndirectDiffuse)].IsValid();
-    const bool ao_available =
-        (accepted_remote_buffer_mask & RemoteBufferKindMask(RemoteBufferSemantic::RemoteAO)) != 0 &&
-        accepted_remote_textures[static_cast<size_t>(RemoteBufferSemantic::RemoteAO)].IsValid();
+    bool matching_history = false;
+    const uint64_t current_lighting_fingerprint =
+        has_published_control_packet
+        ? ComputeControlLightingFingerprint(
+            last_published_control_packet)
+        : 0;
+    if (accepted_remote_contract_v3_valid &&
+        accepted_remote_source_control_frame_id != 0 &&
+        !accepted_remote_metadata.camera_cut)
+    {
+        for (const RemoteGBufferHistoryEntry& entry :
+            remote_gbuffer_history)
+        {
+            if (entry.valid &&
+                entry.control_frame_id ==
+                    accepted_remote_source_control_frame_id &&
+                entry.scene_generation == scene_generation &&
+                entry.lighting_fingerprint ==
+                    current_lighting_fingerprint &&
+                entry.depth.IsValid() &&
+                entry.normal_roughness.IsValid())
+            {
+                matching_history = true;
+                break;
+            }
+        }
+    }
+    if (!matching_history)
+    {
+        elastic_remote_quality = 0.0f;
+        elastic_remote_gi_weight = 0.0f;
+        elastic_remote_ao_weight = 0.0f;
+        elastic_remote_specular_weight = 0.0f;
+        elastic_remote_shadow_weight = 0.0f;
+        ApplyElasticLightingResources();
+        return;
+    }
+
+    const auto semantic_quality = [&](RemoteBufferSemantic semantic) {
+        const size_t index = static_cast<size_t>(semantic);
+        if (!accepted_remote_contract_v3_valid ||
+            index >= accepted_remote_contract_v3.descriptors.size() ||
+            (accepted_remote_buffer_mask & RemoteBufferKindMask(semantic)) == 0 ||
+            !accepted_remote_textures[index].IsValid())
+            return 0.0f;
+        const RemoteBufferDescriptorV3& descriptor =
+            accepted_remote_contract_v3.descriptors[index];
+        if ((descriptor.flags & kRemoteBufferDescriptorAvailableV3) == 0 ||
+            descriptor.content_generation != remote_consume.accepted_generation ||
+            descriptor.content_frame_id > remote_consume.accepted_frame_id)
+            return 0.0f;
+        const uint64_t age =
+            remote_consume.accepted_frame_id - descriptor.content_frame_id;
+        const bool view_sensitive =
+            semantic ==
+                RemoteBufferSemantic::RemoteSpecularIndirect ||
+            semantic ==
+                RemoteBufferSemantic::RemoteShadowVisibility;
+        // Specular and the authoritative shadow are view-sensitive and update
+        // every published frame, so never retain an older atlas region. The
+        // lower-frequency diffuse/AO regions keep their negotiated cadence and
+        // fade independently after one retained frame.
+        const float age_quality = view_sensitive
+            ? (age == 0 ? 1.0f : 0.0f)
+            : (age <= 1
+                ? 1.0f
+                : std::clamp(
+                    1.0f -
+                        static_cast<float>(age - 1u) / 3.0f,
+                    0.0f,
+                    1.0f));
+        return (static_cast<float>(descriptor.confidence_unorm) / 65535.0f) *
+            age_quality;
+    };
+    const float gi_quality =
+        semantic_quality(RemoteBufferSemantic::RemoteIndirectDiffuse);
+    const float ao_quality =
+        semantic_quality(RemoteBufferSemantic::RemoteAO);
+    const float specular_quality =
+        semantic_quality(RemoteBufferSemantic::RemoteSpecularIndirect);
+    float shadow_quality =
+        semantic_quality(RemoteBufferSemantic::RemoteShadowVisibility);
+
+    const uint64_t local_primary_id = GetNewPipelineSunStableId(local_scene);
+    primary_light_entity =
+        ResolveStableLightId(local_scene, local_primary_id);
+    primary_light_generation =
+        ComputeStableLightGeneration(local_scene, local_primary_id);
+    if (accepted_remote_contract_v3_valid)
+    {
+        const RemoteBufferDescriptorV3& shadow_descriptor =
+            accepted_remote_contract_v3.descriptors[
+                static_cast<size_t>(
+                    RemoteBufferSemantic::RemoteShadowVisibility)];
+        if (shadow_descriptor.stable_subject_id != local_primary_id ||
+            shadow_descriptor.stable_subject_generation !=
+                primary_light_generation)
+            shadow_quality = 0.0f;
+    }
 
     const float ddgi_readiness = remote_consume.history_valid
         ? 1.0f
         : std::clamp(static_cast<float>(remote_ddgi_frame_index) / 64.0f, 0.0f, 1.0f);
-    const float gi_target = render_settings.remote_gi_enabled && gi_available
-        ? render_settings.remote_gi_max_weight * quality * ddgi_readiness
+    const float gi_target = render_settings.remote_gi_enabled && gi_quality > 0
+        ? render_settings.remote_gi_max_weight * quality * gi_quality * ddgi_readiness
         : 0.0f;
-    const float ao_target = render_settings.remote_ao_enabled && ao_available
-        ? render_settings.remote_ao_max_weight * quality
+    const float ao_target = render_settings.remote_ao_enabled && ao_quality > 0
+        ? render_settings.remote_ao_max_weight * quality * ao_quality
         : 0.0f;
-    elastic_remote_gi_weight = SmoothWeight(elastic_remote_gi_weight, gi_target, dt);
-    elastic_remote_ao_weight = SmoothWeight(elastic_remote_ao_weight, ao_target, dt);
+    const float specular_target =
+        render_settings.remote_specular_enabled && specular_quality > 0
+        ? render_settings.remote_specular_max_weight * quality * specular_quality
+        : 0.0f;
+    const float shadow_target =
+        render_settings.remote_shadow_enabled && shadow_quality > 0
+        ? render_settings.remote_shadow_max_weight * quality * shadow_quality
+        : 0.0f;
+    elastic_remote_gi_weight = gi_target > 0
+        ? SmoothWeight(elastic_remote_gi_weight, gi_target, dt) : 0.0f;
+    elastic_remote_ao_weight = ao_target > 0
+        ? SmoothWeight(elastic_remote_ao_weight, ao_target, dt) : 0.0f;
+    elastic_remote_specular_weight =
+        specular_target > 0
+        ? SmoothWeight(elastic_remote_specular_weight, specular_target, dt)
+        : 0.0f;
+    elastic_remote_shadow_weight =
+        shadow_target > 0
+        ? SmoothWeight(elastic_remote_shadow_weight, shadow_target, dt)
+        : 0.0f;
     if (elastic_remote_gi_weight < 0.0001f)
         elastic_remote_gi_weight = 0.0f;
     if (elastic_remote_ao_weight < 0.0001f)
         elastic_remote_ao_weight = 0.0f;
+    if (elastic_remote_specular_weight < 0.0001f)
+        elastic_remote_specular_weight = 0.0f;
+    if (elastic_remote_shadow_weight < 0.0001f)
+        elastic_remote_shadow_weight = 0.0f;
 
     ApplyElasticLightingResources();
 }
@@ -865,6 +1333,10 @@ void NewPipelineClientRenderPath::ApplyElasticLightingResources()
 {
     const size_t gi_index = static_cast<size_t>(RemoteBufferSemantic::RemoteIndirectDiffuse);
     const size_t ao_index = static_cast<size_t>(RemoteBufferSemantic::RemoteAO);
+    const size_t specular_index =
+        static_cast<size_t>(RemoteBufferSemantic::RemoteSpecularIndirect);
+    const size_t shadow_index =
+        static_cast<size_t>(RemoteBufferSemantic::RemoteShadowVisibility);
     visibilityResources.texture_remote_indirect_diffuse =
         elastic_remote_gi_weight > 0.0f && accepted_remote_textures[gi_index].IsValid()
             ? &accepted_remote_textures[gi_index]
@@ -873,12 +1345,57 @@ void NewPipelineClientRenderPath::ApplyElasticLightingResources()
         elastic_remote_ao_weight > 0.0f && accepted_remote_textures[ao_index].IsValid()
             ? &accepted_remote_textures[ao_index]
             : nullptr;
+    visibilityResources.texture_remote_specular_indirect_pre_ao =
+        elastic_remote_specular_weight > 0.0f &&
+            accepted_remote_textures[specular_index].IsValid()
+        ? &accepted_remote_textures[specular_index] : nullptr;
+    visibilityResources.texture_remote_primary_light_visibility =
+        elastic_remote_shadow_weight > 0.0f &&
+            accepted_remote_textures[shadow_index].IsValid()
+        ? &accepted_remote_textures[shadow_index] : nullptr;
     visibilityResources.remote_indirect_diffuse_weight = elastic_remote_gi_weight;
     visibilityResources.remote_ao_weight = elastic_remote_ao_weight;
-    visibilityResources.remote_view_projection = accepted_remote_metadata.view_projection;
+    visibilityResources.remote_specular_indirect_weight =
+        elastic_remote_specular_weight;
+    visibilityResources.remote_primary_light_visibility_weight =
+        elastic_remote_shadow_weight;
+    visibilityResources.texture_remote_history_depth = nullptr;
+    visibilityResources.texture_remote_history_normal_roughness = nullptr;
+    for (const RemoteGBufferHistoryEntry& entry : remote_gbuffer_history)
+    {
+        if (!entry.valid ||
+            entry.control_frame_id != accepted_remote_source_control_frame_id ||
+            entry.scene_generation != scene_generation ||
+            entry.lighting_fingerprint !=
+                ComputeControlLightingFingerprint(
+                    last_published_control_packet) ||
+            !entry.depth.IsValid() || !entry.normal_roughness.IsValid())
+            continue;
+        visibilityResources.texture_remote_history_depth = &entry.depth;
+        visibilityResources.texture_remote_history_normal_roughness =
+            &entry.normal_roughness;
+        visibilityResources.remote_view_projection = entry.view_projection;
+        visibilityResources.remote_view_origin = entry.view_origin;
+        visibilityResources.remote_history_near = entry.near_plane;
+        visibilityResources.remote_history_far = entry.far_plane;
+        break;
+    }
+    if (visibilityResources.texture_remote_history_depth == nullptr)
+    {
+        visibilityResources.remote_indirect_diffuse_weight = 0.0f;
+        visibilityResources.remote_ao_weight = 0.0f;
+        visibilityResources.remote_specular_indirect_weight = 0.0f;
+        visibilityResources.remote_primary_light_visibility_weight = 0.0f;
+    }
     visibilityResources.texture_elastic_indirect_diffuse =
         elastic_indirect_diffuse.IsValid() ? &elastic_indirect_diffuse : nullptr;
     visibilityResources.texture_elastic_ao = elastic_ao.IsValid() ? &elastic_ao : nullptr;
+    visibilityResources.texture_elastic_specular_indirect_pre_ao =
+        elastic_specular_indirect_pre_ao.IsValid()
+        ? &elastic_specular_indirect_pre_ao : nullptr;
+    visibilityResources.texture_elastic_primary_light_visibility =
+        elastic_primary_light_visibility.IsValid()
+        ? &elastic_primary_light_visibility : nullptr;
     visibilityResources.texture_specular_indirect_pre_ao = local_specular_indirect_pre_ao.IsValid()
         ? &local_specular_indirect_pre_ao : nullptr;
     visibilityResources.texture_primary_light_visibility = local_primary_light_visibility.IsValid()
@@ -1046,6 +1563,7 @@ void NewPipelineClientRenderPath::LoadStaticLightingAssets()
         scene_source_root_entity = wi::ecs::INVALID_ENTITY;
         environment_probe_entity = wi::ecs::INVALID_ENTITY;
         environment_probe_created_by_client = false;
+        AdvanceSceneGeneration("static lighting scene reload");
     }
     lightmap_bake_status = client_static_lighting.GetLightmapStatus();
     wi::backlog::post(lightmap_result.diagnostic);
@@ -2250,6 +2768,7 @@ void NewPipelineClientRenderPath::FinishLightmapBake()
     environment_probe_entity = wi::ecs::INVALID_ENTITY;
     environment_probe_created_by_client = false;
     environment_probe_load_attempted = false;
+    AdvanceSceneGeneration("committed lightmap scene reload");
     ApplyEnvironmentProbeSettings(false);
     if (!VerifySourceSceneUnchanged(error))
     {
@@ -2344,6 +2863,7 @@ void NewPipelineClientRenderPath::ReloadSceneAfterLightmapBakeAbort()
         scene_source_root_entity = wi::ecs::INVALID_ENTITY;
     wi::backlog::post(package_result.diagnostic);
     lightmap_bake_status = client_static_lighting.GetLightmapStatus();
+    AdvanceSceneGeneration("lightmap abort scene reload");
     ApplyEnvironmentProbeSettings(false);
     if (baked_sun_reference_valid && !SunMatches(sun_state, baked_sun_state))
     {
@@ -2479,19 +2999,30 @@ bool NewPipelineClientRenderPath::IsControlPacketChanged(const ClientControlPack
         !NearlyEqual(packet.eye, previous.eye) ||
         !NearlyEqual(packet.at, previous.at) ||
         !NearlyEqual(packet.up, previous.up) ||
+        !NearlyEqual(packet.view, previous.view) ||
+        !NearlyEqual(packet.projection, previous.projection) ||
         packet.sun_enabled != previous.sun_enabled ||
         !NearlyEqual(packet.sun_direction, previous.sun_direction) ||
         !NearlyEqual(packet.sun_color, previous.sun_color) ||
         !NearlyEqual(packet.sun_intensity, previous.sun_intensity) ||
         !NearlyEqual(packet.ambient, previous.ambient) ||
         !NearlyEqual(packet.horizon, previous.horizon) ||
-        !NearlyEqual(packet.zenith, previous.zenith);
+        !NearlyEqual(packet.zenith, previous.zenith) ||
+        packet.supported_protocol_versions != previous.supported_protocol_versions ||
+        packet.supported_quality_tiers != previous.supported_quality_tiers ||
+        packet.supported_encoding_profiles != previous.supported_encoding_profiles ||
+        packet.preferred_protocol_version != previous.preferred_protocol_version ||
+        packet.preferred_quality_tier != previous.preferred_quality_tier;
 }
 
 void NewPipelineClientRenderPath::PublishControlPacket(float dt)
 {
     control_publish_accumulator += dt;
     ClientControlPacket packet = MakeControlPacketFromCameraAndScene(local_camera, local_scene, frame_id + 1, scene_generation);
+    packet.preferred_quality_tier = config.remote_quality_tier;
+    packet.control_frame_id = has_published_control_packet
+        ? last_published_control_packet.control_frame_id
+        : packet.frame_id;
     const bool changed = IsControlPacketChanged(packet);
     const float publish_interval = changed ? kControlDirtyPublishIntervalSeconds : kControlHeartbeatIntervalSeconds;
     if (control_publish_accumulator < publish_interval)
@@ -2499,6 +3030,13 @@ void NewPipelineClientRenderPath::PublishControlPacket(float dt)
 
     control_publish_accumulator = 0.0f;
     packet.frame_id = ++frame_id;
+    // frame_id is the heartbeat/transport sequence. control_frame_id changes
+    // only when the camera, viewport, scene or lighting state changes, so
+    // returned semantics can refer to one exact Client GBuffer history entry
+    // across unchanged heartbeats and region-cadenced video frames.
+    packet.control_frame_id = changed || !has_published_control_packet
+        ? packet.frame_id
+        : last_published_control_packet.control_frame_id;
     packet.timestamp_usec = NowUsec();
 
     if (!mock_control_publish_logged)
@@ -2522,57 +3060,6 @@ void NewPipelineClientRenderPath::PublishControlPacket(float dt)
 
     last_published_control_packet = packet;
     has_published_control_packet = true;
-}
-
-bool NewPipelineClientRenderPath::UploadRemoteTextures(const RemoteRawFrame& frame)
-{
-    if (!frame.metadata.valid)
-        return false;
-    std::array<wi::graphics::Texture, static_cast<size_t>(RemoteBufferSemantic::Count)> uploaded;
-    uint32_t uploaded_mask = 0;
-    for (size_t index = 0; index < frame.buffers.size(); ++index)
-    {
-        const RemoteRawBuffer& buffer = frame.buffers[index];
-        if (!buffer.available)
-            continue;
-        const size_t semantic_index = static_cast<size_t>(buffer.semantic);
-        if (semantic_index >= uploaded.size())
-            return false;
-        const size_t element_count = static_cast<size_t>(buffer.width) * buffer.height * 4u;
-        const bool hdr = buffer.encoding == RemoteBufferEncoding::LogHDR16F;
-        if (buffer.width == 0 || buffer.height == 0 ||
-            (hdr ? buffer.payload_rgba16f.size() != element_count : buffer.payload_rgba8.size() != element_count))
-            return false;
-
-        wi::graphics::TextureDesc desc;
-        desc.type = wi::graphics::TextureDesc::Type::TEXTURE_2D;
-        desc.width = buffer.width;
-        desc.height = buffer.height;
-        desc.format = hdr ? wi::graphics::Format::R16G16B16A16_FLOAT : wi::graphics::Format::R8G8B8A8_UNORM;
-        desc.bind_flags = wi::graphics::BindFlag::SHADER_RESOURCE;
-        desc.layout = wi::graphics::ResourceState::SHADER_RESOURCE;
-        wi::vector<wi::graphics::SubresourceData> subresources;
-        void* texture_data = hdr
-            ? static_cast<void*>(const_cast<uint16_t*>(buffer.payload_rgba16f.data()))
-            : static_cast<void*>(const_cast<uint8_t*>(buffer.payload_rgba8.data()));
-        wi::graphics::CreateTextureSubresourceDatas(desc, texture_data, subresources);
-        if (!wi::graphics::GetDevice()->CreateTexture(
-                &desc, subresources.data(), &uploaded[semantic_index]))
-            return false;
-        ++remote_texture_creation_count;
-        remote_gpu_upload_bytes += hdr
-            ? buffer.payload_rgba16f.size() * sizeof(uint16_t)
-            : buffer.payload_rgba8.size();
-        const std::string name = std::string{"newpipeline.client."} + ToString(buffer.semantic) +
-            (hdr ? ".rgba16f" : ".rgba8");
-        wi::graphics::GetDevice()->SetName(&uploaded[semantic_index], name.c_str());
-        uploaded_mask |= RemoteBufferKindMask(buffer.semantic);
-    }
-    if ((uploaded_mask & static_cast<uint32_t>(RemoteBufferKind::IndirectDiffuse)) == 0)
-        return false;
-    accepted_remote_textures = std::move(uploaded);
-    accepted_remote_buffer_mask = uploaded_mask;
-    return true;
 }
 
 bool NewPipelineClientRenderPath::UploadRemoteVideoTextures(
@@ -2716,10 +3203,12 @@ bool NewPipelineClientRenderPath::UploadRemoteVideoTextures(
             tile.encoding == RemoteBufferEncoding::LogHDR16F ? 16.0f : 0.0f,
             cmd);
     }
-    device->SubmitCommandLists();
-    // Publish a retained handle set only after the upload and unpack commands
-    // have been submitted.  Each buffered-frame slot owns its outputs, so they
-    // cannot be overwritten until Wicked has waited for that slot's GPU fence.
+    // The upload/unpack command list was opened before RenderPath3D records the
+    // visibility pass which consumes these textures. Wicked submits both lists
+    // in BeginCommandList order at the application frame boundary. Do not call
+    // SubmitCommandLists() from a RenderPath: it advances the global buffered
+    // frame index and would split one application frame into multiple resource
+    // lifetimes.
     accepted_remote_textures = slot.semantic_outputs;
     accepted_remote_buffer_mask = uploaded_mask;
     return true;
@@ -2812,6 +3301,37 @@ bool NewPipelineClientRenderPath::ValidateRemoteVideoLayout(
     const RemoteVideoFrameLayout& layout, std::string& reason) const
 {
     const RemoteFrameMetadata& metadata = layout.metadata;
+    if (layout.protocol_version != kRemoteVideoWireVersion &&
+        layout.protocol_version != kRemoteVideoWireVersionV3)
+    {
+        reason = "unsupported remote video protocol";
+        return false;
+    }
+    if (layout.protocol_version == kRemoteVideoWireVersionV3 &&
+        (layout.encoding_profile_id != kRemoteEncodingProfileI420V3 ||
+            layout.source_control_frame_id == 0 ||
+            layout.layout_checksum == 0 ||
+            layout.descriptor_checksum == 0 ||
+            !ValidateRemoteFrameContractV3(layout.contract_v3, nullptr) ||
+            layout.contract_v3.source_control_frame_id != layout.source_control_frame_id ||
+            layout.contract_v3.atlas_width != layout.video_width ||
+            layout.contract_v3.atlas_height != layout.video_height))
+    {
+        reason = "invalid V3 descriptor contract";
+        return false;
+    }
+    if (negotiated_stream_selection_valid &&
+        (layout.protocol_version !=
+                negotiated_stream_selection.protocol_version ||
+            layout.encoding_profile_id !=
+                negotiated_stream_selection.encoding_profile_id ||
+            (layout.protocol_version == kRemoteVideoWireVersionV3 &&
+                layout.quality_tier !=
+                    negotiated_stream_selection.quality_tier)))
+    {
+        reason = "video frame does not match acknowledged negotiation";
+        return false;
+    }
     if (metadata.source_stream_id != kRemoteFrameStreamId)
     {
         reason = "unexpected stream id";
@@ -2887,34 +3407,39 @@ bool NewPipelineClientRenderPath::ValidateRemoteVideoLayout(
 
 void NewPipelineClientRenderPath::InvalidateRemote(const std::string& reason)
 {
-    if (remote_consume.accepted_valid || remote_consume.fallback_reason != reason)
+    if (remote_consume.accepted_valid || remote_consume.invalid_reason != reason)
     {
-        wi::backlog::post("Client remote fallback: " + reason);
+        wi::backlog::post("Client remote invalidated: " + reason);
     }
 
     remote_consume.accepted_valid = false;
-    remote_consume.fallback_reason = reason;
-}
-
-void NewPipelineClientRenderPath::AcceptRemoteFrame(const RemoteRawFrame& frame)
-{
-    if (!UploadRemoteTextures(frame))
-    {
-        InvalidateRemote("upload failed");
-        return;
-    }
-
-    CommitAcceptedRemoteMetadata(frame.metadata);
+    remote_consume.invalid_reason = reason;
+    elastic_remote_quality = 0.0f;
+    elastic_remote_gi_weight = 0.0f;
+    elastic_remote_ao_weight = 0.0f;
+    elastic_remote_specular_weight = 0.0f;
+    elastic_remote_shadow_weight = 0.0f;
+    ApplyElasticLightingResources();
 }
 
 void NewPipelineClientRenderPath::AcceptRemoteVideoFrame(
     const RetainedI420Frame& frame, const RemoteVideoFrameLayout& layout)
 {
+    if (layout.protocol_version != kRemoteVideoWireVersionV3)
+    {
+        InvalidateRemote(
+            "V2 video cannot enter the formal V3 lighting blend");
+        return;
+    }
     if (!UploadRemoteVideoTextures(frame, layout))
     {
         InvalidateRemote("GPU video upload/unpack failed");
         return;
     }
+    accepted_remote_contract_v3_valid = true;
+    accepted_remote_contract_v3 = layout.contract_v3;
+    accepted_remote_source_control_frame_id =
+        layout.source_control_frame_id;
     CommitAcceptedRemoteMetadata(layout.metadata);
 }
 
@@ -2944,7 +3469,7 @@ void NewPipelineClientRenderPath::CommitAcceptedRemoteMetadata(const RemoteFrame
     remote_consume.placeholder = false;
     remote_consume.stale_timer = 0.0f;
     remote_consume.stale_logged = false;
-    remote_consume.fallback_reason.clear();
+    remote_consume.invalid_reason.clear();
 
     wi::backlog::post("Client remote accepted frame " + std::to_string(remote_consume.accepted_frame_id) +
         " generation " + std::to_string(remote_consume.accepted_generation) + " " +
@@ -2974,25 +3499,26 @@ void NewPipelineClientRenderPath::AcquireRemoteVideoFrame(float dt)
         RetainedI420Frame acquired_frame;
         if (webrtc_transport.TryAcquireI420Frame(acquired_frame))
         {
-            if (!downstream_metadata_active)
+            RemoteVideoFrameLayout pixel_layout;
+            if (!DecodeRemoteVideoFrameLayout(
+                    acquired_frame, pixel_layout, &error))
+            {
+                InvalidateRemote(error.empty()
+                    ? "video metadata-band decode failed" : error);
+                return;
+            }
+            const bool requires_authoritative_metadata =
+                pixel_layout.protocol_version ==
+                    kRemoteVideoWireVersionV3 ||
+                downstream_metadata_active;
+            if (!requires_authoritative_metadata)
             {
                 retained_frame = std::move(acquired_frame);
-                received = DecodeRemoteVideoFrameLayout(retained_frame, video_layout, &error);
-                if (!received)
-                {
-                    InvalidateRemote(error.empty() ? "legacy video metadata decode failed" : error);
-                    return;
-                }
+                video_layout = std::move(pixel_layout);
+                received = true;
             }
             else
             {
-                RemoteVideoFrameLayout pixel_layout;
-                if (!DecodeRemoteVideoFrameLayout(acquired_frame, pixel_layout, &error))
-                {
-                    InvalidateRemote(error.empty()
-                        ? "video metadata-band decode failed" : error);
-                    return;
-                }
                 auto duplicate = std::find_if(
                     pending_remote_video_frames.begin(), pending_remote_video_frames.end(),
                     [&pixel_layout](const PendingRemoteVideoFrame& pending) {
@@ -3028,7 +3554,7 @@ void NewPipelineClientRenderPath::AcquireRemoteVideoFrame(float dt)
                     if (queued_video_without_metadata)
                         ++downstream_metadata_misses;
                     if (!remote_consume.accepted_valid)
-                        remote_consume.fallback_reason =
+                        remote_consume.invalid_reason =
                             "waiting for matching pixel-band frame identity";
                 }
                 else if (!pending_remote_video_frames.empty())
@@ -3036,11 +3562,11 @@ void NewPipelineClientRenderPath::AcquireRemoteVideoFrame(float dt)
                     if (queued_video_without_metadata)
                         ++downstream_metadata_misses;
                     if (!remote_consume.accepted_valid)
-                        remote_consume.fallback_reason = "waiting for frame metadata";
+                        remote_consume.invalid_reason = "waiting for frame metadata";
                 }
                 else if (!downstream_metadata_cache.empty() && !remote_consume.accepted_valid)
                 {
-                    remote_consume.fallback_reason = "waiting for matching video frame";
+                    remote_consume.invalid_reason = "waiting for matching video frame";
                 }
             }
         }
@@ -3053,7 +3579,7 @@ void NewPipelineClientRenderPath::AcquireRemoteVideoFrame(float dt)
     {
         if (!error.empty())
         {
-            if (remote_consume.fallback_reason != error)
+            if (remote_consume.invalid_reason != error)
                 wi::backlog::post(std::string{config.remote_source == RemoteSourceMode::Mock
                     ? "Client mock packed-video acquire failed: "
                     : "Client WebRTC video-track acquire failed: "} + error);
@@ -3083,14 +3609,26 @@ void NewPipelineClientRenderPath::AcquireRemoteVideoFrame(float dt)
     {
         RemoteVideoFrameLayout pixel_layout;
         bool agrees = DecodeRemoteVideoFrameLayout(retained_frame, pixel_layout, &error) &&
+            video_layout.protocol_version == pixel_layout.protocol_version &&
             video_layout.video_width == pixel_layout.video_width &&
             video_layout.video_height == pixel_layout.video_height &&
             video_layout.metadata.frame_id == pixel_layout.metadata.frame_id &&
-            video_layout.metadata.source_generation == pixel_layout.metadata.source_generation &&
-            video_layout.metadata.timestamp_usec == pixel_layout.metadata.timestamp_usec &&
-            video_layout.metadata.available_buffer_mask == pixel_layout.metadata.available_buffer_mask &&
-            video_layout.metadata.continuity_mask == pixel_layout.metadata.continuity_mask;
-        for (size_t index = 0; agrees && index < pixel_layout.tiles.size(); ++index)
+            video_layout.metadata.source_generation == pixel_layout.metadata.source_generation;
+        if (agrees && video_layout.protocol_version == kRemoteVideoWireVersionV3)
+        {
+            agrees = video_layout.descriptor_checksum == pixel_layout.descriptor_checksum &&
+                video_layout.source_control_frame_id == pixel_layout.source_control_frame_id;
+        }
+        else if (agrees)
+        {
+            agrees = video_layout.metadata.timestamp_usec == pixel_layout.metadata.timestamp_usec &&
+                video_layout.metadata.available_buffer_mask == pixel_layout.metadata.available_buffer_mask &&
+                video_layout.metadata.continuity_mask == pixel_layout.metadata.continuity_mask;
+        }
+        for (size_t index = 0;
+            agrees && video_layout.protocol_version == kRemoteVideoWireVersion &&
+                index < pixel_layout.tiles.size();
+            ++index)
         {
             const RemoteVideoTileLayout& pixel = pixel_layout.tiles[index];
             const RemoteVideoTileLayout& channel = video_layout.tiles[index];
@@ -3132,7 +3670,7 @@ void NewPipelineClientRenderPath::AcquireRemoteVideoFrame(float dt)
     if (remote_consume.latest_generation == metadata.source_generation &&
         remote_consume.latest_frame_id != 0 && metadata.frame_id <= remote_consume.latest_frame_id)
     {
-        InvalidateRemote("out-of-order remote video frame");
+        ++downstream_out_of_order_drops;
         return;
     }
 
@@ -3191,7 +3729,8 @@ void NewPipelineClientRenderPath::AcquireRemoteVideoFrame(float dt)
     if (gpu_video_path)
         AcceptRemoteVideoFrame(retained_frame, video_layout);
     else
-        AcceptRemoteFrame(frame);
+        InvalidateRemote(
+            "V2/mock payload has no formal V3 semantic contract");
 }
 
 const wi::graphics::Texture* NewPipelineClientRenderPath::GetDebugPreviewTexture() const
@@ -3250,6 +3789,12 @@ const wi::graphics::Texture* NewPipelineClientRenderPath::GetDebugPreviewTexture
         return elastic_indirect_diffuse.IsValid() ? &elastic_indirect_diffuse : nullptr;
     case DebugPreviewMode::ElasticAO:
         return elastic_ao.IsValid() ? &elastic_ao : nullptr;
+    case DebugPreviewMode::ElasticSpecularIndirectPreAO:
+        return elastic_specular_indirect_pre_ao.IsValid()
+            ? &elastic_specular_indirect_pre_ao : nullptr;
+    case DebugPreviewMode::ElasticPrimaryLightVisibility:
+        return elastic_primary_light_visibility.IsValid()
+            ? &elastic_primary_light_visibility : nullptr;
     case DebugPreviewMode::Final:
     case DebugPreviewMode::RemoteOverview:
     default:
@@ -3268,6 +3813,39 @@ void NewPipelineClientRenderPath::Compose(wi::graphics::CommandList cmd) const
     {
         if (remote_consume.accepted_valid && accepted_remote_buffer_mask != 0)
         {
+            wi::graphics::GraphicsDevice* device =
+                wi::graphics::GetDevice();
+            std::array<wi::graphics::GPUBarrier,
+                static_cast<size_t>(RemoteBufferSemantic::Count)>
+                preview_barriers = {};
+            uint32_t preview_barrier_count = 0;
+            for (size_t index = 0;
+                index < accepted_remote_textures.size();
+                ++index)
+            {
+                const RemoteBufferSemantic semantic =
+                    static_cast<RemoteBufferSemantic>(index);
+                const wi::graphics::Texture& texture =
+                    accepted_remote_textures[index];
+                if ((accepted_remote_buffer_mask &
+                        RemoteBufferKindMask(semantic)) == 0 ||
+                    !texture.IsValid() ||
+                    texture.GetDesc().layout ==
+                        wi::graphics::ResourceState::SHADER_RESOURCE)
+                    continue;
+                preview_barriers[preview_barrier_count++] =
+                    wi::graphics::GPUBarrier::Image(
+                        &texture,
+                        texture.GetDesc().layout,
+                        wi::graphics::ResourceState::SHADER_RESOURCE);
+            }
+            if (preview_barrier_count > 0)
+            {
+                device->Barrier(
+                    preview_barriers.data(),
+                    preview_barrier_count,
+                    cmd);
+            }
             const float half_width = GetLogicalWidth() * 0.5f;
             const float half_height = GetLogicalHeight() * 0.5f;
             wi::image::Params background;
@@ -3306,12 +3884,39 @@ void NewPipelineClientRenderPath::Compose(wi::graphics::CommandList cmd) const
                     fx.enableDebugTonemap();
                 wi::image::Draw(&accepted_remote_textures[index], fx, cmd);
             }
+            if (preview_barrier_count > 0)
+            {
+                for (uint32_t index = 0;
+                    index < preview_barrier_count;
+                    ++index)
+                {
+                    std::swap(
+                        preview_barriers[index].image.layout_before,
+                        preview_barriers[index].image.layout_after);
+                }
+                device->Barrier(
+                    preview_barriers.data(),
+                    preview_barrier_count,
+                    cmd);
+            }
             wi::RenderPath2D::Compose(cmd);
             return;
         }
     }
     else if (const wi::graphics::Texture* debug_texture = GetDebugPreviewTexture())
     {
+        wi::graphics::GraphicsDevice* device = wi::graphics::GetDevice();
+        const wi::graphics::ResourceState source_layout =
+            debug_texture->GetDesc().layout;
+        const bool source_needs_pixel_state =
+            source_layout != wi::graphics::ResourceState::SHADER_RESOURCE;
+        if (source_needs_pixel_state)
+        {
+            device->Barrier(wi::graphics::GPUBarrier::Image(
+                debug_texture,
+                source_layout,
+                wi::graphics::ResourceState::SHADER_RESOURCE), cmd);
+        }
         wi::image::Params fx;
         fx.blendFlag = wi::enums::BLENDMODE_OPAQUE;
         // Keep the explicit single-buffer view pixel-exact. The 2x2 overview
@@ -3335,15 +3940,26 @@ void NewPipelineClientRenderPath::Compose(wi::graphics::CommandList cmd) const
             debug_preview_mode == DebugPreviewMode::LocalReflectionProbe ||
             debug_preview_mode == DebugPreviewMode::RemoteIndirectDiffuse ||
             debug_preview_mode == DebugPreviewMode::RemoteSpecularIndirect ||
-            debug_preview_mode == DebugPreviewMode::ElasticIndirectDiffuse)
+            debug_preview_mode == DebugPreviewMode::ElasticIndirectDiffuse ||
+            debug_preview_mode ==
+                DebugPreviewMode::ElasticSpecularIndirectPreAO)
             fx.enableDebugTonemap();
         if (debug_preview_mode == DebugPreviewMode::LocalAO ||
             debug_preview_mode == DebugPreviewMode::LocalShadowVisibility ||
             debug_preview_mode == DebugPreviewMode::RemoteAO ||
             debug_preview_mode == DebugPreviewMode::RemoteShadowVisibility ||
-            debug_preview_mode == DebugPreviewMode::ElasticAO)
+            debug_preview_mode == DebugPreviewMode::ElasticAO ||
+            debug_preview_mode ==
+                DebugPreviewMode::ElasticPrimaryLightVisibility)
             fx.enableExtractChannelR();
         wi::image::Draw(debug_texture, fx, cmd);
+        if (source_needs_pixel_state)
+        {
+            device->Barrier(wi::graphics::GPUBarrier::Image(
+                debug_texture,
+                wi::graphics::ResourceState::SHADER_RESOURCE,
+                source_layout), cmd);
+        }
         wi::RenderPath2D::Compose(cmd);
         return;
     }

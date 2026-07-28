@@ -112,6 +112,11 @@ function(newpipeline_wicked_add_windows_target TARGET_NAME ENTRY APP_SOURCE APP_
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${WICKED_ROOT_DIR}/WickedEngine/dxcompiler.dll"
             "$<TARGET_FILE_DIR:${TARGET_NAME}>/dxcompiler.dll"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${WICKED_ROOT_DIR}/WickedEngine/shaders"
+            "${CMAKE_BINARY_DIR}/WickedEngine/shaders"
+        COMMENT
+            "Refreshing runtime shader sources for ${TARGET_NAME}"
         VERBATIM
     )
     if(TARGET OpenImageDenoise)

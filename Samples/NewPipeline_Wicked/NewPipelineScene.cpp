@@ -521,6 +521,36 @@ uint64_t GetNewPipelineSunStableId(const wi::scene::Scene& scene)
     return ComputeStableLightId(scene, entity);
 }
 
+uint32_t ComputeStableLightGeneration(
+    const wi::scene::Scene& scene, uint64_t stable_light_id)
+{
+    const wi::ecs::Entity entity =
+        ResolveStableLightId(scene, stable_light_id);
+    const wi::scene::LightComponent* light =
+        scene.lights.GetComponent(entity);
+    if (light == nullptr)
+        return 0;
+
+    // This generation is a content identity, not a process-local entity
+    // transition counter. Client and Server therefore derive the same value
+    // after reloads while every state change that can alter visibility produces
+    // a new descriptor generation.
+    SceneFingerprintBuilder builder;
+    builder.AddString("newpipeline.light-generation.v1");
+    builder.AddU64(stable_light_id);
+    builder.AddU32(static_cast<uint32_t>(light->GetType()));
+    builder.AddBool(light->IsCastingShadow());
+    builder.AddBool(light->IsInactive());
+    builder.AddFloat3(light->direction);
+    builder.AddFloat3(light->color);
+    builder.AddFloat(light->intensity);
+    const uint64_t hash = builder.GetHash();
+    const uint32_t folded =
+        static_cast<uint32_t>(hash) ^
+        static_cast<uint32_t>(hash >> 32u);
+    return folded == 0 ? 1u : folded;
+}
+
 NewPipelineSunState MakeSunStateFromAngles(bool enabled, float yaw_degrees, float pitch_degrees)
 {
     NewPipelineSunState state;
@@ -805,10 +835,10 @@ NewPipelineSunState ExtractSunStateFromScene(const wi::scene::Scene& scene)
     const wi::scene::LightComponent* light = scene.lights.GetComponent(sun);
     if (light != nullptr)
     {
-        state.enabled = !light->IsInactive();
+        state.enabled = !light->IsInactive() && light->intensity > 0.0f;
         state.direction = NormalizeOrDefault(light->direction);
         state.color = light->color;
-        state.intensity = light->intensity > 0.0f ? light->intensity : kDefaultSunIntensity;
+        state.intensity = std::max(0.0f, light->intensity);
     }
     return state;
 }

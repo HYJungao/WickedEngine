@@ -51,8 +51,8 @@ using namespace wi::ecs;
 namespace wi::renderer
 {
 
-static_assert(sizeof(I420AtlasPackPush) == 96,
-	"I420 atlas push constants must remain byte-identical between C++ and HLSL");
+static_assert(sizeof(I420AtlasPackPush) == 48,
+		"I420 atlas push constants must remain byte-identical between C++ and HLSL");
 
 GraphicsDevice*& device = GetDevice();
 
@@ -1179,7 +1179,8 @@ void LoadShaders()
 	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::CS, shaders[CSTYPE_YUV_TO_RGB], "yuv_to_rgbCS.cso"); });
 	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::CS, shaders[CSTYPE_YUV_TO_RGB_ARRAY], "yuv_to_rgbCS.cso", ShaderModel::SM_6_0, {"ARRAY"}); });
 	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::CS, shaders[CSTYPE_YUV_TO_RGB_REGION], "yuv_to_rgb_regionCS.cso"); });
-	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::CS, shaders[CSTYPE_RGB_TO_I420_ATLAS], "rgb_to_i420_atlasCS.cso"); });
+	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::CS, shaders[CSTYPE_RGB_TO_I420_ATLAS], "rgb_to_i420_atlas_v1CS.cso"); });
+	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::CS, shaders[CSTYPE_LIGHTING_DOWNSAMPLE_JOINT], "lighting_downsample_jointCS.cso"); });
 	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::CS, shaders[CSTYPE_WETMAP_UPDATE], "wetmap_updateCS.cso"); });
 	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::CS, shaders[CSTYPE_DEPTH_REPROJECT], "depth_reprojectCS.cso"); });
 	wi::jobsystem::Execute(ctx, [](wi::jobsystem::JobArgs args) { LoadShader(ShaderStage::CS, shaders[CSTYPE_DEPTH_PYRAMID], "depth_pyramidCS.cso"); });
@@ -12307,6 +12308,32 @@ void Visibility_Shade(
 		device->Barrier(GPUBarrier::Memory(res.texture_elastic_ao), cmd);
 		elastic_ao_uav = device->GetDescriptorIndex(res.texture_elastic_ao, SubresourceType::UAV);
 	}
+	int elastic_specular_indirect_pre_ao_uav = -1;
+	if (res.texture_elastic_specular_indirect_pre_ao != nullptr &&
+		res.texture_elastic_specular_indirect_pre_ao->IsValid())
+	{
+		device->Barrier(GPUBarrier::Image(
+			res.texture_elastic_specular_indirect_pre_ao,
+			res.texture_elastic_specular_indirect_pre_ao->desc.layout,
+			ResourceState::UNORDERED_ACCESS), cmd);
+		device->ClearUAV(res.texture_elastic_specular_indirect_pre_ao, 0, cmd);
+		device->Barrier(GPUBarrier::Memory(res.texture_elastic_specular_indirect_pre_ao), cmd);
+		elastic_specular_indirect_pre_ao_uav = device->GetDescriptorIndex(
+			res.texture_elastic_specular_indirect_pre_ao, SubresourceType::UAV);
+	}
+	int elastic_primary_light_visibility_uav = -1;
+	if (res.texture_elastic_primary_light_visibility != nullptr &&
+		res.texture_elastic_primary_light_visibility->IsValid())
+	{
+		device->Barrier(GPUBarrier::Image(
+			res.texture_elastic_primary_light_visibility,
+			res.texture_elastic_primary_light_visibility->desc.layout,
+			ResourceState::UNORDERED_ACCESS), cmd);
+		device->ClearUAV(res.texture_elastic_primary_light_visibility, 0, cmd);
+		device->Barrier(GPUBarrier::Memory(res.texture_elastic_primary_light_visibility), cmd);
+		elastic_primary_light_visibility_uav = device->GetDescriptorIndex(
+			res.texture_elastic_primary_light_visibility, SubresourceType::UAV);
+	}
 
 	const uint visibility_tilecount_flat = res.tile_count.x * res.tile_count.y;
 	struct VisibilityShadePushConstants
@@ -12319,14 +12346,8 @@ void Visibility_Shade(
 		int32_t local_indirect_diffuse_uav;
 		int32_t elastic_indirect_diffuse_uav;
 		int32_t elastic_ao_uav;
-		int32_t remote_indirect_diffuse_texture;
-		int32_t remote_ao_texture;
-		float remote_indirect_diffuse_weight;
-		float remote_ao_weight;
 	};
-	// The default root signature exposes 12 DWORDs at b999. Remote reprojection
-	// data is carried by MiscCB instead of overflowing that fixed ABI.
-	static_assert(sizeof(VisibilityShadePushConstants) == 48);
+	static_assert(sizeof(VisibilityShadePushConstants) == 32);
 	VisibilityShadePushConstants push = {};
 	push.specular_indirect_uav = specular_indirect_uav;
 	push.specular_indirect_pre_ao_uav = specular_indirect_pre_ao_uav;
@@ -12335,14 +12356,40 @@ void Visibility_Shade(
 	push.local_indirect_diffuse_uav = local_indirect_diffuse_uav;
 	push.elastic_indirect_diffuse_uav = elastic_indirect_diffuse_uav;
 	push.elastic_ao_uav = elastic_ao_uav;
-	push.remote_indirect_diffuse_texture = device->GetDescriptorIndex(res.texture_remote_indirect_diffuse, SubresourceType::SRV);
-	push.remote_ao_texture = device->GetDescriptorIndex(res.texture_remote_ao, SubresourceType::SRV);
-	push.remote_indirect_diffuse_weight = res.remote_indirect_diffuse_weight;
-	push.remote_ao_weight = res.remote_ao_weight;
 
-	MiscCB visibility_misc = {};
-	visibility_misc.g_xTransform = res.remote_view_projection;
-	device->BindDynamicConstantBuffer(visibility_misc, CB_GETBINDSLOT(MiscCB), cmd);
+	ExternalLightingCB external = {};
+	external.external_diffuse_texture =
+		device->GetDescriptorIndex(res.texture_remote_indirect_diffuse, SubresourceType::SRV);
+	external.external_ao_texture =
+		device->GetDescriptorIndex(res.texture_remote_ao, SubresourceType::SRV);
+	external.external_specular_texture =
+		device->GetDescriptorIndex(res.texture_remote_specular_indirect_pre_ao, SubresourceType::SRV);
+	external.external_primary_visibility_texture =
+		device->GetDescriptorIndex(res.texture_remote_primary_light_visibility, SubresourceType::SRV);
+	external.external_history_depth_texture =
+		device->GetDescriptorIndex(res.texture_remote_history_depth, SubresourceType::SRV);
+	external.external_history_normal_roughness_texture =
+		device->GetDescriptorIndex(res.texture_remote_history_normal_roughness, SubresourceType::SRV);
+	external.external_elastic_specular_uav = elastic_specular_indirect_pre_ao_uav;
+	external.external_elastic_primary_visibility_uav = elastic_primary_light_visibility_uav;
+	external.external_weights = XMFLOAT4(
+		res.remote_indirect_diffuse_weight,
+		res.remote_ao_weight,
+		res.remote_specular_indirect_weight,
+		res.remote_primary_light_visibility_weight);
+	external.external_reprojection_params = XMFLOAT4(
+		res.remote_history_near,
+		res.remote_history_far,
+		res.remote_history_depth_threshold,
+		res.remote_history_normal_threshold);
+	external.external_remote_view_origin = XMFLOAT4(
+		res.remote_view_origin.x,
+		res.remote_view_origin.y,
+		res.remote_view_origin.z,
+		0.95f);
+	external.external_view_projection = res.remote_view_projection;
+	device->BindDynamicConstantBuffer(
+		external, CB_GETBINDSLOT(ExternalLightingCB), cmd);
 
 	uint64_t bins_offset = 0;
 
@@ -12411,6 +12458,22 @@ void Visibility_Shade(
 			res.texture_elastic_ao,
 			ResourceState::UNORDERED_ACCESS,
 			res.texture_elastic_ao->desc.layout));
+	}
+	if (res.texture_elastic_specular_indirect_pre_ao != nullptr &&
+		res.texture_elastic_specular_indirect_pre_ao->IsValid())
+	{
+		PushBarrier(GPUBarrier::Image(
+			res.texture_elastic_specular_indirect_pre_ao,
+			ResourceState::UNORDERED_ACCESS,
+			res.texture_elastic_specular_indirect_pre_ao->desc.layout));
+	}
+	if (res.texture_elastic_primary_light_visibility != nullptr &&
+		res.texture_elastic_primary_light_visibility->IsValid())
+	{
+		PushBarrier(GPUBarrier::Image(
+			res.texture_elastic_primary_light_visibility,
+			ResourceState::UNORDERED_ACCESS,
+			res.texture_elastic_primary_light_visibility->desc.layout));
 	}
 	FlushBarriers(cmd);
 
@@ -18943,6 +19006,60 @@ void Postprocess_Upsample_Bilateral(
 
 	device->EventEnd(cmd);
 }
+void Postprocess_DownsampleJointLighting(
+	const Texture& input,
+	const Texture& depth,
+	const Texture& normal_roughness,
+	const Texture& output,
+	CommandList cmd,
+	uint32_t mode,
+	bool encode_hdr_transport
+)
+{
+	auto profiler_range = wi::profiler::BeginRangeGPU(
+		"Remote Video GPU Joint Downsample", cmd);
+	device->EventBegin("Postprocess_DownsampleJointLighting", cmd);
+	device->BindComputeShader(&shaders[CSTYPE_LIGHTING_DOWNSAMPLE_JOINT], cmd);
+
+	const TextureDesc& input_desc = input.GetDesc();
+	const TextureDesc& output_desc = output.GetDesc();
+	PostProcess postprocess;
+	postprocess.resolution = XMUINT2(output_desc.width, output_desc.height);
+	postprocess.resolution_rcp = XMFLOAT2(1.0f / output_desc.width, 1.0f / output_desc.height);
+	postprocess.params0 = XMFLOAT4(
+		static_cast<float>(input_desc.width),
+		static_cast<float>(input_desc.height),
+		static_cast<float>(mode),
+		encode_hdr_transport ? 1.0f : 0.0f);
+	postprocess.params1 = XMFLOAT4(
+		static_cast<float>(input_desc.width) / output_desc.width,
+		static_cast<float>(input_desc.height) / output_desc.height,
+		0,
+		0);
+	device->PushConstants(&postprocess, sizeof(postprocess), cmd);
+	device->BindResource(&input, 0, cmd);
+	device->BindResource(&depth, 1, cmd);
+	device->BindResource(&normal_roughness, 2, cmd);
+	device->BindUAV(&output, 0, cmd);
+
+	GPUBarrier barriers[] = {
+		GPUBarrier::Image(&input, input.desc.layout, ResourceState::SHADER_RESOURCE_COMPUTE),
+		GPUBarrier::Image(&depth, depth.desc.layout, ResourceState::SHADER_RESOURCE_COMPUTE),
+		GPUBarrier::Image(&normal_roughness, normal_roughness.desc.layout, ResourceState::SHADER_RESOURCE_COMPUTE),
+		GPUBarrier::Image(&output, output.desc.layout, ResourceState::UNORDERED_ACCESS),
+	};
+	device->Barrier(barriers, arraysize(barriers), cmd);
+	device->Dispatch(
+		(output_desc.width + POSTPROCESS_BLOCKSIZE - 1) / POSTPROCESS_BLOCKSIZE,
+		(output_desc.height + POSTPROCESS_BLOCKSIZE - 1) / POSTPROCESS_BLOCKSIZE,
+		1,
+		cmd);
+	for (GPUBarrier& barrier : barriers)
+		std::swap(barrier.image.layout_before, barrier.image.layout_after);
+	device->Barrier(barriers, arraysize(barriers), cmd);
+	device->EventEnd(cmd);
+}
+
 void Postprocess_Downsample4x(
 	const Texture& input,
 	const Texture& output,
@@ -19437,7 +19554,7 @@ void YUV_to_RGB_Region(
 	device->EventEnd(cmd);
 }
 
-void RGB_to_I420_Atlas(
+bool RGB_to_I420_Atlas(
 	const Texture& input_atlas,
 	const GPUBuffer& metadata_luma,
 	const GPUBuffer& output_i420,
@@ -19457,9 +19574,14 @@ void RGB_to_I420_Atlas(
 	push.u_offset = desc.u_offset;
 	push.v_offset = desc.v_offset;
 	push.available_mask = desc.available_mask;
-	for (uint32_t index = 0; index < 4; ++index)
-		push.tile_rects[index] = desc.tile_rects[index];
-	device->PushConstants(&push, sizeof(push), cmd);
+	push.tile_padding = desc.tile_padding;
+	push.abi_version = 1;
+	push.struct_size = sizeof(push);
+	if (!device->PushConstants(&push, sizeof(push), cmd, 0, true))
+	{
+		device->EventEnd(cmd);
+		return false;
+	}
 
 	device->BindResource(&input_atlas, 0, cmd);
 	device->BindResource(&metadata_luma, 1, cmd);
@@ -19474,6 +19596,7 @@ void RGB_to_I420_Atlas(
 		cmd);
 	device->Barrier(GPUBarrier::Memory(&output_i420), cmd);
 	device->EventEnd(cmd);
+	return true;
 }
 
 void CopyDepthStencil(

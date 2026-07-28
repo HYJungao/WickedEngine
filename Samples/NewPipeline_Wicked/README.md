@@ -26,8 +26,12 @@ WebRTC\signaling\start_signaling.cmd
 The default endpoint and room are `ws://127.0.0.1:39876` and
 `NewPipeline.Wicked.V1`. No Client or Server arguments are needed for the local
 real-WebRTC path. Use `--remote_source=mock` (or `--no_webrtc`) only for mock
-testing. `--webrtc_signal`, `--webrtc_room`, `--webrtc_internet`, and
-`--remote_fps` override the production-path defaults.
+testing. `--webrtc_signal`, `--webrtc_room`, `--webrtc_internet`,
+and `--remote_fps` override connection or publication-rate defaults. Protocol
+and quality are not command-line switches: new peers negotiate V3
+automatically and the production policy requests High. Reduced tiers remain
+self-test-only until a persistent application setting and their visual/bitrate
+soak data are accepted.
 
 ## Focus and buffer previews
 
@@ -38,8 +42,8 @@ automatic camera orbit is applied.
 The Client starts on `Final`; receiving a remote frame never changes the
 selection. Its **Preview Buffer** menu contains the material-independent
 `Local Indirect (Final Input)`,
-the four accepted remote buffers, the actual `Elastic GI` / `Elastic AO` Final
-inputs, and an explicit `Remote 2x2 Overview`. The
+the four accepted remote buffers, all four `Elastic` Final-stage inputs, and an
+explicit `Remote Atlas Overview`. The
 Server debug panel contains `Final`, its four local producer buffers, and four
 pre-I420 `Transport` previews. Missing buffers render an explicit black/red
 `UNAVAILABLE` placeholder instead of silently falling back to Final. The
@@ -133,28 +137,33 @@ set to `auto` (default), `exclude`, or `include`; explicit `include` may overrid
 dynamic/deformation/transparency checks but cannot make missing or non-renderable
 geometry bakeable. Preparation logs categorized coverage and atlas/package errors.
 
-## Elastic GI and AO
+## Elastic four-buffer lighting
 
-The Client always computes its local fallback first: baked Lightmap (or ambient
-fallback) for diffuse GI and SSAO for screen-space AO. An accepted Server frame
-stores the exact Server view-projection matrix alongside the decoded DDGI and
-RTAO textures. During `Visibility_Shade`, each current world-space surface is
-projected into that Server view before the remote textures are sampled.
+The Client's original local lighting remains the baseline: baked Lightmap (or
+the engine's normal ambient term on unbaked geometry) for diffuse GI, SSAO for
+screen-space AO, probe/environment specular, and local primary-light
+visibility. An accepted Server frame stores
+V3 descriptors alongside the decoded formal textures. The returned
+`source_control_frame_id` selects a fixed-capacity Client depth/normal GBuffer
+history entry. During `Visibility_Shade`, each current world-space surface is
+projected into that historical view; out-of-viewport, depth-mismatched and
+normal-mismatched samples reject the corresponding remote contribution.
 
 Remote DDGI irradiance is converted to Wicked's internal Lambert-divided GI
-term and blended with the local GI. Local SSAO and remote RTAO are blended as
-screen-space AO before the result is multiplied by material AO. The current
-policy derives a transport quality from frame freshness and Server confidence,
-ramps DDGI in with its convergence state, applies independent user maximums,
-and smooths attack/release transitions. Missing, rejected, or stale inputs
-therefore converge back to the local result without changing render modes.
+term and blended with local GI. Local SSAO and remote RTAO are blended before
+material AO is applied once. Formal indirect specular is blended before AO.
+Primary-light visibility replaces only the matching stable directional light's
+visibility; other lights are untouched. Each semantic has independent
+availability, content age, confidence, identity and user-weight gates.
+Protocol, generation, identity and history failures zero the affected weight
+immediately.
 
-The `Elastic GI / AO` panel exposes independent enable switches and maximum
-remote weights. `Elastic GI (Final Input)` and `Elastic AO (Final Input)` show
-the full-resolution values actually consumed by Final. V2 does not yet carry a
-source depth companion, so reprojection rejects out-of-viewport samples but
-cannot identify every old-view disocclusion; those pixels will require depth
-validation in a later policy revision.
+The `Elastic Remote Lighting` panel exposes independent enable switches and
+maximum weights for diffuse, AO, pre-AO specular and primary visibility.
+Matching `Elastic` previews show the values actually consumed by Final. Only a
+validated V3 semantic contract can enter Final. V2 and mock payloads remain
+parseable for migration diagnostics but never synthesize V3 descriptors,
+light identity or formal-lighting inputs.
 
 ## Client lightmap assets
 
@@ -218,13 +227,17 @@ service. Changing the runtime sun away from the baked sun marks both contributio
 lighting. Returning to the baked sun reloads the validated packages. Sun controls
 are locked while a static-lighting bake is active.
 
-## Remote video V2
+## Remote video V3
 
 All four buffers remain on the single `np.remote.video` WebRTC video track.
+New Client/Server pairs explicitly negotiate protocol, encoding profile and
+quality tier. The Server acknowledges the selection or a precise mismatch
+reason before publishing frames. V3 is the no-argument default; V2 encoding
+remains only when a peer explicitly advertises V2 compatibility.
 DDGI and reflection are GPU-packed with a Log2 mapping for linear HDR values in
 the `[0,16]` range, then restored to `RGBA16F` by the Client. AO and Shadow use
-full-resolution I420 Y only with neutral chroma. Every tile has 16 pixels of
-padding to isolate chroma and codec block filtering.
+I420 Y only with neutral chroma. A deterministic compact atlas gives every rect
+four texels of true edge-dilated padding to isolate linear and 4:2:0 filtering.
 
 The live software-codec path first produces four canonical RGBA8 transport
 surfaces (Log2 HDR for indirect buffers, replicated scalar for AO/shadow). These
@@ -240,6 +253,11 @@ slot through its release callback, so there is no second full-frame CPU copy or 
 RGB-to-YUV conversion. The Client retains the decoded WebRTC frame, uploads Y/U/V
 once through a buffered ring, and extracts all semantic textures with a GPU compute
 pass. Semantic output textures are persistent at a stable generation/resolution.
+High keeps all four semantics full resolution and same cadence. Balanced and
+Low use depth/normal-aware GPU downsample; on an unchanged control frame they
+can retain lower-frequency diffuse/AO regions in the persistent atlas so the
+inter-frame codec sees unchanged content. Descriptors carry each semantic's
+actual content frame, generation and confidence.
 
 Frame metadata is dual-written to the legacy luma band and the unordered,
 unreliable `np.frame_meta` DataChannel. After the metadata channel becomes active,
@@ -256,6 +274,10 @@ Session creation, teardown and retry run on a lifecycle service thread with boun
 backoff. When signaling is unavailable, render updates only poll an atomic state and
 the Server does not capture or pack remote frames. Status panels report actual codec
 telemetry, compressed bytes, copy/upload bytes, queue drops and metadata matches.
+GPU profiler ranges separately expose joint downsample, I420 pack and I420 unpack.
+Server Transport previews use only canonical semantic surfaces committed for the
+current transport generation; resize, reconnect, camera cut and negotiation
+boundaries invalidate stale preview availability.
 `power-efficient` and `native-surface` are separate modes: the bundled bridge still
 uses the software-I420 codec surface path until a custom Windows DX12 H.264/NV12
 encoder/decoder backend is integrated.
@@ -263,6 +285,8 @@ encoder/decoder backend is integrated.
 The Server panel and Client remote status report DDGI frame/convergence state.
 Scene-generation and significant authoritative-sun changes clear Server DDGI
 history and publish the reset reason in the video metadata. `--transport_selftest`
-runs the CPU V2 LogHDR/luma/padding round-trip plus downstream metadata/checksum
-tests without opening a window. See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the
-remaining production work and validation matrix.
+runs V2 compatibility, V3 descriptor/status checks, High/Balanced atlas-area
+checks, retained-content cadence, scalar I420 numeric tolerance, formal blend
+endpoints and pixel-band/DataChannel agreement without opening a window. See
+[`docs/ROADMAP.md`](docs/ROADMAP.md) for the remaining platform/runtime
+validation matrix.

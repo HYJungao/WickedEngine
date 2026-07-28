@@ -48,7 +48,9 @@ inline half TiledLightingWithPrimaryVisibility(
 	inout Lighting lighting,
 	uint flatTileIndex,
 	ShaderCamera camera,
-	int primary_light_shadow_index)
+	int primary_light_shadow_index,
+	half external_primary_visibility = 1,
+	half external_primary_visibility_weight = 0)
 {
 	half primary_light_visibility = 1;
 	if (camera.buffer_entitytiles_index < 0)
@@ -189,7 +191,13 @@ inline half TiledLightingWithPrimaryVisibility(
 			const bool is_primary_light =
 				primary_light_shadow_index >= 0 && shadow_index == (uint)primary_light_shadow_index;
 			const half directional_visibility = light_directional_with_visibility(
-				light, surface, lighting, shadow_mask, is_primary_light);
+				light,
+				surface,
+				lighting,
+				shadow_mask,
+				is_primary_light,
+				external_primary_visibility,
+				is_primary_light ? external_primary_visibility_weight : 0);
 			if (is_primary_light)
 				primary_light_visibility = directional_visibility;
 		}

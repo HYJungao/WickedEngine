@@ -9,16 +9,11 @@ RWByteAddressBuffer output_i420 : register(u0);
 
 float3 LoadAtlasRGB(uint2 coordinate)
 {
-    [unroll]
-    for (uint tile_index = 0; tile_index < 4; ++tile_index)
-    {
-        if ((i420.available_mask & (1u << tile_index)) == 0)
-            continue;
-        const uint4 rect = i420.tile_rects[tile_index];
-        if (all(coordinate >= rect.xy) && all(coordinate < rect.xy + rect.zw))
-            return saturate(input_atlas.Load(int3(coordinate, 0)).rgb);
-    }
-    return 0;
+    // The canonical RGBA atlas is cleared outside its tiles and V3 tile
+    // padding is explicitly edge-dilated while the atlas is assembled.
+    // Sampling that canonical surface directly keeps the root-constant ABI
+    // fixed and makes the preview and encoder consume identical pixels.
+    return saturate(input_atlas.Load(int3(coordinate, 0)).rgb);
 }
 
 uint PackByte4(uint4 value)
@@ -48,6 +43,9 @@ uint LoadMetadataByte(uint index)
 [numthreads(8, 8, 1)]
 void main(uint3 DTid : SV_DispatchThreadID)
 {
+    if (i420.abi_version != 1u || i420.struct_size != 48u)
+        return;
+
     const uint x_base = DTid.x * 4u;
     if (DTid.z == 0)
     {
@@ -58,9 +56,10 @@ void main(uint3 DTid : SV_DispatchThreadID)
         for (uint lane = 0; lane < 4; ++lane)
         {
             const uint2 coordinate = uint2(x_base + lane, DTid.y);
-            if (coordinate.y < i420.metadata_rows)
+            if (coordinate.x < i420.video_resolution.x &&
+                coordinate.y < i420.metadata_rows)
                 y_values[lane] = LoadMetadataByte(coordinate.y * i420.video_resolution.x + coordinate.x);
-            else
+            else if (coordinate.x < i420.video_resolution.x)
                 y_values[lane] = RGBToY(LoadAtlasRGB(coordinate));
         }
         output_i420.Store(DTid.y * i420.y_stride + x_base, PackByte4(y_values));

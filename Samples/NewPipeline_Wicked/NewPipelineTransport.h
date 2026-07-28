@@ -70,9 +70,20 @@ struct RemoteVideoTileLayout
 struct RemoteVideoFrameLayout
 {
     RemoteFrameMetadata metadata;
+    uint32_t protocol_version = kRemoteVideoWireVersion;
+    uint32_t encoding_profile_id = 0;
+    RemoteQualityTierV3 quality_tier = RemoteQualityTierV3::High;
+    uint64_t source_control_frame_id = 0;
+    // Stable over content-frame/confidence/light-identity updates. This
+    // identifies only the negotiated semantic atlas geometry and encoding.
+    uint32_t layout_checksum = 0;
+    // Per-frame checksum of the complete serialized V3 descriptor contract.
+    uint32_t descriptor_checksum = 0;
+    uint32_t metadata_rows = 0;
     uint32_t video_width = 0;
     uint32_t video_height = 0;
     std::array<RemoteVideoTileLayout, static_cast<size_t>(RemoteBufferSemantic::Count)> tiles = {};
+    RemoteFrameContractV3 contract_v3;
 };
 
 // Backend-neutral ownership token for a decoded or encoder-ready GPU surface.
@@ -146,6 +157,24 @@ bool BuildRemoteVideoFrameLayout(
     RemoteVideoFrameLayout& layout,
     std::vector<uint8_t>& metadata_luma,
     std::string* error = nullptr);
+struct RemoteBufferContentStateV3
+{
+    uint64_t frame_id = 0;
+    uint32_t generation = 0;
+    uint16_t confidence_unorm = 0;
+};
+bool BuildRemoteVideoFrameLayoutV3(
+    const RemoteRawFrame& frame,
+    const RemoteStreamSelection& selection,
+    uint64_t source_control_frame_id,
+    uint64_t stable_shadow_id,
+    uint32_t stable_shadow_generation,
+    RemoteVideoFrameLayout& layout,
+    std::vector<uint8_t>& metadata_luma,
+    std::string* error = nullptr,
+    const std::array<RemoteBufferContentStateV3,
+        static_cast<size_t>(RemoteBufferSemantic::Count)>*
+        content_states = nullptr);
 bool DecodeRemoteVideoFrame(const PackedRemoteVideoFrame& video, RemoteRawFrame& frame, std::string* error = nullptr);
 bool DecodeRemoteVideoFrame(const RetainedI420Frame& video, RemoteRawFrame& frame, std::string* error = nullptr);
 bool DecodeRemoteVideoFrameLayout(
@@ -284,8 +313,11 @@ public:
     bool SendFrame(const RemoteRawFrame& frame);
     bool SendI420Frame(const RetainedI420Frame& frame);
     bool SendFrameMetadata(const RemoteVideoFrameLayout& layout);
-    void RequestKeyframe();
-    bool TryReceiveFrameMetadata(RemoteVideoFrameLayout& layout);
+    bool SendStreamStatus(const RemoteStreamStatus& status);
+    bool RequestKeyframe();
+    bool TryReceiveFrameMetadata(
+        RemoteVideoFrameLayout& layout,
+        RemoteStreamStatus* stream_status = nullptr);
     bool TryAcquireI420Frame(RetainedI420Frame& frame);
     bool TryReceiveFrame(RemoteRawFrame& frame);
     WebRTCTransportStats GetStats() const;

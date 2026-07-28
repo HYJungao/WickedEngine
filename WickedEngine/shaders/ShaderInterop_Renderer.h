@@ -1583,6 +1583,27 @@ CBUFFER(MiscCB, CBSLOT_RENDERER_MISC)
 	float4		g_xColor;
 };
 
+// Optional screen-space lighting supplied by another view. This remains a
+// separate on-demand block so the default renderer path and MiscCB ABI are
+// unchanged when no external lighting is bound.
+CBUFFER(ExternalLightingCB, CBSLOT_RENDERER_EXTERNAL_LIGHTING)
+{
+	int external_diffuse_texture;
+	int external_ao_texture;
+	int external_specular_texture;
+	int external_primary_visibility_texture;
+
+	int external_history_depth_texture;
+	int external_history_normal_roughness_texture;
+	int external_elastic_specular_uav;
+	int external_elastic_primary_visibility_uav;
+
+	float4 external_weights;
+	float4 external_reprojection_params; // near, far, relative depth threshold, normal dot threshold
+	float4 external_remote_view_origin; // xyz source camera, w specular view-direction cosine threshold
+	float4x4 external_view_projection;
+};
+
 CBUFFER(VolumeLightCB, CBSLOT_RENDERER_VOLUMELIGHT)
 {
 	float4x4 xLightWorld;

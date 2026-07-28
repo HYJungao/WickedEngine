@@ -293,6 +293,10 @@ const char* ToString(DebugPreviewMode mode)
     case DebugPreviewMode::RemoteShadowVisibility: return "remote_shadow_visibility";
     case DebugPreviewMode::ElasticIndirectDiffuse: return "elastic_indirect_diffuse";
     case DebugPreviewMode::ElasticAO: return "elastic_ao";
+    case DebugPreviewMode::ElasticSpecularIndirectPreAO:
+        return "elastic_specular_indirect_pre_ao";
+    case DebugPreviewMode::ElasticPrimaryLightVisibility:
+        return "elastic_primary_light_visibility";
     case DebugPreviewMode::RemoteOverview: return "remote_overview";
     case DebugPreviewMode::TransportIndirectDiffuse: return "transport_indirect_diffuse";
     case DebugPreviewMode::TransportAO: return "transport_ao";
@@ -311,6 +315,17 @@ const char* ToString(RemoteBufferEncoding encoding)
     case RemoteBufferEncoding::LinearRGBA8: return "linear_rgba8";
     case RemoteBufferEncoding::LogHDR16F: return "log_hdr16f";
     case RemoteBufferEncoding::ScalarLuma8: return "scalar_luma8";
+    default: return "unknown";
+    }
+}
+
+const char* ToString(RemoteQualityTierV3 tier)
+{
+    switch (tier)
+    {
+    case RemoteQualityTierV3::High: return "high";
+    case RemoteQualityTierV3::Balanced: return "balanced";
+    case RemoteQualityTierV3::Low: return "low";
     default: return "unknown";
     }
 }

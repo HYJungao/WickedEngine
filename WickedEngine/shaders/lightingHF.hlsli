@@ -60,14 +60,16 @@ inline half light_directional_with_visibility(
 	in Surface surface,
 	inout Lighting lighting,
 	in half shadow_mask = 1,
-	in bool resolve_visibility_independent_of_brdf = false)
+	in bool resolve_visibility_independent_of_brdf = false,
+	in half external_visibility = 1,
+	in half external_visibility_weight = 0)
 {
 	half light_visibility = shadow_mask;
 	if ((light.layerMask & surface.layerMask) == 0)
 		return 1; // layer mismatch is not occlusion
-	if (shadow_mask <= 0.001)
+	if (shadow_mask <= 0.001 && external_visibility_weight <= 0)
 		return 0; // shadow mask zero
-		
+
 	half3 L = light.GetDirection();
 	SurfaceToLight surface_to_light;
 	surface_to_light.create(surface, L);
@@ -75,7 +77,7 @@ inline half light_directional_with_visibility(
 	const bool contributes_to_brdf = any(surface_to_light.NdotL_sss);
 	if (!contributes_to_brdf && !resolve_visibility_independent_of_brdf)
 		return 1; // N.L is deliberately excluded from visibility
-		
+
 	half3 light_color = light.GetColor().rgb * shadow_mask;
 
 	[branch]
@@ -137,14 +139,26 @@ inline half light_directional_with_visibility(
 			}
 		}
 		
-		if (!any(light_color))
-			return light_visibility; // light color lost after shadow
 	}
+
+	// External visibility replaces only this matched light's resolved scalar
+	// visibility. At weight zero the exact upstream colored-shadow path is
+	// preserved; at weight one the authoritative remote scalar is used.
+	const half local_light_visibility = saturate(light_visibility);
+	const half external_weight = saturate(external_visibility_weight);
+	light_visibility = lerp(local_light_visibility, saturate(external_visibility), external_weight);
+	light_color = lerp(
+		light_color,
+		light.GetColor().rgb * saturate(external_visibility),
+		external_weight);
+
+	if (!any(light_color))
+		return local_light_visibility;
 
 	// A formal visibility request must still resolve the shadow map on a
 	// back-facing surface. N.L controls direct lighting, not occlusion.
 	if (!contributes_to_brdf)
-		return saturate(light_visibility);
+		return local_light_visibility;
 
 	[branch]
 	if (GetFrame().options & OPTION_BIT_REALISTIC_SKY)
@@ -159,7 +173,7 @@ inline half light_directional_with_visibility(
 	const half scattering = ComputeScattering(saturate(dot(L, -surface.V)));
 	lighting.indirect.specular += scattering * light_color * (1 - surface.extinction) * (1 - sqr(1 - saturate(1 - surface.N.y)));
 #endif // LIGHTING_SCATTER
-	return saturate(light_visibility);
+	return local_light_visibility;
 }
 
 inline void light_directional(in ShaderEntity light, in Surface surface, inout Lighting lighting, in half shadow_mask = 1)

@@ -249,7 +249,12 @@ namespace wi::graphics
 		virtual void BuildRaytracingAccelerationStructure(const RaytracingAccelerationStructure* dst, CommandList cmd, const RaytracingAccelerationStructure* src = nullptr) {}
 		virtual void BindRaytracingPipelineState(const RaytracingPipelineState* rtpso, CommandList cmd) {}
 		virtual void DispatchRays(const DispatchRaysDesc* desc, CommandList cmd) {}
-		virtual void PushConstants(const void* data, uint32_t size, CommandList cmd, uint32_t offset = 0) = 0;
+		virtual bool PushConstants(
+			const void* data,
+			uint32_t size,
+			CommandList cmd,
+			uint32_t offset = 0,
+			bool require_exact_capacity = false) = 0;
 		virtual void PredicationBegin(const GPUBuffer* buffer, uint64_t offset, PredicationOp op, CommandList cmd) {}
 		virtual void PredicationEnd(CommandList cmd) {}
 		virtual void ClearUAV(const GPUResource* resource, uint32_t value, CommandList cmd) = 0;

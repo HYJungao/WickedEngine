@@ -1,10 +1,28 @@
 # Remote Buffer V3 语义、融合与紧凑传输实施计划
 
-状态：Phase 0、Phase 1 已实现；V2 发送保持启用，Phase 2 尚未开始  
+状态：Phase 0–5 代码完成；Phase 6 遥测完成、对比验收待执行；Phase 7 受发布
+soak 门槛约束，尚未删除 V2 兼容路径
 范围：`Samples/NewPipeline_Wicked` 的四个 Server-to-Client lighting buffers  
 目标平台：Windows DX12、macOS Metal  
 依赖：当前 Remote Video V2、canonical RGBA8 atlas、GPU I420 pack/unpack、
 `np.frame_meta` 配对机制
+
+当前实现边界：
+
+- V3 是唯一允许进入正式 Final 融合的路径；V2/mock 只保留迁移诊断解析，禁止根据
+  Client 本地状态合成 V3 descriptor、light identity 或 formal input；
+- compact atlas 使用稳定 layout checksum 和逐帧 descriptor checksum，二者职责分离；
+- generation/layout 边界在 metadata 和首个视频帧发布前同步请求 keyframe；
+- RenderPath 不提交全局 command lists；GPU readback 由应用帧末提交后按 ring 延迟消费；
+- historical GBuffer 受 384 MiB 显存预算和 12 槽硬上限共同约束；history miss
+  明确拒绝对应远端权重，原有 Client local lighting 不被改写；
+- Server Transport 预览只显示已提交给当前 transport generation 的 canonical semantic
+  surfaces；resize、reconnect、camera cut 和 negotiation boundary 会清除可用性状态；
+- Phase 6 已记录 per-semantic area/age/update count、codec 累计时间、窗口码率、
+  readback/copy/upload 和队列丢弃，并提供 joint downsample、I420 pack/unpack GPU
+  profiler ranges；V2/V3 固定路径对比仍需同一台目标机运行采样；
+- Phase 7 的 V2 删除必须等 Windows DX12、macOS Metal、reconnect、resize 和 camera-cut
+  soak 全部通过，不能仅凭构建或自测提前执行。
 
 ## 1. 目标
 
@@ -247,7 +265,7 @@ V3 还需增加：
 
 ## 8. 紧凑 atlas 与质量档位
 
-### 8.1 默认 Balanced 档
+### 8.1 可选 Balanced 档
 
 | Semantic | 默认线性分辨率 | Wire 通道 |
 |---|---:|---|
@@ -256,7 +274,9 @@ V3 还需增加：
 | Ambient Visibility | 1/4 × 1/4 | Y-only scalar |
 | Primary Light Visibility | 1 × 1 | Y-only scalar |
 
-这是分辨率档位，不是场景规则。High/Balanced/Low 由双方能力协商，运行时不得根据
+High 是生产策略；协议和质量不使用命令行开关。Balanced/Low 在持久化应用设置及其
+视觉/码率 soak 验收完成前只用于自测。这是分辨率档位，不是场景规则。
+High/Balanced/Low 由双方能力协商，运行时不得根据
 Sponza、对象名称或显卡型号进入隐藏分支。
 
 当前四个 full-resolution cells 的 luma 面积约为 `4.0 * W * H`。Balanced 的内容面积：
@@ -335,6 +355,8 @@ V3 atlas 尺寸在 generation 内固定。允许每个 semantic 有独立 conten
 
 - 生产四个 V3 canonical surfaces；
 - 使用 formal pre-AO specular 替代原始 `rtSSR`；
+- 在本帧 Render 正式输出完成后捕获，保证 pixels、camera GBuffer 与
+  `source_control_frame_id` 来自同一帧；
 - 对低分辨率 semantic 执行 GPU joint downsample；
 - 维护 generation-stable compact atlas；
 - 按 descriptor rect 做 GPU copy 和 I420 pack；
@@ -434,12 +456,14 @@ Surface 数据，不能替代 compute shading dispatch。
 - deterministic tight packing；
 - persistent canonical atlas；
 - descriptor-driven I420 shader rects。
+- 将 publish cadence 决策与 GPU capture 分离，并在本帧 Render 完成后执行 capture。
 
 退出条件：
 
 - Balanced atlas 内容面积相对四个 full-res cells 至少减少 50%；
 - Server Local 与 Transport 在容差内一致；
 - layout 变化只在 generation boundary 发生；
+- 快速移动相机时，视频 pixels 不得与下一帧 `source_control_frame_id` 配对；
 - live WebRTC 路径仍只有一次 packed readback，不新增 full-frame CPU copy。
 
 ### Phase 4：Client V3 unpack、history 与 upscale
