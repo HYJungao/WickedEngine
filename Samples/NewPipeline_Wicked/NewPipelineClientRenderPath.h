@@ -16,6 +16,7 @@ struct NewPipelineClientRenderSettings
     bool ssao_enabled = true;
     bool environment_probe_enabled = true;
     bool baked_lightmaps_enabled = true;
+    bool dynamic_object_vlm_enabled = true;
     bool lightmap_bake_requested = false;
     bool remote_gi_enabled = true;
     bool remote_ao_enabled = true;

@@ -35,6 +35,7 @@ private:
     wi::gui::CheckBox            ssao_checkbox;
     wi::gui::CheckBox            environment_probe_checkbox;
     wi::gui::CheckBox            baked_lightmaps_checkbox;
+    wi::gui::CheckBox            dynamic_object_vlm_checkbox;
     wi::gui::Button              generate_static_lighting_button;
     wi::gui::Label               static_lighting_progress_label;
     wi::gui::Button              generate_lightmaps_button;

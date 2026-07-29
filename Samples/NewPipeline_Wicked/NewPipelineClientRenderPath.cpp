@@ -338,6 +338,7 @@ std::string NewPipelineClientRenderPath::GetEffectiveAlgorithmSummary() const
     return std::string{render_settings.shadow_maps_enabled ? "Shadow Map 1024/512" : "Shadow Map off"} +
         " | " + (render_settings.ssao_enabled ? "SSAO" : "SSAO off") +
         " | " + (render_settings.baked_lightmaps_enabled ? "Baked Lightmap" : "Baked Lightmap off") +
+        " | " + (render_settings.dynamic_object_vlm_enabled ? "Dynamic VLM" : "Dynamic VLM off") +
         " | " + (render_settings.environment_probe_enabled ? "Baked Probe 128" : "Baked Probe off") +
         " | Elastic DDGI/RTAO" +
         " | local DDGI/RT/SSR off";
@@ -458,6 +459,9 @@ void NewPipelineClientRenderPath::SetRenderSettings(const NewPipelineClientRende
     const bool shadows_changed = previous.shadow_maps_enabled != render_settings.shadow_maps_enabled;
     const bool ssao_changed = previous.ssao_enabled != render_settings.ssao_enabled;
     const bool probe_changed = previous.environment_probe_enabled != render_settings.environment_probe_enabled;
+    const bool dynamic_vlm_changed =
+        previous.dynamic_object_vlm_enabled !=
+        render_settings.dynamic_object_vlm_enabled;
     render_settings.remote_gi_max_weight = std::clamp(render_settings.remote_gi_max_weight, 0.0f, 1.0f);
     render_settings.remote_ao_max_weight = std::clamp(render_settings.remote_ao_max_weight, 0.0f, 1.0f);
     render_settings.remote_specular_max_weight =
@@ -478,6 +482,12 @@ void NewPipelineClientRenderPath::SetRenderSettings(const NewPipelineClientRende
     ApplySSAOSettings(ssao_changed);
     if (scene_initialized)
         ApplyEnvironmentProbeSettings(probe_changed);
+    if (dynamic_vlm_changed)
+    {
+        wi::backlog::post(
+            "Client dynamic-object volumetric lightmap: " +
+            EnabledString(render_settings.dynamic_object_vlm_enabled));
+    }
     ApplyElasticLightingResources();
 }
 
@@ -3050,6 +3060,7 @@ void NewPipelineClientRenderPath::UpdateClientVolumetricLightmapInstances()
     visibilityResources.buffer_client_vlm_instances = nullptr;
     visibilityResources.buffer_client_vlm_instances_upload = nullptr;
     if (!render_settings.baked_lightmaps_enabled ||
+        !render_settings.dynamic_object_vlm_enabled ||
         !client_volumetric_lightmap.IsValid() ||
         local_scene.instanceArraySize == 0)
         return;

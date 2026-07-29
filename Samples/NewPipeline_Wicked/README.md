@@ -126,6 +126,9 @@ low-cost runtime contract. Ambient is used only outside a valid volume. Static
 probes contribute to Final, and raster shadows remain in the light shadow-map
 atlas. The projected resolution floors are still reduced by atlas pressure, so
 they prevent distance-only shadow loss without making allocation unbounded.
+`Dynamic Object VLM` disables only this per-instance VLM lookup for controlled
+A/B comparisons; static 2D lightmaps, SSAO, probe specular and remote semantics
+are unaffected, and changing it does not require a rebake.
 Remote DDGI and RTAO
 are consumed by Final through the elastic-lighting path described below,
 including formal pre-AO specular and primary-light visibility. The effective algorithms are

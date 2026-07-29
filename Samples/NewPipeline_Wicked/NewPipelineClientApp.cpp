@@ -134,10 +134,26 @@ void NewPipelineClientApp::CreateDebugUI()
     });
     debug_window.AddWidget(&baked_lightmaps_checkbox);
 
+    dynamic_object_vlm_checkbox.Create("Dynamic Object VLM: ");
+    dynamic_object_vlm_checkbox.SetTooltip(
+        "Enable the baked volumetric-lightmap SH sample for movable and otherwise unbaked objects. Static 2D lightmaps are unaffected.");
+    dynamic_object_vlm_checkbox.SetPos(XMFLOAT2(150.0f, 337.0f));
+    dynamic_object_vlm_checkbox.SetSize(XMFLOAT2(18.0f, 18.0f));
+    dynamic_object_vlm_checkbox.SetCheck(
+        initial_render_settings.dynamic_object_vlm_enabled);
+    dynamic_object_vlm_checkbox.OnClick(
+        [this](const wi::gui::EventArgs& args) {
+            NewPipelineClientRenderSettings settings =
+                render_path.GetRenderSettings();
+            settings.dynamic_object_vlm_enabled = args.bValue;
+            render_path.SetRenderSettings(settings);
+        });
+    debug_window.AddWidget(&dynamic_object_vlm_checkbox);
+
     generate_static_lighting_button.Create("Generate Client Lighting");
     generate_static_lighting_button.SetTooltip(
         "Recommended: persist probe placement, bake Lightmaps, then capture the validated Reflection Probe package.");
-    generate_static_lighting_button.SetPos(XMFLOAT2(10.0f, 341.0f));
+    generate_static_lighting_button.SetPos(XMFLOAT2(10.0f, 367.0f));
     generate_static_lighting_button.SetSize(XMFLOAT2(310.0f, 24.0f));
     generate_static_lighting_button.OnClick([this](const wi::gui::EventArgs&) {
         render_path.RequestStaticLightingBake();
@@ -148,13 +164,13 @@ void NewPipelineClientApp::CreateDebugUI()
 
     static_lighting_progress_label.Create("Client Lighting Status");
     static_lighting_progress_label.SetText(render_path.GetStaticLightingBakeStatus());
-    static_lighting_progress_label.SetPos(XMFLOAT2(10.0f, 371.0f));
+    static_lighting_progress_label.SetPos(XMFLOAT2(10.0f, 397.0f));
     static_lighting_progress_label.SetSize(XMFLOAT2(310.0f, 40.0f));
     debug_window.AddWidget(&static_lighting_progress_label);
 
     generate_lightmaps_button.Create("Generate Lightmap Only");
     generate_lightmaps_button.SetTooltip("Generate missing atlas UVs, update the single source .wiscene, and bake a sibling .clientlightmap package.");
-    generate_lightmaps_button.SetPos(XMFLOAT2(10.0f, 417.0f));
+    generate_lightmaps_button.SetPos(XMFLOAT2(10.0f, 443.0f));
     generate_lightmaps_button.SetSize(XMFLOAT2(195.0f, 24.0f));
     generate_lightmaps_button.OnClick([this](const wi::gui::EventArgs&) {
         render_path.RequestLightmapBake();
@@ -164,7 +180,7 @@ void NewPipelineClientApp::CreateDebugUI()
 
     cancel_lightmaps_button.Create("Cancel Bake");
     cancel_lightmaps_button.SetTooltip("Cancel the active Client Lighting bake without replacing previous packages.");
-    cancel_lightmaps_button.SetPos(XMFLOAT2(215.0f, 417.0f));
+    cancel_lightmaps_button.SetPos(XMFLOAT2(215.0f, 443.0f));
     cancel_lightmaps_button.SetSize(XMFLOAT2(105.0f, 24.0f));
     cancel_lightmaps_button.OnClick([this](const wi::gui::EventArgs&) {
         render_path.CancelStaticLightingBake();
@@ -173,14 +189,14 @@ void NewPipelineClientApp::CreateDebugUI()
 
     lightmap_progress_label.Create("Lightmap Progress");
     lightmap_progress_label.SetText(render_path.GetLightmapBakeStatus());
-    lightmap_progress_label.SetPos(XMFLOAT2(10.0f, 448.0f));
+    lightmap_progress_label.SetPos(XMFLOAT2(10.0f, 474.0f));
     lightmap_progress_label.SetSize(XMFLOAT2(310.0f, 70.0f));
     debug_window.AddWidget(&lightmap_progress_label);
 
     generate_reflection_probe_button.Create("Generate Reflection Probe");
     generate_reflection_probe_button.SetTooltip(
         "Capture a validated sibling .clientprobe package. Probe placement must already be persisted by Generate Client Lighting.");
-    generate_reflection_probe_button.SetPos(XMFLOAT2(10.0f, 524.0f));
+    generate_reflection_probe_button.SetPos(XMFLOAT2(10.0f, 550.0f));
     generate_reflection_probe_button.SetSize(XMFLOAT2(310.0f, 24.0f));
     generate_reflection_probe_button.OnClick([this](const wi::gui::EventArgs&) {
         render_path.RequestReflectionProbeBake();
@@ -190,7 +206,7 @@ void NewPipelineClientApp::CreateDebugUI()
 
     reflection_probe_mip_slider.Create(0.0f, 6.0f, 0.0f, 6.0f, "Probe Mip: ");
     reflection_probe_mip_slider.SetTooltip("Preview the BC6H prefiltered cubemap mip: 0 is sharp; higher mips represent rougher reflections.");
-    reflection_probe_mip_slider.SetPos(XMFLOAT2(150.0f, 556.0f));
+    reflection_probe_mip_slider.SetPos(XMFLOAT2(150.0f, 582.0f));
     reflection_probe_mip_slider.SetSize(XMFLOAT2(145.0f, 18.0f));
     reflection_probe_mip_slider.valueInputField.SetFloatPrecision(0);
     reflection_probe_mip_slider.OnSlide([this](const wi::gui::EventArgs& args) {
@@ -200,7 +216,7 @@ void NewPipelineClientApp::CreateDebugUI()
 
     reflection_probe_progress_label.Create("Reflection Probe Progress");
     reflection_probe_progress_label.SetText(render_path.GetReflectionProbeBakeStatus());
-    reflection_probe_progress_label.SetPos(XMFLOAT2(10.0f, 586.0f));
+    reflection_probe_progress_label.SetPos(XMFLOAT2(10.0f, 612.0f));
     reflection_probe_progress_label.SetSize(XMFLOAT2(310.0f, 55.0f));
     debug_window.AddWidget(&reflection_probe_progress_label);
 
