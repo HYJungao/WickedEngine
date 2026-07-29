@@ -680,7 +680,10 @@ void NewPipelineClientRenderPath::ResetRemoteGBufferHistory()
 
     if (!depthBuffer_Copy.IsValid() ||
         !visibilityResources.texture_normal_roughness.IsValid())
+    {
+        remote_gbuffer_history_rebuild_pending = true;
         return;
+    }
 
     wi::graphics::TextureDesc depth_desc = depthBuffer_Copy.GetDesc();
     // Reprojection samples only the base level. Do not clone Wicked's depth
@@ -764,6 +767,7 @@ void NewPipelineClientRenderPath::ResetRemoteGBufferHistory()
             remote_gbuffer_history_active_capacity = index;
         }
     }
+    remote_gbuffer_history_rebuild_pending = false;
 }
 
 void NewPipelineClientRenderPath::AdvanceSceneGeneration(
@@ -824,6 +828,16 @@ void NewPipelineClientRenderPath::RenderAO(wi::graphics::CommandList cmd) const
     if (rtAO.IsValid() && local_ao_snapshot.IsValid())
         wi::renderer::CopyTexture2D(local_ao_snapshot, rtAO, cmd);
     CaptureRemoteGBufferHistory(cmd);
+}
+
+void NewPipelineClientRenderPath::PreRender()
+{
+    // RenderPath3D creates the visibility normal/roughness surface in
+    // PreRender(), after ResizeBuffers() has completed. Build the control-frame
+    // GBuffer history only after that source surface exists.
+    wi::RenderPath3D::PreRender();
+    if (remote_gbuffer_history_rebuild_pending)
+        ResetRemoteGBufferHistory();
 }
 
 void NewPipelineClientRenderPath::CaptureRemoteGBufferHistory(

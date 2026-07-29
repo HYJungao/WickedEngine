@@ -82,6 +82,7 @@ public:
     void Update(float dt) override;
     void Compose(wi::graphics::CommandList cmd) const override;
     void ResizeBuffers() override;
+    void PreRender() override;
     void RenderAO(wi::graphics::CommandList cmd) const override;
 
 private:
@@ -274,6 +275,7 @@ private:
     mutable size_t remote_gbuffer_history_active_capacity = 0;
     mutable size_t remote_gbuffer_history_write_index = 0;
     mutable uint64_t remote_gbuffer_history_last_capture = 0;
+    bool remote_gbuffer_history_rebuild_pending = false;
     wi::ecs::Entity environment_probe_entity = wi::ecs::INVALID_ENTITY;
     bool environment_probe_created_by_client = false;
     bool environment_probe_load_attempted = false;
