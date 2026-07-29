@@ -59,8 +59,6 @@ std::string NewPipelineServerRenderPath::GetEffectiveAlgorithmSummary() const
 std::string NewPipelineServerRenderPath::GetDebugStatusSummary() const
 {
     size_t pending_count = 0;
-    for (const ReadbackSlot& slot : readback_ring)
-        pending_count += slot.pending ? 1u : 0u;
     for (const PackedReadbackSlot& slot : packed_readback_ring)
         pending_count += slot.pending ? 1u : 0u;
     const std::string shadow = authoritative_shadow_index < 16
@@ -92,8 +90,8 @@ std::string NewPipelineServerRenderPath::GetDebugStatusSummary() const
                 std::to_string(remote_content_updates[index]);
         }
     }
-    const std::string transport_status = config.remote_source == RemoteSourceMode::WebRTC
-        ? "\nWebRTC: " + std::string{ToString(transport.state)} + " " + transport.codec_name +
+    const std::string transport_status =
+        "\nWebRTC: " + std::string{ToString(transport.state)} + " " + transport.codec_name +
             (transport.native_codec ? " native-surface" :
                 (transport.power_efficient_codec ? " power-efficient" : " software-surface")) +
             " impl=" + transport.codec_implementation +
@@ -109,11 +107,8 @@ std::string NewPipelineServerRenderPath::GetDebugStatusSummary() const
             " queue-drop=" + std::to_string(publish_queue_drops.load(std::memory_order_relaxed)) +
             " readback=" + std::to_string(gpu_readback_bytes / 1024u) + " KiB" +
             " cpu-copy=" + std::to_string(
-                (cpu_readback_copy_bytes + transport.cpu_full_frame_copy_bytes) / 1024u) + " KiB" +
-            " convert=" + std::to_string(transport.cpu_conversion_usec / 1000u) + " ms" +
-            (transport.native_codec || transport.codec_fallback_reason.empty()
-                ? std::string{} : " fallback=" + transport.codec_fallback_reason)
-        : std::string{};
+                transport.cpu_full_frame_copy_bytes / 1024u) + " KiB" +
+            " convert=" + std::to_string(transport.cpu_conversion_usec / 1000u) + " ms";
     return GetEffectiveAlgorithmSummary() + "\nSun shadow slice: " + shadow +
         " stable-id=" + std::to_string(authoritative_shadow_light_id) +
         " generation=" + std::to_string(authoritative_shadow_light_generation) +
@@ -131,11 +126,6 @@ std::string NewPipelineServerRenderPath::GetDebugStatusSummary() const
 
 void NewPipelineServerRenderPath::Start()
 {
-    std::string codec_test_error;
-    if (!ValidateRemoteTransportSelfTest(&codec_test_error))
-        wi::backlog::post("Remote transport self-test failed: " + codec_test_error);
-    else
-        wi::backlog::post("Remote transport self-test passed: V2 codec plus V3 formal contracts.");
     InitializeSceneIfNeeded();
     ConfigureDDGI();
     // SpecularIndirectPreAO is emitted by Visibility_Shade. Keep Server and
@@ -143,15 +133,12 @@ void NewPipelineServerRenderPath::Start()
     setVisibilityComputeShadingEnabled(true);
     wi::RenderPath3D::Start();
     StartPublishWorker();
-    if (config.remote_source == RemoteSourceMode::WebRTC)
-    {
-        std::string error;
-        if (!webrtc_transport.RequestStart(true, config, &error))
-            wi::backlog::post("Server WebRTC start failed: " + error);
-    }
+    std::string error;
+    if (!webrtc_transport.RequestStart(true, config, &error))
+        wi::backlog::post("Server WebRTC start failed: " + error);
 
     wi::backlog::post("NewPipeline_Wicked Server render path started.");
-    wi::backlog::post(std::string{"Server remote source: "} + ToString(config.remote_source));
+    wi::backlog::post("Server remote source: WebRTC V3");
     wi::backlog::post(std::string{"Server DDGI: "} + (settings.ddgi_enabled ? "enabled" : "disabled"));
     wi::backlog::post("Server DDGI ray count: " + std::to_string(settings.ddgi_ray_count));
     wi::backlog::post("Server remote publish FPS: " + std::to_string(settings.remote_publish_fps));
@@ -183,7 +170,7 @@ void NewPipelineServerRenderPath::Update(float dt)
 
     if (!status_logged)
     {
-        wi::backlog::post(std::string{"Server remote source: "} + ToString(config.remote_source));
+        wi::backlog::post("Server remote source: WebRTC V3");
         wi::backlog::post(std::string{"Server DDGI: "} + (settings.ddgi_enabled ? "enabled" : "disabled"));
         wi::backlog::post("Server DDGI ray count: " + std::to_string(settings.ddgi_ray_count));
         wi::backlog::post("Server remote publish FPS: " + std::to_string(settings.remote_publish_fps));
@@ -412,8 +399,6 @@ void NewPipelineServerRenderPath::DrawUnavailablePreview(wi::graphics::CommandLi
 void NewPipelineServerRenderPath::MaintainWebRTC(float dt)
 {
     webrtc_transport.Tick();
-    if (config.remote_source != RemoteSourceMode::WebRTC)
-        return;
     const WebRTCTransportStats stats = webrtc_transport.GetStats();
     transport_telemetry_window_seconds += std::max(0.0f, dt);
     if (transport_telemetry_window_seconds >= 1.0f)
@@ -437,19 +422,12 @@ void NewPipelineServerRenderPath::MaintainWebRTC(float dt)
     if (previous_webrtc_state == WebRTCTransportState::Connected &&
         stats.state != WebRTCTransportState::Connected)
     {
-        for (ReadbackSlot& slot : readback_ring)
-        {
-            slot.pending = false;
-            slot.available_mask = 0;
-        }
         for (PackedReadbackSlot& slot : packed_readback_ring)
             slot.pending = false;
-        readback_write_index = 0;
         packed_readback_write_index = 0;
         transport_preview_available_mask = 0;
         packed_layout_contract_valid = false;
         std::lock_guard lock(publish_mutex);
-        pending_publish_frame.reset();
         pending_i420_frame.reset();
     }
     previous_webrtc_state = stats.state;
@@ -608,16 +586,14 @@ bool NewPipelineServerRenderPath::EncodeTransportTexture(
 
 void NewPipelineServerRenderPath::PublishRemotePayload(float dt)
 {
-    if (config.remote_source == RemoteSourceMode::WebRTC &&
-        webrtc_transport.GetStats().state != WebRTCTransportState::Connected)
+    if (webrtc_transport.GetStats().state != WebRTCTransportState::Connected)
     {
-        mock_publish_accumulator = 0.0f;
+        publish_accumulator = 0.0f;
         remote_capture_requested = false;
         return;
     }
 
-    if (config.remote_source == RemoteSourceMode::WebRTC &&
-        pending_stream_status.has_value())
+    if (pending_stream_status.has_value())
     {
         // A selected profile must be announced before any frame using it can
         // enter the capture/publish pipeline. If the non-blocking channel is
@@ -630,35 +606,32 @@ void NewPipelineServerRenderPath::PublishRemotePayload(float dt)
         pending_stream_status.reset();
     }
 
-    if (config.remote_source == RemoteSourceMode::WebRTC)
-        ConsumeCompletedPackedReadback();
-    else
-        ConsumeCompletedReadback();
+    ConsumeCompletedPackedReadback();
 
     if (settings.remote_publish_fps <= 0.0f)
     {
         remote_capture_requested = false;
-        if (!mock_remote_disabled_logged)
+        if (!remote_publish_disabled_logged)
         {
             wi::backlog::post("Server remote publish disabled: --remote_fps 0");
-            mock_remote_disabled_logged = true;
+            remote_publish_disabled_logged = true;
         }
         return;
     }
 
-    if (!mock_remote_publish_logged)
+    if (!remote_publish_logged)
     {
-        wi::backlog::post(config.remote_source == RemoteSourceMode::Mock
-            ? "Server mock remote publish active: " + mock_remote_mailbox.GetRootDirectory()
-            : "Server WebRTC video-track publish active: " + config.signaling_url + " room=" + config.room_id);
-        mock_remote_publish_logged = true;
+        wi::backlog::post(
+            "Server WebRTC video-track publish active: " +
+            config.signaling_url + " room=" + config.room_id);
+        remote_publish_logged = true;
     }
 
     const float publish_interval = 1.0f / std::max(0.001f, settings.remote_publish_fps);
-    mock_publish_accumulator += dt;
-    if (mock_publish_accumulator < publish_interval)
+    publish_accumulator += dt;
+    if (publish_accumulator < publish_interval)
         return;
-    mock_publish_accumulator = 0.0f;
+    publish_accumulator = 0.0f;
     remote_capture_requested = true;
 }
 
@@ -678,106 +651,7 @@ void NewPipelineServerRenderPath::CaptureRequestedRemotePayload()
         authoritative_shadow_index < 16 &&
             local_primary_light_visibility.IsValid()
         ? &local_primary_light_visibility : nullptr;
-    if (config.remote_source == RemoteSourceMode::WebRTC)
-    {
-        CapturePackedRemoteFrame(sources);
-        return;
-    }
-    ReadbackSlot& slot = readback_ring[readback_write_index];
-    if (slot.pending)
-    {
-        // The ring only advances when a copy is submitted. A still-pending slot
-        // means the producer outran the three-frame latency, so drop this capture
-        // instead of ever waiting for the GPU on the render thread.
-        ++remote_capture_drops;
-        return;
-    }
-
-    wi::graphics::GraphicsDevice* device = wi::graphics::GetDevice();
-    wi::graphics::CommandList cmd = device->BeginCommandList();
-    uint32_t available_mask = 0;
-    for (size_t index = 0; index < sources.size(); ++index)
-    {
-        const wi::graphics::Texture* source = sources[index];
-        if (source == nullptr || !source->IsValid())
-            continue;
-        const RemoteBufferSemantic semantic = static_cast<RemoteBufferSemantic>(index);
-        const wi::graphics::TextureDesc& source_desc = source->GetDesc();
-        if (!EnsureTransportTexture(semantic, source_desc.width, source_desc.height))
-            continue;
-
-        if (!EncodeTransportTexture(
-                semantic, *source,
-                transport_textures[index], cmd))
-        {
-            ++remote_capture_drops;
-            continue;
-        }
-
-        wi::graphics::Texture& readback = slot.textures[index];
-        const auto& transport_desc = transport_textures[index].GetDesc();
-        if (!readback.IsValid() || readback.GetDesc().width != transport_desc.width ||
-            readback.GetDesc().height != transport_desc.height)
-        {
-            wi::graphics::TextureDesc readback_desc = transport_desc;
-            readback_desc.usage = wi::graphics::Usage::READBACK;
-            readback_desc.bind_flags = wi::graphics::BindFlag::NONE;
-            readback_desc.layout = wi::graphics::ResourceState::COPY_DST;
-            if (!device->CreateTexture(&readback_desc, nullptr, &readback))
-                continue;
-            const std::string name = "newpipeline.readback[" + std::to_string(readback_write_index) + "]." +
-                ToString(semantic);
-            device->SetName(&readback, name.c_str());
-        }
-        device->Barrier(wi::graphics::GPUBarrier::Image(
-            &transport_textures[index], transport_desc.layout, wi::graphics::ResourceState::COPY_SRC), cmd);
-        device->CopyResource(&readback, &transport_textures[index], cmd);
-        gpu_readback_bytes += static_cast<uint64_t>(transport_desc.width) * transport_desc.height * 4u;
-        device->Barrier(wi::graphics::GPUBarrier::Image(
-            &transport_textures[index], wi::graphics::ResourceState::COPY_SRC, transport_desc.layout), cmd);
-        available_mask |= RemoteBufferKindMask(semantic);
-    }
-    if (available_mask == 0)
-        return;
-    slot.metadata = {};
-    slot.metadata.frame_id = ++remote_frame_id;
-    slot.metadata.timestamp_usec = NowUsec();
-    slot.metadata.source_generation = remote_generation;
-    slot.metadata.continuity_mask = available_mask;
-    slot.metadata.available_buffer_mask = available_mask;
-    slot.metadata.dynamic_range = RemoteDynamicRange::HDR;
-    slot.metadata.source_stream_id = kRemoteFrameStreamId;
-    slot.metadata.view_origin = local_camera.Eye;
-    XMStoreFloat3(&slot.metadata.view_forward,
-        XMVector3Normalize(XMLoadFloat3(&local_camera.At)));
-    slot.metadata.view = local_camera.View;
-    slot.metadata.projection = local_camera.Projection;
-    XMStoreFloat4x4(&slot.metadata.view_projection,
-        XMMatrixMultiply(XMLoadFloat4x4(&local_camera.View), XMLoadFloat4x4(&local_camera.Projection)));
-    XMStoreFloat4x4(&slot.metadata.inverse_view, XMMatrixInverse(nullptr, XMLoadFloat4x4(&slot.metadata.view)));
-    XMStoreFloat4x4(&slot.metadata.inverse_projection, XMMatrixInverse(nullptr, XMLoadFloat4x4(&slot.metadata.projection)));
-    XMStoreFloat4x4(&slot.metadata.inverse_view_projection,
-        XMMatrixInverse(nullptr, XMLoadFloat4x4(&slot.metadata.view_projection)));
-    slot.metadata.near_plane = local_camera.zNearP;
-    slot.metadata.far_plane = local_camera.zFarP;
-    slot.metadata.history_valid = local_scene.ddgi.frame_index >= 64;
-    slot.metadata.reset_this_frame = ddgi_announced_reset_serial != ddgi_reset_serial;
-    slot.metadata.camera_cut = camera_cut_pending;
-    if (slot.metadata.reset_this_frame)
-        ddgi_announced_reset_serial = ddgi_reset_serial;
-    // Buffer availability is described independently by available_buffer_mask.
-    // Missing an optional reflection or shadow buffer must not reduce the
-    // confidence of a valid DDGI or AO tile.
-    slot.metadata.confidence = 1.0f;
-    slot.metadata.valid = true;
-    slot.metadata.ddgi_frame_index = local_scene.ddgi.frame_index;
-    slot.metadata.ddgi_reset_reason = ddgi_reset_reason;
-    slot.available_mask = available_mask;
-    slot.pending = true;
-    transport_preview_available_mask = available_mask;
-    camera_cut_pending = false;
-    ++remote_capture_count;
-    readback_write_index = (readback_write_index + 1) % kReadbackRingSize;
+    CapturePackedRemoteFrame(sources);
 }
 
 void NewPipelineServerRenderPath::CapturePackedRemoteFrame(
@@ -800,12 +674,12 @@ void NewPipelineServerRenderPath::CapturePackedRemoteFrame(
         return;
     }
 
-    RemoteRawFrame contract;
+    RemoteFrameSource contract;
     uint32_t available_mask = 0;
     for (size_t index = 0; index < sources.size(); ++index)
     {
         const wi::graphics::Texture* source = sources[index];
-        RemoteRawBuffer& buffer = contract.buffers[index];
+        RemoteSemanticSource& buffer = contract.buffers[index];
         buffer.semantic = static_cast<RemoteBufferSemantic>(index);
         buffer.encoding = RemoteBufferTransportEncoding(buffer.semantic);
         if (source == nullptr || !source->IsValid())
@@ -898,8 +772,6 @@ void NewPipelineServerRenderPath::CapturePackedRemoteFrame(
         }
     };
     refresh_content_states(
-        remote_stream_selection.protocol_version !=
-            kRemoteVideoWireVersionV3 ||
         !packed_layout_contract_valid ||
         control_frame_id == 0 ||
         control_frame_id != remote_content_control_frame_id);
@@ -908,20 +780,16 @@ void NewPipelineServerRenderPath::CapturePackedRemoteFrame(
     std::vector<uint8_t> metadata_luma;
     std::string layout_error;
     const auto build_layout = [&]() {
-        if (remote_stream_selection.protocol_version == kRemoteVideoWireVersionV3)
-        {
-            return BuildRemoteVideoFrameLayoutV3(
-                contract,
-                remote_stream_selection,
-                control_frame_id,
-                authoritative_shadow_light_id,
-                authoritative_shadow_light_generation,
-                layout,
-                metadata_luma,
-                &layout_error,
-                &proposed_content_states);
-        }
-        return BuildRemoteVideoFrameLayout(contract, layout, metadata_luma, &layout_error);
+        return BuildRemoteVideoFrameLayoutV3(
+            contract,
+            remote_stream_selection,
+            control_frame_id,
+            authoritative_shadow_light_id,
+            authoritative_shadow_light_generation,
+            layout,
+            metadata_luma,
+            &layout_error,
+            &proposed_content_states);
     };
     if (!build_layout())
     {
@@ -956,19 +824,8 @@ void NewPipelineServerRenderPath::CapturePackedRemoteFrame(
             a.quality_tier != b.quality_tier ||
             a.video_width != b.video_width || a.video_height != b.video_height)
             return false;
-        if (a.protocol_version == kRemoteVideoWireVersionV3)
-            return a.layout_checksum != 0 &&
-                a.layout_checksum == b.layout_checksum;
-        for (size_t index = 0; index < a.tiles.size(); ++index)
-        {
-            const RemoteVideoTileLayout& x = a.tiles[index];
-            const RemoteVideoTileLayout& y = b.tiles[index];
-            if (x.semantic != y.semantic || x.width != y.width || x.height != y.height ||
-                x.origin_x != y.origin_x || x.origin_y != y.origin_y ||
-                x.available != y.available || x.encoding != y.encoding)
-                return false;
-        }
-        return true;
+        return a.layout_checksum != 0 &&
+            a.layout_checksum == b.layout_checksum;
     };
     const bool layout_boundary =
         !packed_layout_contract_valid ||
@@ -1067,9 +924,7 @@ void NewPipelineServerRenderPath::CapturePackedRemoteFrame(
     pack_desc.u_offset = u_offset;
     pack_desc.v_offset = v_offset;
     pack_desc.available_mask = available_mask;
-    pack_desc.tile_padding = layout.protocol_version == kRemoteVideoWireVersionV3
-        ? kRemoteVideoV3CodecAlignment * 2u
-        : 0u;
+    pack_desc.tile_padding = kRemoteVideoV3CodecAlignment * 2u;
 
     wi::graphics::CommandList cmd = device->BeginCommandList();
     // These are the canonical pre-I420 transport surfaces. The Server preview
@@ -1161,39 +1016,36 @@ void NewPipelineServerRenderPath::CapturePackedRemoteFrame(
         image.blendFlag = wi::enums::BLENDMODE_OPAQUE;
         image.quality = wi::image::QUALITY_LINEAR;
         image.sampleFlag = wi::image::SAMPLEMODE_CLAMP;
-        if (layout.protocol_version == kRemoteVideoWireVersionV3)
-        {
-            constexpr uint32_t padding = kRemoteVideoV3CodecAlignment * 2u;
-            const float x = static_cast<float>(tile.origin_x);
-            const float y = static_cast<float>(tile.origin_y);
-            const float width = static_cast<float>(tile.width);
-            const float height = static_cast<float>(tile.height);
-            const float pad = static_cast<float>(padding);
+        constexpr uint32_t padding = kRemoteVideoV3CodecAlignment * 2u;
+        const float x = static_cast<float>(tile.origin_x);
+        const float y = static_cast<float>(tile.origin_y);
+        const float width = static_cast<float>(tile.width);
+        const float height = static_cast<float>(tile.height);
+        const float pad = static_cast<float>(padding);
 
-            const auto draw_dilated_rect = [&](float destination_x, float destination_y,
-                float destination_width, float destination_height,
-                float source_x, float source_y, float source_width, float source_height) {
-                wi::image::Params edge = image;
-                edge.quality = wi::image::QUALITY_NEAREST;
-                edge.pos = XMFLOAT3(destination_x, destination_y, 0);
-                edge.siz = XMFLOAT2(destination_width, destination_height);
-                edge.enableDrawRect(XMFLOAT4(source_x, source_y, source_width, source_height));
-                wi::image::Draw(&transport_textures[index], edge, cmd);
-            };
+        const auto draw_dilated_rect = [&](float destination_x, float destination_y,
+            float destination_width, float destination_height,
+            float source_x, float source_y, float source_width, float source_height) {
+            wi::image::Params edge = image;
+            edge.quality = wi::image::QUALITY_NEAREST;
+            edge.pos = XMFLOAT3(destination_x, destination_y, 0);
+            edge.siz = XMFLOAT2(destination_width, destination_height);
+            edge.enableDrawRect(XMFLOAT4(source_x, source_y, source_width, source_height));
+            wi::image::Draw(&transport_textures[index], edge, cmd);
+        };
 
-            // Edge strips:
-            draw_dilated_rect(x - pad, y, pad, height, 0, 0, 1, height);
-            draw_dilated_rect(x + width, y, pad, height, width - 1, 0, 1, height);
-            draw_dilated_rect(x, y - pad, width, pad, 0, 0, width, 1);
-            draw_dilated_rect(
-                x, y + height, width, pad, 0, height - 1, width, 1);
-            // Corners:
-            draw_dilated_rect(x - pad, y - pad, pad, pad, 0, 0, 1, 1);
-            draw_dilated_rect(x + width, y - pad, pad, pad, width - 1, 0, 1, 1);
-            draw_dilated_rect(x - pad, y + height, pad, pad, 0, height - 1, 1, 1);
-            draw_dilated_rect(
-                x + width, y + height, pad, pad, width - 1, height - 1, 1, 1);
-        }
+        // Edge strips:
+        draw_dilated_rect(x - pad, y, pad, height, 0, 0, 1, height);
+        draw_dilated_rect(x + width, y, pad, height, width - 1, 0, 1, height);
+        draw_dilated_rect(x, y - pad, width, pad, 0, 0, width, 1);
+        draw_dilated_rect(
+            x, y + height, width, pad, 0, height - 1, width, 1);
+        // Corners:
+        draw_dilated_rect(x - pad, y - pad, pad, pad, 0, 0, 1, 1);
+        draw_dilated_rect(x + width, y - pad, pad, pad, width - 1, 0, 1, 1);
+        draw_dilated_rect(x - pad, y + height, pad, pad, 0, height - 1, 1, 1);
+        draw_dilated_rect(
+            x + width, y + height, pad, pad, width - 1, height - 1, 1, 1);
         image.pos = XMFLOAT3(
             static_cast<float>(tile.origin_x),
             static_cast<float>(tile.origin_y),
@@ -1308,54 +1160,6 @@ void NewPipelineServerRenderPath::ConsumeCompletedPackedReadback()
     QueueI420FrameForPublish(std::move(frame), slot.layout);
 }
 
-void NewPipelineServerRenderPath::ConsumeCompletedReadback()
-{
-    ReadbackSlot& slot = readback_ring[readback_write_index];
-    if (!slot.pending)
-        return;
-
-    RemoteRawFrame frame;
-    frame.metadata = slot.metadata;
-    for (size_t index = 0; index < frame.buffers.size(); ++index)
-    {
-        const RemoteBufferSemantic semantic = static_cast<RemoteBufferSemantic>(index);
-        if ((slot.available_mask & RemoteBufferKindMask(semantic)) == 0)
-            continue;
-        const wi::graphics::Texture& readback = slot.textures[index];
-        if (!readback.IsValid() || readback.mapped_data == nullptr ||
-            readback.mapped_subresources == nullptr || readback.mapped_subresource_count == 0)
-        {
-            frame.metadata.continuity_mask &= ~RemoteBufferKindMask(semantic);
-            frame.metadata.available_buffer_mask &= ~RemoteBufferKindMask(semantic);
-            continue;
-        }
-        const auto& desc = readback.GetDesc();
-        RemoteRawBuffer& destination = frame.buffers[index];
-        destination.width = desc.width;
-        destination.height = desc.height;
-        destination.available = true;
-        destination.encoding = RemoteBufferTransportEncoding(semantic);
-        destination.payload_rgba8.resize(static_cast<size_t>(desc.width) * desc.height * 4);
-        const uint8_t* source = static_cast<const uint8_t*>(readback.mapped_data);
-        const uint32_t source_pitch = readback.mapped_subresources[0].row_pitch;
-        const size_t destination_pitch = static_cast<size_t>(desc.width) * 4;
-        for (uint32_t y = 0; y < desc.height; ++y)
-        {
-            std::memcpy(destination.payload_rgba8.data() + y * destination_pitch,
-                source + static_cast<size_t>(y) * source_pitch, destination_pitch);
-        }
-        cpu_readback_copy_bytes += static_cast<uint64_t>(destination_pitch) * desc.height;
-        frame.metadata.width = std::max(frame.metadata.width, desc.width);
-        frame.metadata.height = std::max(frame.metadata.height, desc.height);
-    }
-    slot.pending = false;
-    slot.available_mask = 0;
-    if (frame.metadata.available_buffer_mask == 0)
-        return;
-
-    QueueFrameForPublish(std::move(frame));
-}
-
 void NewPipelineServerRenderPath::StartPublishWorker()
 {
     if (publish_worker.joinable())
@@ -1366,73 +1170,45 @@ void NewPipelineServerRenderPath::StartPublishWorker()
         uint32_t published_generation = 0;
         for (;;)
         {
-            RemoteRawFrame frame;
             RetainedI420Frame i420_frame;
             RemoteVideoFrameLayout i420_layout;
-            bool has_raw_frame = false;
-            bool has_i420_frame = false;
             {
                 std::unique_lock lock(publish_mutex);
                 publish_cv.wait(lock, [this]() {
-                    return publish_worker_stop || pending_publish_frame.has_value() || pending_i420_frame.has_value();
+                    return publish_worker_stop || pending_i420_frame.has_value();
                 });
-                if (publish_worker_stop && !pending_publish_frame.has_value() && !pending_i420_frame.has_value())
+                if (publish_worker_stop && !pending_i420_frame.has_value())
                     return;
-                if (pending_i420_frame.has_value())
-                {
-                    i420_frame = std::move(pending_i420_frame->frame);
-                    i420_layout = std::move(pending_i420_frame->layout);
-                    pending_i420_frame.reset();
-                    has_i420_frame = true;
-                }
-                else if (pending_publish_frame.has_value())
-                {
-                    frame = std::move(*pending_publish_frame);
-                    pending_publish_frame.reset();
-                    has_raw_frame = true;
-                }
+                i420_frame = std::move(pending_i420_frame->frame);
+                i420_layout = std::move(pending_i420_frame->layout);
+                pending_i420_frame.reset();
             }
 
             std::string error;
-            bool published = false;
-            if (has_i420_frame)
-            {
-                const bool generation_boundary =
-                    i420_layout.metadata.camera_cut ||
-                    i420_layout.metadata.source_generation != published_generation;
-                const bool keyframe_ready =
-                    !generation_boundary || webrtc_transport.RequestKeyframe();
-                const bool metadata_sent =
-                    keyframe_ready && webrtc_transport.SendFrameMetadata(i420_layout);
-                published = metadata_sent &&
-                    webrtc_transport.SendI420Frame(i420_frame);
-                if (published)
-                    published_generation = i420_layout.metadata.source_generation;
-                if (!published)
-                    error = keyframe_ready
-                        ? webrtc_transport.GetStats().status
-                        : "keyframe request was not acknowledged before generation boundary";
-            }
-            else if (has_raw_frame && config.remote_source == RemoteSourceMode::Mock)
-            {
-                published = mock_remote_mailbox.PublishLatest(frame, &error);
-            }
-            else if (has_raw_frame)
-            {
-                published = webrtc_transport.SendFrame(frame);
-                if (!published)
-                    error = webrtc_transport.GetStats().status;
-            }
+            const bool generation_boundary =
+                i420_layout.metadata.camera_cut ||
+                i420_layout.metadata.source_generation != published_generation;
+            const bool keyframe_ready =
+                !generation_boundary || webrtc_transport.RequestKeyframe();
+            const bool metadata_sent =
+                keyframe_ready && webrtc_transport.SendFrameMetadata(i420_layout);
+            const bool published = metadata_sent &&
+                webrtc_transport.SendI420Frame(i420_frame);
+            if (published)
+                published_generation = i420_layout.metadata.source_generation;
+            else
+                error = keyframe_ready
+                    ? webrtc_transport.GetStats().status
+                    : "keyframe request was not acknowledged before generation boundary";
             if (!published)
                 wi::backlog::post("Server remote publish failed: " +
                     (error.empty() ? std::string{"unknown transport error"} : error));
-            else if ((has_raw_frame && frame.metadata.frame_id == 1) ||
-                (has_i420_frame && !first_packed_frame_published))
+            else if (!first_packed_frame_published)
             {
                 wi::backlog::post("Server remote published first asynchronous frame: " +
-                    std::to_string(has_i420_frame ? i420_frame.width : frame.metadata.width) + "x" +
-                    std::to_string(has_i420_frame ? i420_frame.height : frame.metadata.height));
-                first_packed_frame_published = first_packed_frame_published || has_i420_frame;
+                    std::to_string(i420_frame.width) + "x" +
+                    std::to_string(i420_frame.height));
+                first_packed_frame_published = true;
             }
         }
     });
@@ -1447,18 +1223,6 @@ void NewPipelineServerRenderPath::StopPublishWorker()
     publish_cv.notify_all();
     if (publish_worker.joinable())
         publish_worker.join();
-}
-
-void NewPipelineServerRenderPath::QueueFrameForPublish(RemoteRawFrame&& frame)
-{
-    {
-        std::lock_guard lock(publish_mutex);
-        // Latest-frame semantics: encoding never builds a backlog behind rendering.
-        if (pending_publish_frame.has_value())
-            publish_queue_drops.fetch_add(1, std::memory_order_relaxed);
-        pending_publish_frame = std::move(frame);
-    }
-    publish_cv.notify_one();
 }
 
 void NewPipelineServerRenderPath::QueueI420FrameForPublish(
@@ -1503,9 +1267,8 @@ void NewPipelineServerRenderPath::InitializeSceneIfNeeded()
         wi::backlog::post("Server scene diagnostic: " + result.diagnostic);
     wi::backlog::post("Server scene parity: " +
         FormatSceneParityFingerprint(ComputeSceneParityFingerprint(local_scene)));
-    wi::backlog::post(config.remote_source == RemoteSourceMode::Mock
-        ? "Server using file mock control source: " + mock_control_mailbox.GetRootDirectory()
-        : "Server using WebRTC DataChannel for client control only; frame output is video-track only.");
+    wi::backlog::post(
+        "Server using WebRTC DataChannel for client control only; frame output is video-track only.");
     wi::backlog::post("Server DDGI grid dimensions: " +
         std::to_string(local_scene.ddgi.grid_dimensions.x) + " x " +
         std::to_string(local_scene.ddgi.grid_dimensions.y) + " x " +
@@ -1569,32 +1332,20 @@ void NewPipelineServerRenderPath::ConfigureDDGI()
 
 void NewPipelineServerRenderPath::ApplyLatestControlPacket()
 {
-    if (!mock_control_source_logged)
+    if (!control_source_logged)
     {
-        wi::backlog::post(config.remote_source == RemoteSourceMode::Mock
-            ? "Server file mock control acquire active: " + mock_control_mailbox.GetRootDirectory()
-            : "Server WebRTC control DataChannel acquire active (client to server only).");
-        mock_control_source_logged = true;
+        wi::backlog::post(
+            "Server WebRTC control DataChannel acquire active (client to server only).");
+        control_source_logged = true;
     }
 
     ClientControlPacket packet;
-    std::string error;
-    const bool received = config.remote_source == RemoteSourceMode::Mock
-        ? mock_control_mailbox.TryConsumeLatest(packet, &error)
-        : webrtc_transport.TryReceiveControl(packet);
-    if (!received)
-    {
-        if (!error.empty())
-            wi::backlog::post(std::string{config.remote_source == RemoteSourceMode::Mock
-                ? "Server file mock control acquire failed: "
-                : "Server WebRTC control acquire failed: "} + error);
+    if (!webrtc_transport.TryReceiveControl(packet))
         return;
-    }
 
     const RemoteStreamSelection negotiated = NegotiateRemoteStream(packet);
     const RemoteStreamStatus stream_status = BuildRemoteStreamStatus(packet);
-    if (config.remote_source == RemoteSourceMode::WebRTC)
-        pending_stream_status = stream_status;
+    pending_stream_status = stream_status;
     if (!remote_stream_selection_initialized || negotiated != remote_stream_selection)
     {
         remote_stream_selection = negotiated;
@@ -1704,9 +1455,9 @@ void NewPipelineServerRenderPath::ApplyLatestControlPacket()
     }
     if (first_control)
     {
-        wi::backlog::post(std::string{config.remote_source == RemoteSourceMode::Mock
-                ? "Server file mock control applied first frame: "
-                : "Server WebRTC control applied first frame: "} + std::to_string(last_applied_frame_id) +
+        wi::backlog::post(
+            "Server WebRTC control applied first frame: " +
+            std::to_string(last_applied_frame_id) +
             " sun=" + (packet.sun_enabled ? std::string("enabled") : std::string("disabled")));
     }
 }
@@ -1730,7 +1481,8 @@ void NewPipelineServerRenderPath::LogDDGIStatusIfNeeded()
     const wi::graphics::Texture& formal = GetDDGIRemoteIndirectDiffuseFormal();
     if (!settings.ddgi_enabled)
     {
-        wi::backlog::post("Server RemoteIndirectDiffuseFormal: DDGI disabled, mock remote publish skipped.");
+        wi::backlog::post(
+            "Server RemoteIndirectDiffuseFormal: DDGI disabled, remote publish skipped.");
         ddgi_formal_status_logged = true;
         return;
     }

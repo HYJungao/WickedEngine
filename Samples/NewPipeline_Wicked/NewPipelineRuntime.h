@@ -9,12 +9,6 @@
 
 namespace wicked_newpipeline
 {
-enum class RemoteSourceMode : uint8_t
-{
-    Mock,
-    WebRTC
-};
-
 enum class RemoteBufferKind : uint32_t
 {
     None               = 0u,
@@ -23,10 +17,6 @@ enum class RemoteBufferKind : uint32_t
     SpecularIndirect   = 1u << 2u,
     ShadowVisibility   = 1u << 3u,
     All                = (1u << 0u) | (1u << 1u) | (1u << 2u) | (1u << 3u),
-
-    // Compatibility aliases retained for existing command-line/config code.
-    GI                 = IndirectDiffuse,
-    Reflection         = SpecularIndirect,
 };
 
 enum class RemoteBufferSemantic : uint8_t
@@ -52,8 +42,8 @@ enum class RemoteBufferEncoding : uint8_t
     ScalarLuma8,
 };
 
-// V3 names the physical representation independently from the legacy buffer
-// label.  These values are protocol constants; do not reorder or reuse them.
+// V3 names the physical representation independently from the UI buffer label.
+// These values are protocol constants; do not reorder or reuse them.
 enum class RemoteBufferRepresentationV3 : uint8_t
 {
     DiffuseIrradiance = 0,
@@ -102,13 +92,6 @@ enum class DDGIResetReason : uint8_t
     GridChanged,
 };
 
-enum class RemoteDebugMode : uint8_t
-{
-    Local,
-    Raw,
-    DebugComposite
-};
-
 enum class DebugPreviewMode : uint8_t
 {
     Final,
@@ -129,7 +112,6 @@ enum class DebugPreviewMode : uint8_t
     ElasticAO,
     ElasticSpecularIndirectPreAO,
     ElasticPrimaryLightVisibility,
-    RemoteOverview,
     TransportIndirectDiffuse,
     TransportAO,
     TransportSpecularIndirect,
@@ -173,21 +155,8 @@ struct RemoteFrameMetadata
     DDGIResetReason    ddgi_reset_reason = DDGIResetReason::None;
 };
 
-struct RemoteStreamConfig
-{
-    std::string        stream_id       = "RemoteBuffer.RemoteIndirectDiffuse.V1";
-    RemoteSourceMode   source_mode     = RemoteSourceMode::Mock;
-    uint32_t           produced_kinds  = static_cast<uint32_t>(RemoteBufferKind::All);
-    uint32_t           target_width    = 0;
-    uint32_t           target_height   = 0;
-    float              target_fps      = 30.0f;
-    RemoteDynamicRange dynamic_range   = RemoteDynamicRange::LDR;
-};
-
 struct RuntimeConfig
 {
-    RemoteSourceMode        remote_source = RemoteSourceMode::WebRTC;
-    RemoteDebugMode         remote_debug_mode = RemoteDebugMode::Local;
     std::string             signaling_url = "ws://127.0.0.1:39876";
     std::string             room_id = "NewPipeline.Wicked.V1";
     RemoteQualityTierV3     remote_quality_tier = RemoteQualityTierV3::High;
@@ -231,15 +200,11 @@ FormalLightingBlendV3Result EvaluateFormalLightingBlendV3(const FormalLightingBl
 bool ValidateFormalLightingBlendV3Reference(std::string* error = nullptr);
 
 const char* ToString(RemoteBufferSemantic semantic);
-const char* ToString(RemoteSourceMode mode);
 const char* ToString(RemoteDynamicRange range);
-const char* ToString(RemoteDebugMode mode);
 const char* ToString(DebugPreviewMode mode);
 const char* ToString(RemoteBufferEncoding encoding);
 const char* ToString(RemoteQualityTierV3 tier);
 const char* ToString(DDGIResetReason reason);
 
-RemoteSourceMode ParseRemoteSourceMode(const std::string& value, RemoteSourceMode fallback);
-RemoteDebugMode ParseRemoteDebugMode(const std::string& value, RemoteDebugMode fallback);
 RuntimeConfig ParseRuntimeConfig(int argc, char* argv[], RuntimeConfig fallback = {});
 } // namespace wicked_newpipeline

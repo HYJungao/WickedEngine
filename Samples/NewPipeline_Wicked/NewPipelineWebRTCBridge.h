@@ -38,7 +38,6 @@ typedef struct NPWebRTCBridgeStats
     uint32_t power_efficient_codec;
     char codec_name[64];
     char codec_implementation[64];
-    char codec_fallback_reason[160];
     char status[256];
 } NPWebRTCBridgeStats;
 

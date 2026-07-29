@@ -22,7 +22,7 @@ int main(int argc, char* argv[])
         {
             std::string error;
             const bool passed = wicked_newpipeline::ValidateRemoteTransportSelfTest(&error);
-            fprintf(stderr, "%s\n", passed ? "Remote transport V2+V3 self-test passed" : error.c_str());
+            fprintf(stderr, "%s\n", passed ? "Remote transport V3 self-test passed" : error.c_str());
             return passed ? 0 : 1;
         }
     }

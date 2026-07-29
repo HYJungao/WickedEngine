@@ -19,16 +19,16 @@ notes are intentionally not repeated here.
 - Metadata and video pixels are accepted only as a matching frame/generation pair.
 - Server capture runs after the matching frame's formal lighting outputs are recorded,
   so pixels and `source_control_frame_id` never straddle two camera frames.
-- Software I420/VP8 remains the portable compatibility path until a native codec path
+- Software I420/VP8 remains the portable production path until a native codec path
   passes the same correctness and lifecycle tests.
 
 ## Completed implementation: remote V3 semantic path
 
-The versioned four-buffer contract, explicit negotiation status,
+The V3 four-buffer contract, explicit negotiation status,
 descriptor-driven compact atlas, bounded control-frame GBuffer history,
 geometry-aware reprojection/upscale, four-way Final fusion, quality tiers and
-fixed-atlas per-semantic cadence are implemented as defined in
-[`REMOTE_BUFFER_BLEND_V3_PLAN.md`](REMOTE_BUFFER_BLEND_V3_PLAN.md).
+fixed-atlas per-semantic cadence are implemented. V2 and the file/mock transport
+were removed after visual acceptance; V3 is now the only remote video protocol.
 
 High is the production default. Balanced/Low and cadence remain explicit opt-in
 until the production-validation matrix below records acceptable visual, bitrate
@@ -42,8 +42,8 @@ remote-lighting pixels on the GPU.
 
 Required work:
 
-- implement a retained DX12/NV12 surface and fence token behind
-  `IRemoteVideoCodecBackend`;
+- define a retained DX12/NV12 surface and fence-token interface for the native
+  backend;
 - integrate a hardware H.264 encoder that accepts the Server surface without a raw
   GPU-to-CPU readback;
 - integrate a matching decoder that exposes a retained Client GPU surface;
@@ -110,7 +110,7 @@ These are not approved implementation requirements:
 - multiple remote shadow slots;
 - multiple video tracks;
 - direct sampling as the default without profiling;
-- removal of the legacy pixel metadata band before the paired metadata channel has
+- removal of the V3 pixel identity band before the paired metadata channel has
   passed loss, reorder and native-decoder validation;
 - Linux WebRTC packaging and runtime support.
 

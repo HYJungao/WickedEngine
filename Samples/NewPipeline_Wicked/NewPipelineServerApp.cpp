@@ -118,18 +118,14 @@ void NewPipelineServerApp::ConfigureFromCommandLine(int argc, char* argv[])
     server_settings.ddgi_enabled = !HasStartupArgument(argc, argv, "no_ddgi");
     server_settings.ddgi_debug_formal = HasStartupArgument(argc, argv, "ddgi_debug_formal");
 
-    std::string remote_fps_arg = GetStartupArgumentValue(argc, argv, "remote_fps");
-    const bool used_legacy_remote_fps = remote_fps_arg.empty();
-    if (used_legacy_remote_fps)
-        remote_fps_arg = GetStartupArgumentValue(argc, argv, "mock_remote_fps");
+    const std::string remote_fps_arg =
+        GetStartupArgumentValue(argc, argv, "remote_fps");
     if (!remote_fps_arg.empty())
     {
         float parsed = 0.0f;
         if (TryParseFloat(remote_fps_arg, parsed))
         {
             server_settings.remote_publish_fps = std::clamp(parsed, 0.0f, 30.0f);
-            if (used_legacy_remote_fps)
-                runtime_config.parse_warnings.push_back("--mock_remote_fps is deprecated; use --remote_fps.");
         }
         else
         {
@@ -201,6 +197,6 @@ void NewPipelineServerApp::Update(float dt)
 
 std::string NewPipelineServerApp::GetWindowTitle() const
 {
-    return std::string{"NewPipeline_Wicked Server ["} + ToString(runtime_config.remote_source) + "]";
+    return "NewPipeline_Wicked Server [WebRTC V3]";
 }
 } // namespace wicked_newpipeline

@@ -71,7 +71,6 @@ void NewPipelineClientApp::CreateDebugUI()
     preview_buffer_combo.AddItem("Elastic AO (Final Input)", static_cast<uint64_t>(DebugPreviewMode::ElasticAO));
     preview_buffer_combo.AddItem("Elastic Specular (Pre-AO)", static_cast<uint64_t>(DebugPreviewMode::ElasticSpecularIndirectPreAO));
     preview_buffer_combo.AddItem("Elastic Primary Visibility", static_cast<uint64_t>(DebugPreviewMode::ElasticPrimaryLightVisibility));
-    preview_buffer_combo.AddItem("Remote Atlas Overview", static_cast<uint64_t>(DebugPreviewMode::RemoteOverview));
     preview_buffer_combo.SetSelectedByUserdataWithoutCallback(static_cast<uint64_t>(render_path.GetDebugPreviewMode()));
     preview_buffer_combo.OnSelect([this](const wi::gui::EventArgs& args) {
         render_path.SetDebugPreviewMode(static_cast<DebugPreviewMode>(args.userdata));
@@ -391,6 +390,6 @@ void NewPipelineClientApp::Update(float dt)
 
 std::string NewPipelineClientApp::GetWindowTitle() const
 {
-    return std::string{"NewPipeline_Wicked Client ["} + ToString(runtime_config.remote_source) + "]";
+    return "NewPipeline_Wicked Client [WebRTC V3]";
 }
 } // namespace wicked_newpipeline

@@ -182,8 +182,8 @@ bool SerializeClientControlPacket(
 
     bytes.clear();
     bytes.reserve(320);
-    WriteU32(bytes, kControlWireMagicV2);
-    WriteU32(bytes, kControlWireVersionV2);
+    WriteU32(bytes, kControlWireMagic);
+    WriteU32(bytes, kControlWireVersion);
     WriteU32(bytes, 0); // byte size
     WriteU32(bytes, 0); // checksum
     WriteU64(bytes, packet.control_frame_id);
@@ -245,7 +245,7 @@ bool DeserializeClientControlPacket(
     ClientControlPacket decoded;
     if (!ReadU32(cursor, end, magic) || !ReadU32(cursor, end, version) ||
         !ReadU32(cursor, end, encoded_size) || !ReadU32(cursor, end, checksum) ||
-        magic != kControlWireMagicV2 || version != kControlWireVersionV2 ||
+        magic != kControlWireMagic || version != kControlWireVersion ||
         encoded_size != byte_count || checksum != FNV1a32(bytes + 16, byte_count - 16) ||
         !ReadU64(cursor, end, decoded.control_frame_id) ||
         !ReadU64(cursor, end, decoded.frame_id) ||
@@ -297,20 +297,15 @@ bool DeserializeClientControlPacket(
 RemoteStreamSelection NegotiateRemoteStream(const ClientControlPacket& packet)
 {
     RemoteStreamSelection selection;
-    const bool v2 = (packet.supported_protocol_versions & kRemoteProtocolCapabilityV2) != 0;
     const bool v3 = (packet.supported_protocol_versions & kRemoteProtocolCapabilityV3) != 0 &&
         (packet.supported_encoding_profiles & (1u << kRemoteEncodingProfileI420V3)) != 0;
-    if (packet.preferred_protocol_version == kRemoteVideoWireVersion && v2)
-        return selection;
     if (!v3)
     {
-        if (!v2)
-            selection.protocol_version = 0;
+        selection.protocol_version = 0;
+        selection.encoding_profile_id = 0;
         return selection;
     }
 
-    selection.protocol_version = kRemoteVideoWireVersionV3;
-    selection.encoding_profile_id = kRemoteEncodingProfileI420V3;
     const uint32_t preferred = static_cast<uint32_t>(packet.preferred_quality_tier);
     if (preferred <= static_cast<uint32_t>(RemoteQualityTierV3::Low) &&
         (packet.supported_quality_tiers & (1u << preferred)) != 0)
@@ -331,7 +326,7 @@ RemoteStreamSelection NegotiateRemoteStream(const ClientControlPacket& packet)
     }
     else
     {
-        selection.protocol_version = v2 ? kRemoteVideoWireVersion : 0;
+        selection.protocol_version = 0;
         selection.encoding_profile_id = 0;
         selection.quality_tier = RemoteQualityTierV3::High;
     }
@@ -349,11 +344,9 @@ RemoteStreamStatus BuildRemoteStreamStatus(const ClientControlPacket& packet)
         return status;
     }
 
-    const bool supports_v2 =
-        (packet.supported_protocol_versions & kRemoteProtocolCapabilityV2) != 0;
     const bool supports_v3 =
         (packet.supported_protocol_versions & kRemoteProtocolCapabilityV3) != 0;
-    if (!supports_v2 && !supports_v3)
+    if (!supports_v3)
     {
         status.code = RemoteStreamStatusCode::NoCommonProtocol;
     }
@@ -381,9 +374,13 @@ bool SerializeRemoteStreamStatus(
         static_cast<uint8_t>(status.selection.quality_tier) >
             static_cast<uint8_t>(RemoteQualityTierV3::Low) ||
         (status.code == RemoteStreamStatusCode::Selected &&
-            status.selection.protocol_version == 0) ||
+            (status.selection.protocol_version !=
+                    kRemoteVideoWireVersionV3 ||
+                status.selection.encoding_profile_id !=
+                    kRemoteEncodingProfileI420V3)) ||
         (status.code != RemoteStreamStatusCode::Selected &&
-            status.selection.protocol_version != 0))
+            (status.selection.protocol_version != 0 ||
+                status.selection.encoding_profile_id != 0)))
     {
         SetError(error, "invalid remote stream status");
         return false;
@@ -454,9 +451,13 @@ bool DeserializeRemoteStreamStatus(
         static_cast<RemoteQualityTierV3>(quality);
     if (decoded.control_frame_id == 0 ||
         (decoded.code == RemoteStreamStatusCode::Selected &&
-            decoded.selection.protocol_version == 0) ||
+            (decoded.selection.protocol_version !=
+                    kRemoteVideoWireVersionV3 ||
+                decoded.selection.encoding_profile_id !=
+                    kRemoteEncodingProfileI420V3)) ||
         (decoded.code != RemoteStreamStatusCode::Selected &&
-            decoded.selection.protocol_version != 0))
+            (decoded.selection.protocol_version != 0 ||
+                decoded.selection.encoding_profile_id != 0)))
     {
         SetError(error, "remote stream status violates the protocol contract");
         return false;
@@ -490,10 +491,12 @@ bool ValidateRemoteProtocolNegotiationSelfTest(std::string* error)
         SetError(error, "corrupt control checksum was accepted");
         return false;
     }
-    source.supported_protocol_versions = kRemoteProtocolCapabilityV2;
-    if (NegotiateRemoteStream(source).protocol_version != kRemoteVideoWireVersion)
+    source.supported_protocol_versions = 1u << 2u;
+    const RemoteStreamStatus obsolete_protocol = BuildRemoteStreamStatus(source);
+    if (obsolete_protocol.code != RemoteStreamStatusCode::NoCommonProtocol ||
+        obsolete_protocol.selection.protocol_version != 0)
     {
-        SetError(error, "V2-only control did not negotiate V2");
+        SetError(error, "obsolete remote video protocol was not rejected");
         return false;
     }
     source.supported_protocol_versions = kRemoteProtocolCapabilityV3;

@@ -71,7 +71,7 @@ constexpr size_t kMaxControlBytes = 64u * 1024u;
 constexpr size_t kMaxDataChannelBufferedBytes = 1u * 1024u * 1024u;
 constexpr size_t kMaxReceiveQueueDepth = 8u;
 constexpr uint32_t kMaxVideoDimension = 8192;
-// The V2 video frame is a data atlas rather than a camera image. Let congestion
+// The V3 video frame is a semantic data atlas rather than a camera image. Let congestion
 // control drop frames, but never silently downscale it because that destroys the
 // one-to-one mapping between decoded pixels and buffer samples.
 constexpr int kBufferVideoMinBitrateBps = 20'000'000;
@@ -1882,8 +1882,6 @@ extern "C" void np_webrtc_bridge_get_stats(NPWebRTCBridge* bridge, NPWebRTCBridg
     if (!stats)
         return;
     std::memset(stats, 0, sizeof(*stats));
-    const char fallback[] = "native GPU codec backend unavailable; software I420 bridge selected";
-    std::memcpy(stats->codec_fallback_reason, fallback, sizeof(fallback));
     if (!bridge || !bridge->session)
     {
         stats->state = NP_WEBRTC_DISABLED;

@@ -11,9 +11,7 @@ namespace wicked_newpipeline
 {
 constexpr const char* kControlStreamName             = "np.control";
 constexpr const char* kRemoteVideoStreamName         = "np.remote.video";
-constexpr const char* kRemoteFrameStreamId            = "RemoteFrame.CloudBuffers.V2";
-constexpr uint32_t    kRemoteVideoWireMagic           = 0x3156504Eu; // NPV1
-constexpr uint32_t    kRemoteVideoWireVersion         = 2u;
+constexpr const char* kRemoteFrameStreamId            = "RemoteFrame.SemanticLighting.V3";
 constexpr uint32_t    kRemoteVideoWireVersionV3       = 3u;
 constexpr uint32_t    kRemoteVideoWireMagicV3         = 0x3356504Eu; // NPV3
 constexpr uint8_t     kRemoteBufferDescriptorAvailableV3 = 1u << 0u;
@@ -21,11 +19,10 @@ constexpr uint32_t    kRemoteEncodingProfileI420V3    = 1u;
 constexpr uint16_t    kRemoteVideoV3CodecAlignment    = 2u;
 constexpr uint16_t    kRemoteVideoV3MaxAtlasDimension = 8192u;
 constexpr uint16_t    kRemoteVideoV3MaxLogicalDimension = 4096u;
-constexpr uint32_t    kControlWireMagicV2               = 0x3243504Eu; // NPC2
-constexpr uint32_t    kControlWireVersionV2             = 2u;
+constexpr uint32_t    kControlWireMagic                 = 0x3243504Eu; // NPC2
+constexpr uint32_t    kControlWireVersion               = 2u;
 constexpr uint32_t    kStreamStatusWireMagicV3          = 0x3353504Eu; // NPS3
 constexpr uint32_t    kStreamStatusWireVersionV3        = 1u;
-constexpr uint32_t    kRemoteProtocolCapabilityV2       = 1u << kRemoteVideoWireVersion;
 constexpr uint32_t    kRemoteProtocolCapabilityV3       = 1u << kRemoteVideoWireVersionV3;
 constexpr uint32_t    kRemoteQualityCapabilityHigh      = 1u << static_cast<uint32_t>(RemoteQualityTierV3::High);
 constexpr uint32_t    kRemoteQualityCapabilityBalanced  = 1u << static_cast<uint32_t>(RemoteQualityTierV3::Balanced);
@@ -104,8 +101,7 @@ struct ClientControlPacket
     XMFLOAT3 ambient          = XMFLOAT3(0.2f, 0.2f, 0.2f);
     XMFLOAT3 horizon          = XMFLOAT3(0.38f, 0.38f, 0.38f);
     XMFLOAT3 zenith           = XMFLOAT3(0.42f, 0.42f, 0.42f);
-    uint32_t supported_protocol_versions =
-        kRemoteProtocolCapabilityV2 | kRemoteProtocolCapabilityV3;
+    uint32_t supported_protocol_versions = kRemoteProtocolCapabilityV3;
     uint32_t supported_quality_tiers =
         kRemoteQualityCapabilityHigh | kRemoteQualityCapabilityBalanced | kRemoteQualityCapabilityLow;
     uint32_t supported_encoding_profiles = 1u << kRemoteEncodingProfileI420V3;
@@ -117,8 +113,8 @@ struct ClientControlPacket
 
 struct RemoteStreamSelection
 {
-    uint32_t protocol_version = kRemoteVideoWireVersion;
-    uint32_t encoding_profile_id = 0;
+    uint32_t protocol_version = kRemoteVideoWireVersionV3;
+    uint32_t encoding_profile_id = kRemoteEncodingProfileI420V3;
     RemoteQualityTierV3 quality_tier = RemoteQualityTierV3::High;
 
     bool operator==(const RemoteStreamSelection& other) const

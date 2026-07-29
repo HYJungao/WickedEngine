@@ -274,26 +274,8 @@ uint64_t ComputeControlLightingFingerprint(
 
 void NewPipelineClientRenderPath::SetRuntimeConfig(const RuntimeConfig& value)
 {
-    if (config.remote_source != value.remote_source)
-    {
-        ClearPendingRemoteFrames();
-        downstream_metadata_active = false;
-        remote_consume = {};
-    }
     config        = value;
-    switch (config.remote_debug_mode)
-    {
-    case RemoteDebugMode::Raw:
-        debug_preview_mode = DebugPreviewMode::RemoteIndirectDiffuse;
-        break;
-    case RemoteDebugMode::DebugComposite:
-        debug_preview_mode = DebugPreviewMode::RemoteOverview;
-        break;
-    case RemoteDebugMode::Local:
-    default:
-        debug_preview_mode = DebugPreviewMode::Final;
-        break;
-    }
+    debug_preview_mode = DebugPreviewMode::Final;
     status_logged = false;
     remote_acquire_logged = false;
 }
@@ -352,8 +334,8 @@ std::string NewPipelineClientRenderPath::GetEffectiveAlgorithmSummary() const
 std::string NewPipelineClientRenderPath::GetDebugStatusSummary() const
 {
     const WebRTCTransportStats transport = webrtc_transport.GetStats();
-    const std::string transport_status = config.remote_source == RemoteSourceMode::WebRTC
-        ? "\nWebRTC: " + std::string{ToString(transport.state)} + " " + transport.codec_name +
+    const std::string transport_status =
+        "\nWebRTC: " + std::string{ToString(transport.state)} + " " + transport.codec_name +
             (transport.native_codec ? " native-surface" :
                 (transport.power_efficient_codec ? " power-efficient" : " software-surface")) +
             " retained=" + std::to_string(transport.retained_frame_acquires) +
@@ -381,10 +363,7 @@ std::string NewPipelineClientRenderPath::GetDebugStatusSummary() const
                 std::to_string(downstream_out_of_order_drops) + "/" +
                 std::to_string(downstream_stale_status_drops) +
             " pending=" + std::to_string(downstream_metadata_cache.size()) + "/" +
-                std::to_string(pending_remote_video_frames.size()) +
-            (transport.native_codec || transport.codec_fallback_reason.empty()
-                ? std::string{} : " fallback=" + transport.codec_fallback_reason)
-        : std::string{};
+                std::to_string(pending_remote_video_frames.size());
     return GetEffectiveAlgorithmSummary() + "\n" + client_static_lighting.GetStatusSummary() + transport_status +
         "\nPrimary light: stable-id=" + std::to_string(GetNewPipelineSunStableId(local_scene)) +
         " shadow-index=" +
@@ -501,21 +480,13 @@ void NewPipelineClientRenderPath::Start()
     setVisibilitySurfaceResourcesForced(true);
     ApplyRenderSettings(true);
     wi::RenderPath3D::Start();
-    if (config.remote_source == RemoteSourceMode::WebRTC)
-    {
-        std::string error;
-        if (!webrtc_transport.RequestStart(false, config, &error))
-            wi::backlog::post("Client WebRTC start failed: " + error);
-    }
+    std::string error;
+    if (!webrtc_transport.RequestStart(false, config, &error))
+        wi::backlog::post("Client WebRTC start failed: " + error);
 
     wi::backlog::post("NewPipeline_Wicked Client render path started.");
-    wi::backlog::post(std::string{"Client remote source: "} + ToString(config.remote_source));
-    wi::backlog::post(std::string{"Client remote debug mode: "} + ToString(config.remote_debug_mode));
+    wi::backlog::post("Client remote source: WebRTC V3");
     wi::backlog::post(std::string{"Client debug preview mode: "} + ToString(debug_preview_mode));
-    if (config.remote_debug_mode == RemoteDebugMode::DebugComposite)
-    {
-        wi::backlog::post("Client remote debug composite is a preview mode, not final material GI composite.");
-    }
     status_logged = true;
 }
 
@@ -894,12 +865,7 @@ void NewPipelineClientRenderPath::Update(float dt)
 
     if (!status_logged)
     {
-        wi::backlog::post(std::string{"Client remote source: "} + ToString(config.remote_source));
-        wi::backlog::post(std::string{"Client remote debug mode: "} + ToString(config.remote_debug_mode));
-        if (config.remote_debug_mode == RemoteDebugMode::DebugComposite)
-        {
-            wi::backlog::post("Client remote debug composite is a preview mode, not final material GI composite.");
-        }
+        wi::backlog::post("Client remote source: WebRTC V3");
         status_logged = true;
     }
 }
@@ -907,8 +873,6 @@ void NewPipelineClientRenderPath::Update(float dt)
 void NewPipelineClientRenderPath::MaintainWebRTC(float dt)
 {
     webrtc_transport.Tick();
-    if (config.remote_source != RemoteSourceMode::WebRTC)
-        return;
     const WebRTCTransportStats stats = webrtc_transport.GetStats();
     transport_telemetry_window_seconds += std::max(0.0f, dt);
     if (transport_telemetry_window_seconds >= 1.0f)
@@ -933,7 +897,6 @@ void NewPipelineClientRenderPath::MaintainWebRTC(float dt)
         stats.state != WebRTCTransportState::Connected)
     {
         ClearPendingRemoteFrames();
-        downstream_metadata_active = false;
         InvalidateRemote("transport disconnected");
     }
     previous_webrtc_state = stats.state;
@@ -941,8 +904,6 @@ void NewPipelineClientRenderPath::MaintainWebRTC(float dt)
 
 void NewPipelineClientRenderPath::PollRemoteFrameMetadata()
 {
-    if (config.remote_source != RemoteSourceMode::WebRTC)
-        return;
     RemoteVideoFrameLayout layout;
     RemoteStreamStatus stream_status;
     if (!webrtc_transport.TryReceiveFrameMetadata(layout, &stream_status))
@@ -972,7 +933,6 @@ void NewPipelineClientRenderPath::PollRemoteFrameMetadata()
         }
         return;
     }
-    downstream_metadata_active = true;
     for (auto iterator = downstream_metadata_cache.begin(); iterator != downstream_metadata_cache.end();)
     {
         if (iterator->metadata.frame_id == layout.metadata.frame_id &&
@@ -3053,24 +3013,15 @@ void NewPipelineClientRenderPath::PublishControlPacket(float dt)
         : last_published_control_packet.control_frame_id;
     packet.timestamp_usec = NowUsec();
 
-    if (!mock_control_publish_logged)
+    if (!control_publish_logged)
     {
-        wi::backlog::post(config.remote_source == RemoteSourceMode::Mock
-            ? "Client file mock control publish active: " + mock_control_mailbox.GetRootDirectory() + " dirty<=30fps heartbeat=5fps"
-            : "Client WebRTC control DataChannel publish active: client->server only");
-        mock_control_publish_logged = true;
+        wi::backlog::post(
+            "Client WebRTC control DataChannel publish active: client->server only");
+        control_publish_logged = true;
     }
 
-    std::string error;
-    const bool published = config.remote_source == RemoteSourceMode::Mock
-        ? mock_control_mailbox.PublishLatest(packet, &error)
-        : webrtc_transport.SendControl(packet);
-    if (!published)
-    {
-        if (config.remote_source == RemoteSourceMode::Mock && !error.empty())
-            wi::backlog::post("Client file mock control publish failed: " + error);
+    if (!webrtc_transport.SendControl(packet))
         return;
-    }
 
     last_published_control_packet = packet;
     has_published_control_packet = true;
@@ -3228,108 +3179,23 @@ bool NewPipelineClientRenderPath::UploadRemoteVideoTextures(
     return true;
 }
 
-bool NewPipelineClientRenderPath::ValidateRemoteFrame(const RemoteRawFrame& frame, std::string& reason) const
-{
-    const RemoteFrameMetadata& metadata = frame.metadata;
-    if (metadata.source_stream_id != kRemoteFrameStreamId)
-    {
-        reason = "unexpected stream id";
-        return false;
-    }
-    if (!metadata.valid)
-    {
-        reason = "metadata invalid flag";
-        return false;
-    }
-    if (metadata.width == 0 || metadata.height == 0)
-    {
-        reason = "empty resolution";
-        return false;
-    }
-    if (metadata.dynamic_range != RemoteDynamicRange::HDR)
-    {
-        reason = "unexpected dynamic range";
-        return false;
-    }
-    if ((metadata.continuity_mask & static_cast<uint32_t>(RemoteBufferKind::IndirectDiffuse)) == 0)
-    {
-        reason = "missing GI continuity bit";
-        return false;
-    }
-    const uint64_t now = NowUsec();
-    if (metadata.local_receive_timestamp_usec == 0 ||
-        metadata.local_receive_timestamp_usec + kMaxRemoteFrameAgeUsec < now)
-    {
-        reason = "stale locally received video frame";
-        return false;
-    }
-
-    const RemoteRawBuffer* indirect = frame.FindBuffer(RemoteBufferSemantic::RemoteIndirectDiffuse);
-    if (indirect == nullptr || !indirect->available || indirect->width == 0 || indirect->height == 0)
-    {
-        reason = "missing indirect diffuse video tile";
-        return false;
-    }
-    uint32_t observed_available_mask = 0;
-    for (size_t index = 0; index < frame.buffers.size(); ++index)
-    {
-        const RemoteRawBuffer& buffer = frame.buffers[index];
-        const RemoteBufferSemantic expected_semantic =
-            static_cast<RemoteBufferSemantic>(index);
-        if (buffer.semantic != expected_semantic ||
-            buffer.encoding != RemoteBufferTransportEncoding(expected_semantic))
-        {
-            reason = std::string{"semantic/encoding contract mismatch at slot "} +
-                std::to_string(index);
-            return false;
-        }
-        if (!buffer.available)
-            continue;
-        observed_available_mask |= RemoteBufferKindMask(buffer.semantic);
-        const size_t expected_size = static_cast<size_t>(buffer.width) * buffer.height * 4u;
-        const bool valid_size = buffer.encoding == RemoteBufferEncoding::LogHDR16F
-            ? buffer.payload_rgba16f.size() == expected_size
-            : buffer.payload_rgba8.size() == expected_size;
-        if (!valid_size)
-        {
-            reason = std::string{"payload size mismatch for "} + ToString(buffer.semantic);
-            return false;
-        }
-    }
-    if (observed_available_mask != metadata.available_buffer_mask ||
-        (metadata.continuity_mask & observed_available_mask) != observed_available_mask)
-    {
-        reason = "remote buffer availability mask mismatch";
-        return false;
-    }
-    if (metadata.confidence < 0.5f)
-    {
-        reason = "placeholder confidence";
-        return false;
-    }
-
-    return true;
-}
-
 bool NewPipelineClientRenderPath::ValidateRemoteVideoLayout(
     const RemoteVideoFrameLayout& layout, std::string& reason) const
 {
     const RemoteFrameMetadata& metadata = layout.metadata;
-    if (layout.protocol_version != kRemoteVideoWireVersion &&
-        layout.protocol_version != kRemoteVideoWireVersionV3)
+    if (layout.protocol_version != kRemoteVideoWireVersionV3)
     {
         reason = "unsupported remote video protocol";
         return false;
     }
-    if (layout.protocol_version == kRemoteVideoWireVersionV3 &&
-        (layout.encoding_profile_id != kRemoteEncodingProfileI420V3 ||
+    if (layout.encoding_profile_id != kRemoteEncodingProfileI420V3 ||
             layout.source_control_frame_id == 0 ||
             layout.layout_checksum == 0 ||
             layout.descriptor_checksum == 0 ||
             !ValidateRemoteFrameContractV3(layout.contract_v3, nullptr) ||
             layout.contract_v3.source_control_frame_id != layout.source_control_frame_id ||
             layout.contract_v3.atlas_width != layout.video_width ||
-            layout.contract_v3.atlas_height != layout.video_height))
+            layout.contract_v3.atlas_height != layout.video_height)
     {
         reason = "invalid V3 descriptor contract";
         return false;
@@ -3339,9 +3205,8 @@ bool NewPipelineClientRenderPath::ValidateRemoteVideoLayout(
                 negotiated_stream_selection.protocol_version ||
             layout.encoding_profile_id !=
                 negotiated_stream_selection.encoding_profile_id ||
-            (layout.protocol_version == kRemoteVideoWireVersionV3 &&
-                layout.quality_tier !=
-                    negotiated_stream_selection.quality_tier)))
+            layout.quality_tier !=
+                negotiated_stream_selection.quality_tier))
     {
         reason = "video frame does not match acknowledged negotiation";
         return false;
@@ -3439,12 +3304,6 @@ void NewPipelineClientRenderPath::InvalidateRemote(const std::string& reason)
 void NewPipelineClientRenderPath::AcceptRemoteVideoFrame(
     const RetainedI420Frame& frame, const RemoteVideoFrameLayout& layout)
 {
-    if (layout.protocol_version != kRemoteVideoWireVersionV3)
-    {
-        InvalidateRemote(
-            "V2 video cannot enter the formal V3 lighting blend");
-        return;
-    }
     if (!UploadRemoteVideoTextures(frame, layout))
     {
         InvalidateRemote("GPU video upload/unpack failed");
@@ -3495,108 +3354,81 @@ void NewPipelineClientRenderPath::AcquireRemoteVideoFrame(float dt)
 {
     if (!remote_acquire_logged)
     {
-        wi::backlog::post(config.remote_source == RemoteSourceMode::Mock
-            ? "Client mock packed-video acquire active: " + mock_remote_mailbox.GetRootDirectory()
-            : "Client WebRTC video acquire active: retained I420 plus paired np.frame_meta validation");
+        wi::backlog::post(
+            "Client WebRTC video acquire active: retained I420 plus paired np.frame_meta validation");
         remote_acquire_logged = true;
     }
 
-    const bool gpu_video_path = config.remote_source == RemoteSourceMode::WebRTC;
-    RemoteRawFrame frame;
     RetainedI420Frame retained_frame;
     RemoteVideoFrameLayout video_layout;
     std::string error;
     bool received = false;
     bool queued_video_without_metadata = false;
-    if (gpu_video_path)
+    RetainedI420Frame acquired_frame;
+    if (webrtc_transport.TryAcquireI420Frame(acquired_frame))
     {
-        RetainedI420Frame acquired_frame;
-        if (webrtc_transport.TryAcquireI420Frame(acquired_frame))
+        RemoteVideoFrameLayout pixel_layout;
+        if (!DecodeRemoteVideoFrameLayout(
+                acquired_frame, pixel_layout, &error))
         {
-            RemoteVideoFrameLayout pixel_layout;
-            if (!DecodeRemoteVideoFrameLayout(
-                    acquired_frame, pixel_layout, &error))
-            {
-                InvalidateRemote(error.empty()
-                    ? "video metadata-band decode failed" : error);
-                return;
-            }
-            const bool requires_authoritative_metadata =
-                pixel_layout.protocol_version ==
-                    kRemoteVideoWireVersionV3 ||
-                downstream_metadata_active;
-            if (!requires_authoritative_metadata)
-            {
-                retained_frame = std::move(acquired_frame);
-                video_layout = std::move(pixel_layout);
-                received = true;
-            }
-            else
-            {
-                auto duplicate = std::find_if(
-                    pending_remote_video_frames.begin(), pending_remote_video_frames.end(),
-                    [&pixel_layout](const PendingRemoteVideoFrame& pending) {
-                        return pending.pixel_layout.metadata.frame_id ==
-                                pixel_layout.metadata.frame_id &&
-                            pending.pixel_layout.metadata.source_generation ==
-                                pixel_layout.metadata.source_generation;
-                    });
-                if (duplicate != pending_remote_video_frames.end())
-                    pending_remote_video_frames.erase(duplicate);
-                PendingRemoteVideoFrame pending;
-                pending.frame = std::move(acquired_frame);
-                pending.pixel_layout = std::move(pixel_layout);
-                pending.local_receive_timestamp_usec = NowUsec();
-                pending_remote_video_frames.push_back(std::move(pending));
-                queued_video_without_metadata = true;
-                while (pending_remote_video_frames.size() > kMaxPendingRemotePairs)
-                {
-                    pending_remote_video_frames.pop_front();
-                    ++downstream_pair_expirations;
-                }
-            }
+            InvalidateRemote(error.empty()
+                ? "video metadata-band decode failed" : error);
+            return;
         }
+        auto duplicate = std::find_if(
+            pending_remote_video_frames.begin(), pending_remote_video_frames.end(),
+            [&pixel_layout](const PendingRemoteVideoFrame& pending) {
+                return pending.pixel_layout.metadata.frame_id ==
+                        pixel_layout.metadata.frame_id &&
+                    pending.pixel_layout.metadata.source_generation ==
+                        pixel_layout.metadata.source_generation;
+            });
+        if (duplicate != pending_remote_video_frames.end())
+            pending_remote_video_frames.erase(duplicate);
+        PendingRemoteVideoFrame pending;
+        pending.frame = std::move(acquired_frame);
+        pending.pixel_layout = std::move(pixel_layout);
+        pending.local_receive_timestamp_usec = NowUsec();
+        pending_remote_video_frames.push_back(std::move(pending));
+        queued_video_without_metadata = true;
+        while (pending_remote_video_frames.size() > kMaxPendingRemotePairs)
+        {
+            pending_remote_video_frames.pop_front();
+            ++downstream_pair_expirations;
+        }
+    }
 
-        if (downstream_metadata_active)
-        {
-            PrunePendingRemoteFrames(NowUsec());
-            received = TryMatchRemoteVideoFrame(retained_frame, video_layout);
-            if (!received)
-            {
-                if (!pending_remote_video_frames.empty() && !downstream_metadata_cache.empty())
-                {
-                    if (queued_video_without_metadata)
-                        ++downstream_metadata_misses;
-                    if (!remote_consume.accepted_valid)
-                        remote_consume.invalid_reason =
-                            "waiting for matching pixel-band frame identity";
-                }
-                else if (!pending_remote_video_frames.empty())
-                {
-                    if (queued_video_without_metadata)
-                        ++downstream_metadata_misses;
-                    if (!remote_consume.accepted_valid)
-                        remote_consume.invalid_reason = "waiting for frame metadata";
-                }
-                else if (!downstream_metadata_cache.empty() && !remote_consume.accepted_valid)
-                {
-                    remote_consume.invalid_reason = "waiting for matching video frame";
-                }
-            }
-        }
-    }
-    else
-    {
-        received = mock_remote_mailbox.TryReadLatest(frame, &error);
-    }
+    PrunePendingRemoteFrames(NowUsec());
+    received = TryMatchRemoteVideoFrame(retained_frame, video_layout);
     if (!received)
     {
+        if (queued_video_without_metadata)
+            ++downstream_metadata_misses;
+        if (!pending_remote_video_frames.empty() &&
+            !downstream_metadata_cache.empty())
+        {
+            if (!remote_consume.accepted_valid)
+                remote_consume.invalid_reason =
+                    "waiting for matching pixel-band frame identity";
+        }
+        else if (!pending_remote_video_frames.empty())
+        {
+            if (!remote_consume.accepted_valid)
+                remote_consume.invalid_reason = "waiting for frame metadata";
+        }
+        else if (!downstream_metadata_cache.empty() &&
+            !remote_consume.accepted_valid)
+        {
+            remote_consume.invalid_reason = "waiting for matching video frame";
+        }
+
         if (!error.empty())
         {
             if (remote_consume.invalid_reason != error)
-                wi::backlog::post(std::string{config.remote_source == RemoteSourceMode::Mock
-                    ? "Client mock packed-video acquire failed: "
-                    : "Client WebRTC video-track acquire failed: "} + error);
+            {
+                wi::backlog::post(
+                    "Client WebRTC video-track acquire failed: " + error);
+            }
             InvalidateRemote(error);
         }
         else if (remote_consume.accepted_valid)
@@ -3611,55 +3443,34 @@ void NewPipelineClientRenderPath::AcquireRemoteVideoFrame(float dt)
         else if (!remote_consume.no_remote_logged &&
             pending_remote_video_frames.empty() && downstream_metadata_cache.empty())
         {
-            wi::backlog::post(config.remote_source == RemoteSourceMode::Mock
-                ? "Client mock packed-video: no latest frame, using local scene."
-                : "Client WebRTC video track: no frame yet, using local scene.");
+            wi::backlog::post(
+                "Client WebRTC video track: no frame yet, using local scene.");
             remote_consume.no_remote_logged = true;
         }
         return;
     }
 
-    if (gpu_video_path && downstream_metadata_active)
+    RemoteVideoFrameLayout pixel_layout;
+    const bool agrees =
+        DecodeRemoteVideoFrameLayout(retained_frame, pixel_layout, &error) &&
+        video_layout.protocol_version == pixel_layout.protocol_version &&
+        video_layout.video_width == pixel_layout.video_width &&
+        video_layout.video_height == pixel_layout.video_height &&
+        video_layout.metadata.frame_id == pixel_layout.metadata.frame_id &&
+        video_layout.metadata.source_generation ==
+            pixel_layout.metadata.source_generation &&
+        video_layout.descriptor_checksum ==
+            pixel_layout.descriptor_checksum &&
+        video_layout.source_control_frame_id ==
+            pixel_layout.source_control_frame_id;
+    if (!agrees)
     {
-        RemoteVideoFrameLayout pixel_layout;
-        bool agrees = DecodeRemoteVideoFrameLayout(retained_frame, pixel_layout, &error) &&
-            video_layout.protocol_version == pixel_layout.protocol_version &&
-            video_layout.video_width == pixel_layout.video_width &&
-            video_layout.video_height == pixel_layout.video_height &&
-            video_layout.metadata.frame_id == pixel_layout.metadata.frame_id &&
-            video_layout.metadata.source_generation == pixel_layout.metadata.source_generation;
-        if (agrees && video_layout.protocol_version == kRemoteVideoWireVersionV3)
-        {
-            agrees = video_layout.descriptor_checksum == pixel_layout.descriptor_checksum &&
-                video_layout.source_control_frame_id == pixel_layout.source_control_frame_id;
-        }
-        else if (agrees)
-        {
-            agrees = video_layout.metadata.timestamp_usec == pixel_layout.metadata.timestamp_usec &&
-                video_layout.metadata.available_buffer_mask == pixel_layout.metadata.available_buffer_mask &&
-                video_layout.metadata.continuity_mask == pixel_layout.metadata.continuity_mask;
-        }
-        for (size_t index = 0;
-            agrees && video_layout.protocol_version == kRemoteVideoWireVersion &&
-                index < pixel_layout.tiles.size();
-            ++index)
-        {
-            const RemoteVideoTileLayout& pixel = pixel_layout.tiles[index];
-            const RemoteVideoTileLayout& channel = video_layout.tiles[index];
-            agrees = pixel.semantic == channel.semantic && pixel.width == channel.width &&
-                pixel.height == channel.height && pixel.origin_x == channel.origin_x &&
-                pixel.origin_y == channel.origin_y && pixel.available == channel.available &&
-                pixel.encoding == channel.encoding;
-        }
-        if (!agrees)
-        {
-            ++downstream_metadata_mismatches;
-            InvalidateRemote("pixel-band/frame-metadata mismatch");
-            return;
-        }
+        ++downstream_metadata_mismatches;
+        InvalidateRemote("pixel-band/frame-metadata mismatch");
+        return;
     }
 
-    const RemoteFrameMetadata& metadata = gpu_video_path ? video_layout.metadata : frame.metadata;
+    const RemoteFrameMetadata& metadata = video_layout.metadata;
     const bool same_latest = metadata.frame_id == remote_consume.latest_frame_id &&
         metadata.source_generation == remote_consume.latest_generation;
     if (same_latest)
@@ -3709,27 +3520,17 @@ void NewPipelineClientRenderPath::AcquireRemoteVideoFrame(float dt)
     std::string validation_reason;
     if (!remote_payload_read_logged)
     {
-        if (gpu_video_path)
-        {
-            const uint64_t i420_bytes = static_cast<uint64_t>(retained_frame.width) * retained_frame.height * 3u / 2u;
-            wi::backlog::post("Client WebRTC retained I420 frame: " + std::to_string(i420_bytes) +
-                " bytes, zero bridge copy, GPU semantic unpack");
-        }
-        else
-        {
-            size_t payload_bytes = 0;
-            for (const RemoteRawBuffer& buffer : frame.buffers)
-                payload_bytes += buffer.payload_rgba8.size() + buffer.payload_rgba16f.size() * sizeof(uint16_t);
-            wi::backlog::post("Client mock packed-video frame decoded: " +
-                std::to_string(payload_bytes) + " RGBA bytes");
-        }
+        const uint64_t i420_bytes =
+            static_cast<uint64_t>(retained_frame.width) *
+            retained_frame.height * 3u / 2u;
+        wi::backlog::post(
+            "Client WebRTC retained I420 frame: " +
+            std::to_string(i420_bytes) +
+            " bytes, zero bridge copy, GPU semantic unpack");
         remote_payload_read_logged = true;
     }
 
-    const bool valid = gpu_video_path
-        ? ValidateRemoteVideoLayout(video_layout, validation_reason)
-        : ValidateRemoteFrame(frame, validation_reason);
-    if (!valid)
+    if (!ValidateRemoteVideoLayout(video_layout, validation_reason))
     {
         remote_consume.placeholder = validation_reason == "placeholder confidence";
         remote_consume.confidence = metadata.confidence;
@@ -3740,11 +3541,7 @@ void NewPipelineClientRenderPath::AcquireRemoteVideoFrame(float dt)
     }
 
     remote_consume.placeholder_logged = false;
-    if (gpu_video_path)
-        AcceptRemoteVideoFrame(retained_frame, video_layout);
-    else
-        InvalidateRemote(
-            "V2/mock payload has no formal V3 semantic contract");
+    AcceptRemoteVideoFrame(retained_frame, video_layout);
 }
 
 const wi::graphics::Texture* NewPipelineClientRenderPath::GetDebugPreviewTexture() const
@@ -3810,7 +3607,6 @@ const wi::graphics::Texture* NewPipelineClientRenderPath::GetDebugPreviewTexture
         return elastic_primary_light_visibility.IsValid()
             ? &elastic_primary_light_visibility : nullptr;
     case DebugPreviewMode::Final:
-    case DebugPreviewMode::RemoteOverview:
     default:
         return nullptr;
     }
@@ -3823,101 +3619,7 @@ void NewPipelineClientRenderPath::Compose(wi::graphics::CommandList cmd) const
         wi::RenderPath3D::Compose(cmd);
         return;
     }
-    if (debug_preview_mode == DebugPreviewMode::RemoteOverview)
-    {
-        if (remote_consume.accepted_valid && accepted_remote_buffer_mask != 0)
-        {
-            wi::graphics::GraphicsDevice* device =
-                wi::graphics::GetDevice();
-            std::array<wi::graphics::GPUBarrier,
-                static_cast<size_t>(RemoteBufferSemantic::Count)>
-                preview_barriers = {};
-            uint32_t preview_barrier_count = 0;
-            for (size_t index = 0;
-                index < accepted_remote_textures.size();
-                ++index)
-            {
-                const RemoteBufferSemantic semantic =
-                    static_cast<RemoteBufferSemantic>(index);
-                const wi::graphics::Texture& texture =
-                    accepted_remote_textures[index];
-                if ((accepted_remote_buffer_mask &
-                        RemoteBufferKindMask(semantic)) == 0 ||
-                    !texture.IsValid() ||
-                    texture.GetDesc().layout ==
-                        wi::graphics::ResourceState::SHADER_RESOURCE)
-                    continue;
-                preview_barriers[preview_barrier_count++] =
-                    wi::graphics::GPUBarrier::Image(
-                        &texture,
-                        texture.GetDesc().layout,
-                        wi::graphics::ResourceState::SHADER_RESOURCE);
-            }
-            if (preview_barrier_count > 0)
-            {
-                device->Barrier(
-                    preview_barriers.data(),
-                    preview_barrier_count,
-                    cmd);
-            }
-            const float half_width = GetLogicalWidth() * 0.5f;
-            const float half_height = GetLogicalHeight() * 0.5f;
-            wi::image::Params background;
-            background.blendFlag = wi::enums::BLENDMODE_OPAQUE;
-            background.enableFullScreen();
-            wi::image::Draw(wi::texturehelper::getBlack(), background, cmd);
-            for (size_t index = 0; index < accepted_remote_textures.size(); ++index)
-            {
-                if ((accepted_remote_buffer_mask & RemoteBufferKindMask(static_cast<RemoteBufferSemantic>(index))) == 0 ||
-                    !accepted_remote_textures[index].IsValid())
-                {
-                    wi::font::Params unavailable;
-                    unavailable.position = XMFLOAT3(
-                        ((index & 1u) + 0.5f) * half_width,
-                        ((index / 2u) + 0.5f) * half_height,
-                        0.0f);
-                    unavailable.h_align = wi::font::WIFALIGN_CENTER;
-                    unavailable.v_align = wi::font::WIFALIGN_CENTER;
-                    unavailable.size = 18;
-                    unavailable.color = wi::Color::Red();
-                    unavailable.shadowColor = wi::Color::Black();
-                    wi::font::Draw(std::string{"UNAVAILABLE: "} +
-                        ToString(static_cast<RemoteBufferSemantic>(index)), unavailable, cmd);
-                    continue;
-                }
-                wi::image::Params fx;
-                fx.blendFlag = wi::enums::BLENDMODE_OPAQUE;
-                fx.quality = wi::image::QUALITY_LINEAR;
-                fx.sampleFlag = wi::image::SAMPLEMODE_CLAMP;
-                fx.pos = XMFLOAT3((index & 1u) * half_width, (index / 2u) * half_height, 0.0f);
-                fx.siz = XMFLOAT2(half_width, half_height);
-                if (index == static_cast<size_t>(RemoteBufferSemantic::RemoteAO) ||
-                    index == static_cast<size_t>(RemoteBufferSemantic::RemoteShadowVisibility))
-                    fx.enableExtractChannelR();
-                else
-                    fx.enableDebugTonemap();
-                wi::image::Draw(&accepted_remote_textures[index], fx, cmd);
-            }
-            if (preview_barrier_count > 0)
-            {
-                for (uint32_t index = 0;
-                    index < preview_barrier_count;
-                    ++index)
-                {
-                    std::swap(
-                        preview_barriers[index].image.layout_before,
-                        preview_barriers[index].image.layout_after);
-                }
-                device->Barrier(
-                    preview_barriers.data(),
-                    preview_barrier_count,
-                    cmd);
-            }
-            wi::RenderPath2D::Compose(cmd);
-            return;
-        }
-    }
-    else if (const wi::graphics::Texture* debug_texture = GetDebugPreviewTexture())
+    if (const wi::graphics::Texture* debug_texture = GetDebugPreviewTexture())
     {
         wi::graphics::GraphicsDevice* device = wi::graphics::GetDevice();
         const wi::graphics::ResourceState source_layout =
@@ -3933,9 +3635,7 @@ void NewPipelineClientRenderPath::Compose(wi::graphics::CommandList cmd) const
         }
         wi::image::Params fx;
         fx.blendFlag = wi::enums::BLENDMODE_OPAQUE;
-        // Keep the explicit single-buffer view pixel-exact. The 2x2 overview
-        // remains a deliberately scaled overview and is not used for judging
-        // source resolution.
+        // Keep explicit single-buffer views pixel-exact.
         fx.quality = wi::image::QUALITY_NEAREST;
         fx.sampleFlag = wi::image::SAMPLEMODE_CLAMP;
         fx.enableFullScreen();

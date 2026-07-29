@@ -95,7 +95,6 @@ private:
     void PrunePendingRemoteFrames(uint64_t now_usec);
     void ClearPendingRemoteFrames();
     void MaintainWebRTC(float dt);
-    bool ValidateRemoteFrame(const RemoteRawFrame& frame, std::string& reason) const;
     bool ValidateRemoteVideoLayout(const RemoteVideoFrameLayout& layout, std::string& reason) const;
     bool IsControlPacketChanged(const ClientControlPacket& packet) const;
     void AcceptRemoteVideoFrame(const RetainedI420Frame& frame, const RemoteVideoFrameLayout& layout);
@@ -209,8 +208,6 @@ private:
     SceneParityFingerprint lightmap_bake_scene_fingerprint;
     bool lightmap_bake_scene_fingerprint_valid = false;
     bool lightmap_cancel_requested = false;
-    FileMockControlMailbox mock_control_mailbox;
-    FileMockRemoteMailbox mock_remote_mailbox;
     WebRTCVideoTransport webrtc_transport;
     struct RemoteVideoUploadSlot
     {
@@ -240,7 +237,6 @@ private:
     uint64_t transport_bitrate_bps = 0;
     WebRTCTransportState previous_webrtc_state = WebRTCTransportState::Disabled;
     std::deque<RemoteVideoFrameLayout> downstream_metadata_cache;
-    bool downstream_metadata_active = false;
     uint64_t downstream_metadata_matches = 0;
     uint64_t downstream_metadata_misses = 0;
     uint64_t downstream_metadata_mismatches = 0;
@@ -317,7 +313,7 @@ private:
     bool          status_logged = false;
     uint32_t remote_ddgi_frame_index = 0;
     DDGIResetReason remote_ddgi_reset_reason = DDGIResetReason::None;
-    bool mock_control_publish_logged = false;
+    bool control_publish_logged = false;
     bool remote_acquire_logged = false;
     bool remote_unchanged_skip_logged = false;
     bool remote_payload_read_logged = false;

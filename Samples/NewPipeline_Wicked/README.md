@@ -2,8 +2,8 @@
 
 Client and Server use the real WebRTC path by default. Server-to-client pixels use
 the `np.remote.video` track; frame metadata is paired through the video metadata band
-and `np.frame_meta` DataChannel. `np.control` remains client-to-server only. Mock mode
-must be selected explicitly.
+and `np.frame_meta` DataChannel. `np.control` remains client-to-server only.
+Remote Video V3 is the only production transport path.
 
 This README is the source of truth for the current build, runtime and architecture.
 Only unfinished production work belongs in [`docs/ROADMAP.md`](docs/ROADMAP.md).
@@ -25,13 +25,11 @@ WebRTC\signaling\start_signaling.cmd
 
 The default endpoint and room are `ws://127.0.0.1:39876` and
 `NewPipeline.Wicked.V1`. No Client or Server arguments are needed for the local
-real-WebRTC path. Use `--remote_source=mock` (or `--no_webrtc`) only for mock
-testing. `--webrtc_signal`, `--webrtc_room`, `--webrtc_internet`,
+real-WebRTC path. `--webrtc_signal`, `--webrtc_room`, `--webrtc_internet`,
 and `--remote_fps` override connection or publication-rate defaults. Protocol
-and quality are not command-line switches: new peers negotiate V3
-automatically and the production policy requests High. Reduced tiers remain
-self-test-only until a persistent application setting and their visual/bitrate
-soak data are accepted.
+selection is not a command-line switch: peers must negotiate V3. The production
+policy requests High; reduced tiers remain self-test-only until exposed through
+a persistent application setting and accepted by visual/bitrate soak.
 
 ## Focus and buffer previews
 
@@ -42,14 +40,10 @@ automatic camera orbit is applied.
 The Client starts on `Final`; receiving a remote frame never changes the
 selection. Its **Preview Buffer** menu contains the material-independent
 `Local Indirect (Final Input)`,
-the four accepted remote buffers, all four `Elastic` Final-stage inputs, and an
-explicit `Remote Atlas Overview`. The
+the four accepted remote buffers, and all four `Elastic` Final-stage inputs. The
 Server debug panel contains `Final`, its four local producer buffers, and four
 pre-I420 `Transport` previews. Missing buffers render an explicit black/red
-`UNAVAILABLE` placeholder instead of silently falling back to Final. The
-legacy options remain compatible: `--remote_debug=local` selects `Final`,
-`raw` selects `Remote Indirect Diffuse`, and `debug_composite` selects the
-explicit remote overview.
+`UNAVAILABLE` placeholder instead of silently substituting another semantic.
 
 ## macOS
 
@@ -126,8 +120,8 @@ planar reflections are disabled. `Local Indirect (Final Input)` shows the exact 
 term used by Final before remote blending, including the ambient fallback on
 dynamic or otherwise unbaked geometry. Static probes contribute to Final,
 and raster shadows remain in the light shadow-map atlas. Remote DDGI and RTAO
-are consumed by Final through the elastic-lighting path described below;
-reflection and shadow remain preview-only. The effective algorithms are
+are consumed by Final through the elastic-lighting path described below,
+including formal pre-AO specular and primary-light visibility. The effective algorithms are
 printed at startup and displayed in both debug panels.
 
 Lightmap eligibility is scene-independent. Automatic mode accepts renderable,
@@ -161,9 +155,8 @@ immediately.
 The `Elastic Remote Lighting` panel exposes independent enable switches and
 maximum weights for diffuse, AO, pre-AO specular and primary visibility.
 Matching `Elastic` previews show the values actually consumed by Final. Only a
-validated V3 semantic contract can enter Final. V2 and mock payloads remain
-parseable for migration diagnostics but never synthesize V3 descriptors,
-light identity or formal-lighting inputs.
+validated V3 semantic contract can enter Final; unsupported versions are rejected
+during negotiation and never enter the video decode or blend pipeline.
 
 ## Client lightmap assets
 
@@ -232,8 +225,8 @@ are locked while a static-lighting bake is active.
 All four buffers remain on the single `np.remote.video` WebRTC video track.
 New Client/Server pairs explicitly negotiate protocol, encoding profile and
 quality tier. The Server acknowledges the selection or a precise mismatch
-reason before publishing frames. V3 is the no-argument default; V2 encoding
-remains only when a peer explicitly advertises V2 compatibility.
+reason before publishing frames. V3 is required; there is no V2 encoder,
+decoder, parser or runtime fallback.
 DDGI and reflection are GPU-packed with a Log2 mapping for linear HDR values in
 the `[0,16]` range, then restored to `RGBA16F` by the Client. AO and Shadow use
 I420 Y only with neutral chroma. A deterministic compact atlas gives every rect
@@ -259,16 +252,17 @@ can retain lower-frequency diffuse/AO regions in the persistent atlas so the
 inter-frame codec sees unchanged content. Descriptors carry each semantic's
 actual content frame, generation and confidence.
 
-Frame metadata is dual-written to the legacy luma band and the unordered,
-unreliable `np.frame_meta` DataChannel. After the metadata channel becomes active,
-the Client retains video frames and metadata in separate bounded queues and accepts
+The video luma band carries only the V3 frame identity and descriptor checksum
+needed to pair decoded pixels. The unordered, unreliable `np.frame_meta`
+DataChannel carries an explicit endian-safe V3 metadata record and descriptor
+contract. The Client retains video frames and metadata in separate bounded queues and accepts
 the newest pair whose pixel-band `frame_id` and `source_generation` match the
 DataChannel packet, regardless of which side arrived first. The decoded WebRTC/RTP
 timestamp is deliberately not used as a frame identity. Unmatched entries expire
 after one second and each queue is capped at eight
 entries; a transient unmatched frame does not discard the last accepted remote
-input. The legacy band remains for migration agreement checks, and a matched pair
-is still rejected if its DataChannel metadata disagrees with the pixel band.
+input. A matched pair is still rejected if its protocol, dimensions, layout
+checksum, descriptor checksum, generation or control-frame identity disagrees.
 
 Session creation, teardown and retry run on a lifecycle service thread with bounded
 backoff. When signaling is unavailable, render updates only poll an atomic state and
@@ -285,7 +279,7 @@ encoder/decoder backend is integrated.
 The Server panel and Client remote status report DDGI frame/convergence state.
 Scene-generation and significant authoritative-sun changes clear Server DDGI
 history and publish the reset reason in the video metadata. `--transport_selftest`
-runs V2 compatibility, V3 descriptor/status checks, High/Balanced atlas-area
+runs V3 descriptor/status checks, High/Balanced atlas-area
 checks, retained-content cadence, scalar I420 numeric tolerance, formal blend
 endpoints and pixel-band/DataChannel agreement without opening a window. See
 [`docs/ROADMAP.md`](docs/ROADMAP.md) for the remaining platform/runtime

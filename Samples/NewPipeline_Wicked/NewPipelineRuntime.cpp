@@ -1,7 +1,6 @@
 #include "NewPipelineRuntime.h"
 
 #include <algorithm>
-#include <cctype>
 #include <cmath>
 #include <iterator>
 #include <limits>
@@ -11,14 +10,6 @@ namespace wicked_newpipeline
 {
 namespace
 {
-std::string NormalizeToken(std::string value)
-{
-    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-    });
-    return value;
-}
-
 bool IsNameMatch(const std::string& arg, const std::string& name)
 {
     return arg == name || arg == ("--" + name);
@@ -213,19 +204,6 @@ bool ValidateFormalLightingBlendV3Reference(std::string* error)
     return true;
 }
 
-const char* ToString(RemoteSourceMode mode)
-{
-    switch (mode)
-    {
-    case RemoteSourceMode::Mock:
-        return "mock";
-    case RemoteSourceMode::WebRTC:
-        return "webrtc";
-    default:
-        return "unknown";
-    }
-}
-
 const char* ToString(RemoteBufferSemantic semantic)
 {
     switch (semantic)
@@ -258,21 +236,6 @@ const char* ToString(RemoteDynamicRange range)
     }
 }
 
-const char* ToString(RemoteDebugMode mode)
-{
-    switch (mode)
-    {
-    case RemoteDebugMode::Local:
-        return "local";
-    case RemoteDebugMode::Raw:
-        return "raw";
-    case RemoteDebugMode::DebugComposite:
-        return "debug_composite";
-    default:
-        return "unknown";
-    }
-}
-
 const char* ToString(DebugPreviewMode mode)
 {
     switch (mode)
@@ -297,7 +260,6 @@ const char* ToString(DebugPreviewMode mode)
         return "elastic_specular_indirect_pre_ao";
     case DebugPreviewMode::ElasticPrimaryLightVisibility:
         return "elastic_primary_light_visibility";
-    case DebugPreviewMode::RemoteOverview: return "remote_overview";
     case DebugPreviewMode::TransportIndirectDiffuse: return "transport_indirect_diffuse";
     case DebugPreviewMode::TransportAO: return "transport_ao";
     case DebugPreviewMode::TransportSpecularIndirect: return "transport_specular_indirect";
@@ -343,75 +305,11 @@ const char* ToString(DDGIResetReason reason)
     }
 }
 
-RemoteSourceMode ParseRemoteSourceMode(const std::string& value, RemoteSourceMode fallback)
-{
-    const std::string token = NormalizeToken(value);
-    if (token == "mock")
-        return RemoteSourceMode::Mock;
-    if (token == "webrtc")
-        return RemoteSourceMode::WebRTC;
-    return fallback;
-}
-
-RemoteDebugMode ParseRemoteDebugMode(const std::string& value, RemoteDebugMode fallback)
-{
-    const std::string token = NormalizeToken(value);
-    if (token == "local")
-        return RemoteDebugMode::Local;
-    if (token == "raw")
-        return RemoteDebugMode::Raw;
-    if (token == "debug_composite" || token == "debug-composite" || token == "composite")
-        return RemoteDebugMode::DebugComposite;
-    return fallback;
-}
-
 RuntimeConfig ParseRuntimeConfig(int argc, char* argv[], RuntimeConfig fallback)
 {
     RuntimeConfig config = fallback;
     config.parse_warnings.clear();
     const std::vector<std::string> args = CollectArguments(argc, argv);
-
-    const std::string remote_source_arg = GetArgumentValue(args, "remote_source");
-    if (!remote_source_arg.empty())
-    {
-        const RemoteSourceMode parsed = ParseRemoteSourceMode(remote_source_arg, config.remote_source);
-        if (NormalizeToken(remote_source_arg) != ToString(parsed))
-        {
-            config.parse_warnings.push_back(
-                "Unknown --remote_source value '" + remote_source_arg + "', using " + ToString(config.remote_source));
-        }
-        else
-        {
-            config.remote_source = parsed;
-        }
-    }
-
-    const std::string remote_debug_arg = GetArgumentValue(args, "remote_debug");
-    if (!remote_debug_arg.empty())
-    {
-        const std::string token = NormalizeToken(remote_debug_arg);
-        const RemoteDebugMode parsed = ParseRemoteDebugMode(remote_debug_arg, config.remote_debug_mode);
-        if (token == "composite")
-        {
-            config.parse_warnings.push_back(
-                "--remote_debug composite is a compatibility alias for debug_composite; it is not final GI composite.");
-            config.remote_debug_mode = parsed;
-        }
-        else if (token != ToString(parsed) && token != "debug-composite")
-        {
-            config.parse_warnings.push_back(
-                "Unknown --remote_debug value '" + remote_debug_arg + "', using " + ToString(config.remote_debug_mode));
-        }
-        else
-        {
-            config.remote_debug_mode = parsed;
-        }
-    }
-
-    if (HasArgument(args, "webrtc"))
-        config.remote_source = RemoteSourceMode::WebRTC;
-    if (HasArgument(args, "no_webrtc"))
-        config.remote_source = RemoteSourceMode::Mock;
 
     const std::string signaling_url = GetArgumentValue(args, "webrtc_signal");
     if (!signaling_url.empty())
