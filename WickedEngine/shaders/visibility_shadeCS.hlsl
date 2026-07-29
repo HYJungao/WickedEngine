@@ -183,6 +183,45 @@ inline half4 sample_external_joint(
 	return valid ? accumulated / weight_sum : 0;
 }
 
+bool sample_client_volumetric_lightmap(
+	uint instance_index,
+	half3 normal,
+	out half3 diffuse_gi)
+{
+	diffuse_gi = 0;
+	if (external_client_vlm_buffer < 0)
+		return false;
+
+	Buffer<float4> coefficients =
+		bindless_buffers_float4[
+			descriptor_index(external_client_vlm_buffer)];
+	const uint base = instance_index * 7;
+	const float4 packed0 = coefficients[base + 0];
+	const float4 packed1 = coefficients[base + 1];
+	const float4 packed2 = coefficients[base + 2];
+	const float4 packed3 = coefficients[base + 3];
+	const float4 packed4 = coefficients[base + 4];
+	const float4 packed5 = coefficients[base + 5];
+	const float4 packed6 = coefficients[base + 6];
+	if (packed6.w < 0.5)
+		return false;
+
+	SH::L2_RGB radiance;
+	radiance.C[0] = packed0.xyz;
+	radiance.C[1] = float3(packed0.w, packed1.xy);
+	radiance.C[2] = float3(packed1.zw, packed2.x);
+	radiance.C[3] = packed2.yzw;
+	radiance.C[4] = packed3.xyz;
+	radiance.C[5] = float3(packed3.w, packed4.xy);
+	radiance.C[6] = float3(packed4.zw, packed5.x);
+	radiance.C[7] = packed5.yzw;
+	radiance.C[8] = packed6.xyz;
+	diffuse_gi = max(
+		0,
+		SH::CalculateIrradiance(radiance, normal) / PI);
+	return all(isfinite(diffuse_gi));
+}
+
 [numthreads(VISIBILITY_BLOCKSIZE * VISIBILITY_BLOCKSIZE, 1, 1)]
 void main(uint Gid : SV_GroupID, uint groupIndex : SV_GroupIndex)
 {
@@ -230,13 +269,28 @@ void main(uint Gid : SV_GroupID, uint groupIndex : SV_GroupIndex)
 
 	if (!surface.IsGIApplied())
 	{
-		half3 ambient = GetAmbient(surface.N);
-		surface.gi = lerp(ambient, ambient * surface.sss.rgb, saturate(surface.sss.a));
+		half3 client_vlm_gi = 0;
+		if (sample_client_volumetric_lightmap(
+				prim.instanceIndex,
+				surface.N,
+				client_vlm_gi))
+		{
+			surface.gi = client_vlm_gi;
+			surface.SetGIApplied(true);
+		}
+		else
+		{
+			half3 ambient = GetAmbient(surface.N);
+			surface.gi = lerp(
+				ambient,
+				ambient * surface.sss.rgb,
+				saturate(surface.sss.a));
+		}
 	}
 
 	// Exact material-independent local diffuse GI consumed by Final before the
-	// remote elastic blend. Dynamic and otherwise unbaked surfaces use the same
-	// ambient/SSS fallback as the regular Final path.
+	// remote elastic blend. Dynamic and otherwise unbaked surfaces use the
+	// per-instance VLM sample, with ambient only outside the baked volume.
 	[branch]
 	if (push.local_indirect_diffuse_uav >= 0)
 	{

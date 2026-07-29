@@ -1598,6 +1598,11 @@ CBUFFER(ExternalLightingCB, CBSLOT_RENDERER_EXTERNAL_LIGHTING)
 	int external_elastic_specular_uav;
 	int external_elastic_primary_visibility_uav;
 
+	int external_client_vlm_buffer;
+	int external_client_vlm_padding0;
+	int external_client_vlm_padding1;
+	int external_client_vlm_padding2;
+
 	float4 external_weights;
 	float4 external_reprojection_params; // near, far, relative depth threshold, normal dot threshold
 	float4 external_remote_view_origin; // xyz source camera, w specular view-direction cosine threshold

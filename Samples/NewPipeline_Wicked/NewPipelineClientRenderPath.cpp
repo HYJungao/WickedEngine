@@ -5,6 +5,7 @@
 #include "wiImage.h"
 #include "wiFont.h"
 #include "wiTextureHelper.h"
+#include "shaders/ShaderInterop_DDGI.h"
 
 #include <algorithm>
 #include <cctype>
@@ -36,6 +37,10 @@ constexpr float kControlHeartbeatIntervalSeconds = 1.0f / 5.0f;
 constexpr const char* kClientEnvironmentProbeName = "NewPipelineEnvironmentProbe";
 constexpr uint32_t kMobileShadow2DResolution = 1024;
 constexpr uint32_t kMobileShadowCubeResolution = 512;
+constexpr uint32_t kMobileShadow2DMinResolution = 96;
+constexpr uint32_t kMobileShadowCubeMinResolution = 64;
+constexpr uint32_t kMobileDirectionalCascadeCount = 4;
+constexpr float kMobileDirectionalCascadeLambda = 0.95f;
 constexpr uint32_t kMobileLightmapResolution = 256;
 constexpr uint32_t kClientReflectionProbeResolution = 128;
 constexpr const char* kLightmapBakeModeMetadataKey = "newpipeline.lightmap_bake_mode";
@@ -49,6 +54,13 @@ constexpr float kLightmapFrameTimeRampDown = 0.110f;
 constexpr float kLightmapFrameTimeEmergency = 0.200f;
 constexpr uint32_t kLightmapAdaptationIntervalFrames = 4;
 constexpr uint64_t kLightmapNoProgressTimeoutUsec = 30'000'000;
+constexpr uint32_t kClientVLMGridLongestAxis = 24;
+constexpr uint32_t kClientVLMGridMinimumAxis = 4;
+constexpr uint32_t kClientVLMMaxProbeCount = 4096;
+constexpr uint32_t kClientVLMConvergenceFrames = 64;
+constexpr uint32_t kClientVLMConvergenceMinRays = 128;
+constexpr uint32_t kClientVLMFinalProjectionRays = DDGI_MAX_RAYCOUNT;
+constexpr uint32_t kClientVLMFloat4sPerInstance = 7;
 
 uint64_t EstimateLightmapTransientBytes(const XMUINT2& dimensions)
 {
@@ -503,6 +515,8 @@ void NewPipelineClientRenderPath::ResizeBuffers()
     elastic_specular_indirect_pre_ao = {};
     elastic_primary_light_visibility = {};
     visibilityResources.texture_local_indirect_diffuse = nullptr;
+    visibilityResources.buffer_client_vlm_instances = nullptr;
+    visibilityResources.buffer_client_vlm_instances_upload = nullptr;
     visibilityResources.texture_specular_indirect = nullptr;
     visibilityResources.texture_specular_indirect_pre_ao = nullptr;
     visibilityResources.texture_primary_light_visibility = nullptr;
@@ -811,6 +825,103 @@ void NewPipelineClientRenderPath::PreRender()
         ResetRemoteGBufferHistory();
 }
 
+void NewPipelineClientRenderPath::Render() const
+{
+    wi::RenderPath3D::Render();
+    ScheduleVolumetricLightmapReadback();
+}
+
+void NewPipelineClientRenderPath::ScheduleVolumetricLightmapReadback() const
+{
+    if (!volumetric_readback_requested ||
+        volumetric_readback_scheduled)
+        return;
+
+    wi::graphics::GraphicsDevice* device = wi::graphics::GetDevice();
+    if (!local_scene.ddgi.ray_buffer.IsValid() ||
+        !local_scene.ddgi.raycount_buffer.IsValid())
+    {
+        volumetric_readback_requested = false;
+        volumetric_readback_scheduled = true;
+        volumetric_readback_error =
+            "volumetric lightmap ray resources became unavailable";
+        return;
+    }
+    wi::graphics::GPUBufferDesc ray_desc;
+    ray_desc.size = local_scene.ddgi.ray_buffer.GetDesc().size;
+    ray_desc.usage = wi::graphics::Usage::READBACK;
+    wi::graphics::GPUBufferDesc ray_count_desc;
+    ray_count_desc.size =
+        local_scene.ddgi.raycount_buffer.GetDesc().size;
+    ray_count_desc.usage = wi::graphics::Usage::READBACK;
+
+    volumetric_ray_readback = {};
+    volumetric_ray_count_readback = {};
+    if (!device->CreateBuffer(
+            &ray_desc, nullptr, &volumetric_ray_readback) ||
+        !device->CreateBuffer(
+            &ray_count_desc, nullptr, &volumetric_ray_count_readback))
+    {
+        volumetric_readback_requested = false;
+        volumetric_readback_scheduled = true;
+        volumetric_readback_error =
+            "volumetric lightmap readback allocation failed";
+        return;
+    }
+    device->SetName(
+        &volumetric_ray_readback,
+        "newpipeline.client.vlm_ray_readback");
+    device->SetName(
+        &volumetric_ray_count_readback,
+        "newpipeline.client.vlm_ray_count_readback");
+
+    // This is recorded after RenderPath3D's DDGI work on the same compute
+    // queue. The host remains the sole command-list submitter, so Wicked's
+    // frame and buffered-resource indices cannot be advanced from RenderPath.
+    const wi::graphics::CommandList cmd =
+        device->BeginCommandList(wi::graphics::QUEUE_COMPUTE);
+    const wi::graphics::GPUBarrier begin_barriers[] = {
+        wi::graphics::GPUBarrier::Buffer(
+            &local_scene.ddgi.ray_buffer,
+            wi::graphics::ResourceState::SHADER_RESOURCE_COMPUTE,
+            wi::graphics::ResourceState::COPY_SRC),
+        wi::graphics::GPUBarrier::Buffer(
+            &local_scene.ddgi.raycount_buffer,
+            wi::graphics::ResourceState::SHADER_RESOURCE_COMPUTE,
+            wi::graphics::ResourceState::COPY_SRC),
+    };
+    device->Barrier(
+        begin_barriers,
+        static_cast<uint32_t>(std::size(begin_barriers)),
+        cmd);
+    device->CopyResource(
+        &volumetric_ray_readback,
+        &local_scene.ddgi.ray_buffer,
+        cmd);
+    device->CopyResource(
+        &volumetric_ray_count_readback,
+        &local_scene.ddgi.raycount_buffer,
+        cmd);
+    const wi::graphics::GPUBarrier end_barriers[] = {
+        wi::graphics::GPUBarrier::Buffer(
+            &local_scene.ddgi.ray_buffer,
+            wi::graphics::ResourceState::COPY_SRC,
+            wi::graphics::ResourceState::SHADER_RESOURCE_COMPUTE),
+        wi::graphics::GPUBarrier::Buffer(
+            &local_scene.ddgi.raycount_buffer,
+            wi::graphics::ResourceState::COPY_SRC,
+            wi::graphics::ResourceState::SHADER_RESOURCE_COMPUTE),
+    };
+    device->Barrier(
+        end_barriers,
+        static_cast<uint32_t>(std::size(end_barriers)),
+        cmd);
+    volumetric_readback_requested = false;
+    volumetric_readback_scheduled = true;
+    volumetric_readback_submit_frame = device->GetFrameCount();
+    volumetric_readback_error.clear();
+}
+
 void NewPipelineClientRenderPath::CaptureRemoteGBufferHistory(
     wi::graphics::CommandList cmd) const
 {
@@ -855,10 +966,12 @@ void NewPipelineClientRenderPath::Update(float dt)
     UpdateReflectionProbeBake();
     UpdateLightmapBake(dt);
     UpdateLocalCamera(dt);
+    ConfigureClientDirectionalShadowCascades();
     MaintainWebRTC(dt);
     PublishControlPacket(dt);
 
     wi::RenderPath3D::Update(dt);
+    UpdateClientVolumetricLightmapInstances();
     PollRemoteFrameMetadata();
     AcquireRemoteVideoFrame(dt);
     UpdateElasticLighting(dt);
@@ -1079,6 +1192,10 @@ void NewPipelineClientRenderPath::InitializeSceneIfNeeded()
     if (!scene_asset_path.empty())
     {
         const ClientLightmapPackageResult package_result = client_static_lighting.LoadLightmaps(scene_asset_path, local_scene);
+        client_volumetric_lightmap =
+            package_result.success
+                ? package_result.volumetric_lightmap
+                : ClientVolumetricLightmapData{};
         if (package_result.scene_replaced)
             scene_source_root_entity = wi::ecs::INVALID_ENTITY;
         wi::backlog::post(package_result.diagnostic);
@@ -1128,12 +1245,50 @@ void NewPipelineClientRenderPath::ApplyShadowSettings(bool log_changes)
     wi::renderer::SetShadowsEnabled(render_settings.shadow_maps_enabled);
     wi::renderer::SetShadowProps2D(render_settings.shadow_maps_enabled ? kMobileShadow2DResolution : 0);
     wi::renderer::SetShadowPropsCube(render_settings.shadow_maps_enabled ? kMobileShadowCubeResolution : 0);
+    wi::renderer::SetShadowMinResolution2D(
+        render_settings.shadow_maps_enabled ? kMobileShadow2DMinResolution : 0);
+    wi::renderer::SetShadowMinResolutionCube(
+        render_settings.shadow_maps_enabled ? kMobileShadowCubeMinResolution : 0);
+    ConfigureClientDirectionalShadowCascades();
     wi::renderer::SetRaytracedShadowsEnabled(false);
     wi::renderer::SetScreenSpaceShadowsEnabled(false);
     if (log_changes)
     {
-        wi::backlog::post(std::string{"Client local shadows (raster Shadow Map 2D 1024 / Cube 512): "} +
+        wi::backlog::post(std::string{"Client local shadows (4-cascade CSM / raster Shadow Map 2D 1024 / Cube 512): "} +
             EnabledString(render_settings.shadow_maps_enabled));
+    }
+}
+
+void NewPipelineClientRenderPath::ConfigureClientDirectionalShadowCascades()
+{
+    if (!render_settings.shadow_maps_enabled)
+        return;
+
+    const float near_plane = std::max(0.01f, local_camera.zNearP);
+    const float far_plane = std::max(near_plane + 1.0f, local_camera.zFarP);
+    for (size_t light_index = 0; light_index < local_scene.lights.GetCount(); ++light_index)
+    {
+        wi::scene::LightComponent& light = local_scene.lights[light_index];
+        if (light.GetType() != wi::scene::LightComponent::DIRECTIONAL ||
+            !light.IsCastingShadow())
+            continue;
+
+        light.cascade_distances.resize(kMobileDirectionalCascadeCount);
+        for (uint32_t cascade = 1; cascade <= kMobileDirectionalCascadeCount; ++cascade)
+        {
+            const float fraction =
+                static_cast<float>(cascade) /
+                static_cast<float>(kMobileDirectionalCascadeCount);
+            const float logarithmic =
+                near_plane * std::pow(far_plane / near_plane, fraction);
+            const float uniform =
+                near_plane + (far_plane - near_plane) * fraction;
+            light.cascade_distances[cascade - 1] =
+                cascade == kMobileDirectionalCascadeCount
+                    ? far_plane
+                    : uniform * (1.0f - kMobileDirectionalCascadeLambda) +
+                        logarithmic * kMobileDirectionalCascadeLambda;
+        }
     }
 }
 
@@ -1532,6 +1687,10 @@ void NewPipelineClientRenderPath::LoadStaticLightingAssets()
         return;
     const ClientLightmapPackageResult lightmap_result =
         client_static_lighting.LoadLightmaps(scene_asset_path, local_scene);
+    client_volumetric_lightmap =
+        lightmap_result.success
+            ? lightmap_result.volumetric_lightmap
+            : ClientVolumetricLightmapData{};
     if (lightmap_result.scene_replaced)
     {
         scene_source_root_entity = wi::ecs::INVALID_ENTITY;
@@ -1645,7 +1804,7 @@ bool NewPipelineClientRenderPath::IsStaticLightingBakeActive() const
 std::string NewPipelineClientRenderPath::GetStaticLightingBakeStatus() const
 {
     if (static_lighting_bake_requested && IsLightmapBakeActive())
-        return "Client Lighting 1/2 - " + lightmap_bake_status;
+        return "Client Lighting 1/2 (2D + VLM) - " + lightmap_bake_status;
     if (static_lighting_bake_requested && IsReflectionProbeBakeActive())
         return "Client Lighting 2/2 - " + reflection_probe_status;
     return client_static_lighting.GetStatusSummary();
@@ -1899,6 +2058,8 @@ bool NewPipelineClientRenderPath::IsLightmapBakeActive() const
 {
     return lightmap_bake_state == LightmapBakeState::Preparing ||
         lightmap_bake_state == LightmapBakeState::Baking ||
+        lightmap_bake_state == LightmapBakeState::BakingVolume ||
+        lightmap_bake_state == LightmapBakeState::ReadingVolume ||
         lightmap_bake_state == LightmapBakeState::Saving;
 }
 
@@ -2462,6 +2623,7 @@ void NewPipelineClientRenderPath::UpdateLightmapBake(float dt)
     if (lightmap_cancel_requested)
     {
         ClearLightmapBakeRequests(true);
+        RestoreVolumetricLightmapBakeRendererState();
         wi::renderer::SetRaytraceBounceCount(previous_raytrace_bounce_count);
         ResetLightmapBakeScheduling();
         CleanupLightmapBakeTemps();
@@ -2481,6 +2643,12 @@ void NewPipelineClientRenderPath::UpdateLightmapBake(float dt)
     if (lightmap_bake_state == LightmapBakeState::Preparing)
     {
         PrepareLightmapBake();
+        return;
+    }
+    if (lightmap_bake_state == LightmapBakeState::BakingVolume ||
+        lightmap_bake_state == LightmapBakeState::ReadingVolume)
+    {
+        UpdateVolumetricLightmapBake();
         return;
     }
     if (lightmap_bake_state != LightmapBakeState::Baking)
@@ -2514,7 +2682,7 @@ void NewPipelineClientRenderPath::UpdateLightmapBake(float dt)
     if (lightmap_bake_active.empty() && lightmap_bake_pending_save.empty() &&
         lightmap_bake_next_index >= lightmap_bake_queue.size())
     {
-        FinishLightmapBake();
+        BeginVolumetricLightmapBake();
         return;
     }
 
@@ -2535,6 +2703,456 @@ void NewPipelineClientRenderPath::UpdateLightmapBake(float dt)
 
     UpdateLightmapBakeWorkload(dt);
     UpdateLightmapBakeProgress();
+}
+
+void NewPipelineClientRenderPath::BeginVolumetricLightmapBake()
+{
+    ResetLightmapBakeScheduling();
+
+    const XMFLOAT3 bounds_min = local_scene.bounds.getMin();
+    const XMFLOAT3 bounds_max = local_scene.bounds.getMax();
+    const float extents[] = {
+        bounds_max.x - bounds_min.x,
+        bounds_max.y - bounds_min.y,
+        bounds_max.z - bounds_min.z,
+    };
+    const float longest_extent =
+        std::max(extents[0], std::max(extents[1], extents[2]));
+    if (!std::isfinite(longest_extent) || longest_extent <= 0.001f)
+    {
+        FailLightmapBake(
+            "volumetric lightmap scene bounds are empty or invalid");
+        return;
+    }
+
+    uint32_t dimensions[] = {};
+    for (size_t axis = 0; axis < 3; ++axis)
+    {
+        dimensions[axis] = std::clamp<uint32_t>(
+            static_cast<uint32_t>(std::lround(
+                extents[axis] / longest_extent *
+                float(kClientVLMGridLongestAxis))),
+            kClientVLMGridMinimumAxis,
+            kClientVLMGridLongestAxis);
+    }
+    auto probe_count = [&]() {
+        return static_cast<uint64_t>(dimensions[0]) *
+            dimensions[1] * dimensions[2];
+    };
+    while (probe_count() > kClientVLMMaxProbeCount)
+    {
+        size_t largest_axis = 3;
+        for (size_t axis = 0; axis < 3; ++axis)
+        {
+            if (dimensions[axis] <= kClientVLMGridMinimumAxis)
+                continue;
+            if (largest_axis == 3 ||
+                dimensions[axis] > dimensions[largest_axis])
+                largest_axis = axis;
+        }
+        if (largest_axis == 3)
+        {
+            FailLightmapBake(
+                "volumetric lightmap probe budget cannot fit scene grid");
+            return;
+        }
+        --dimensions[largest_axis];
+    }
+
+    previous_ddgi_enabled = wi::renderer::GetDDGIEnabled();
+    previous_ddgi_ray_count = wi::renderer::GetDDGIRayCount();
+    previous_ddgi_min_ray_count = wi::renderer::GetDDGIMinRayCount();
+    previous_ddgi_instance_inclusion_mask =
+        wi::renderer::GetDDGIInstanceInclusionMask();
+    previous_ddgi_blend_speed = wi::renderer::GetDDGIBlendSpeed();
+    volumetric_renderer_state_saved = true;
+
+    previous_ddgi_scene_state = std::move(local_scene.ddgi);
+    local_scene.ddgi = {};
+    local_scene.ddgi.grid_dimensions =
+        uint3(dimensions[0], dimensions[1], dimensions[2]);
+    client_volumetric_lightmap.Clear();
+    volumetric_ray_readback = {};
+    volumetric_ray_count_readback = {};
+    volumetric_readback_requested = false;
+    volumetric_readback_scheduled = false;
+    volumetric_readback_submit_frame = 0;
+    volumetric_readback_error.clear();
+
+    wi::renderer::SetDDGIEnabled(true);
+    wi::renderer::SetDDGIRayCount(kClientVLMFinalProjectionRays);
+    wi::renderer::SetDDGIMinRayCount(kClientVLMConvergenceMinRays);
+    wi::renderer::SetDDGIInstanceInclusionMask(
+        wi::renderer::raytracing_inclusion_mask_lightmap);
+    wi::renderer::SetDDGIBlendSpeed(0.15f);
+
+    lightmap_bake_state = LightmapBakeState::BakingVolume;
+    lightmap_bake_status =
+        "Lightmap: baking Client volumetric lightmap " +
+        std::to_string(dimensions[0]) + "x" +
+        std::to_string(dimensions[1]) + "x" +
+        std::to_string(dimensions[2]) +
+        " probes (UE Mobile per-primitive runtime contract)";
+    wi::backlog::post(lightmap_bake_status);
+}
+
+void NewPipelineClientRenderPath::UpdateVolumetricLightmapBake()
+{
+    wi::graphics::GraphicsDevice* device = wi::graphics::GetDevice();
+    if (lightmap_bake_state == LightmapBakeState::BakingVolume)
+    {
+        if (!local_scene.ddgi.ray_buffer.IsValid() ||
+            !local_scene.ddgi.raycount_buffer.IsValid() ||
+            local_scene.ddgi.frame_index < kClientVLMConvergenceFrames)
+        {
+            lightmap_bake_status =
+                "Lightmap: Client volumetric lightmap converging " +
+                std::to_string(std::min(
+                    local_scene.ddgi.frame_index,
+                    kClientVLMConvergenceFrames)) +
+                "/" + std::to_string(kClientVLMConvergenceFrames);
+            return;
+        }
+
+        // The saved L2 projection must use a complete, uniformly distributed
+        // ray set. Adaptive DDGI ray counts remain enabled during convergence,
+        // then the final frame is explicitly sampled at the production budget.
+        wi::renderer::SetDDGIMinRayCount(
+            kClientVLMFinalProjectionRays);
+        volumetric_readback_requested = true;
+        lightmap_bake_state = LightmapBakeState::ReadingVolume;
+        lightmap_bake_status =
+            "Lightmap: projecting final volumetric SH and reading back";
+        return;
+    }
+
+    if (!volumetric_readback_scheduled)
+        return;
+
+    if (!volumetric_readback_error.empty())
+    {
+        const std::string error = volumetric_readback_error;
+        FailLightmapBake(error);
+        return;
+    }
+    if (device->GetFrameCount() <= volumetric_readback_submit_frame)
+        return;
+
+    // The copy was submitted by the host at the end of the previous frame.
+    // One terminal bake stall is acceptable and avoids a persistent readback
+    // ring or any RenderPath-owned SubmitCommandLists call.
+    device->WaitForGPU();
+    std::string error;
+    if (!CompleteVolumetricLightmapReadback(error))
+    {
+        FailLightmapBake(error);
+        return;
+    }
+    RestoreVolumetricLightmapBakeRendererState();
+    FinishLightmapBake();
+}
+
+bool NewPipelineClientRenderPath::CompleteVolumetricLightmapReadback(
+    std::string& error)
+{
+    if (volumetric_ray_readback.mapped_data == nullptr ||
+        volumetric_ray_count_readback.mapped_data == nullptr)
+    {
+        error = "volumetric lightmap GPU readback is not CPU accessible";
+        return false;
+    }
+
+    const XMUINT3 dimensions(
+        local_scene.ddgi.grid_dimensions.x,
+        local_scene.ddgi.grid_dimensions.y,
+        local_scene.ddgi.grid_dimensions.z);
+    const uint64_t probe_count =
+        static_cast<uint64_t>(dimensions.x) *
+        dimensions.y * dimensions.z;
+    if (probe_count == 0 ||
+        probe_count > kClientVLMMaxProbeCount)
+    {
+        error = "volumetric lightmap probe count is invalid";
+        return false;
+    }
+    const uint64_t expected_ray_bytes =
+        probe_count * DDGI_MAX_RAYCOUNT *
+        sizeof(DDGIRayDataPacked);
+    if (volumetric_ray_readback.GetDesc().size <
+            expected_ray_bytes ||
+        volumetric_ray_count_readback.GetDesc().size < probe_count)
+    {
+        error = "volumetric lightmap GPU readback is truncated";
+        return false;
+    }
+
+    ClientVolumetricLightmapData result;
+    result.dimensions = dimensions;
+    result.bounds_min = XMFLOAT3(
+        local_scene.ddgi.grid_min.x,
+        local_scene.ddgi.grid_min.y,
+        local_scene.ddgi.grid_min.z);
+    result.bounds_max = XMFLOAT3(
+        local_scene.ddgi.grid_max.x,
+        local_scene.ddgi.grid_max.y,
+        local_scene.ddgi.grid_max.z);
+    result.probes.resize(static_cast<size_t>(probe_count));
+
+    const auto* rays = static_cast<const DDGIRayDataPacked*>(
+        volumetric_ray_readback.mapped_data);
+    const auto* ray_counts = static_cast<const uint8_t*>(
+        volumetric_ray_count_readback.mapped_data);
+    constexpr float sqrt_pi = 1.7724538509055160273f;
+    constexpr float basis_l0 = 1.0f / (2.0f * sqrt_pi);
+    constexpr float basis_l1 =
+        1.7320508075688772935f / (2.0f * sqrt_pi);
+    constexpr float basis_l2_mn2 =
+        3.8729833462074168852f / (2.0f * sqrt_pi);
+    constexpr float basis_l2_mn1 =
+        3.8729833462074168852f / (2.0f * sqrt_pi);
+    constexpr float basis_l2_m0 =
+        2.2360679774997896964f / (4.0f * sqrt_pi);
+    constexpr float basis_l2_m1 =
+        3.8729833462074168852f / (2.0f * sqrt_pi);
+    constexpr float basis_l2_m2 =
+        3.8729833462074168852f / (4.0f * sqrt_pi);
+
+    for (uint64_t probe_index = 0;
+        probe_index < probe_count;
+        ++probe_index)
+    {
+        const uint32_t ray_count = std::min<uint32_t>(
+            uint32_t(ray_counts[probe_index]) *
+                DDGI_RAY_BUCKET_COUNT,
+            DDGI_MAX_RAYCOUNT);
+        if (ray_count != kClientVLMFinalProjectionRays)
+        {
+            error =
+                "volumetric lightmap final probe sampling was incomplete";
+            return false;
+        }
+
+        ClientVolumetricLightmapProbe& destination =
+            result.probes[static_cast<size_t>(probe_index)];
+        uint32_t valid_rays = 0;
+        for (uint32_t ray_index = 0;
+            ray_index < ray_count;
+            ++ray_index)
+        {
+            const DDGIRayDataPacked& packed =
+                rays[probe_index * DDGI_MAX_RAYCOUNT + ray_index];
+            XMFLOAT3 direction(
+                wi::math::f16tof32(packed.data.x),
+                wi::math::f16tof32(packed.data.x >> 16u),
+                wi::math::f16tof32(packed.data.y));
+            const XMFLOAT3 radiance(
+                wi::math::f16tof32(packed.data.z),
+                wi::math::f16tof32(packed.data.z >> 16u),
+                wi::math::f16tof32(packed.data.w));
+            const float direction_length = std::sqrt(
+                direction.x * direction.x +
+                direction.y * direction.y +
+                direction.z * direction.z);
+            if (!std::isfinite(direction_length) ||
+                direction_length <= 1e-5f ||
+                !std::isfinite(radiance.x) ||
+                !std::isfinite(radiance.y) ||
+                !std::isfinite(radiance.z))
+                continue;
+            direction.x /= direction_length;
+            direction.y /= direction_length;
+            direction.z /= direction_length;
+
+            const float basis[9] = {
+                basis_l0,
+                basis_l1 * direction.y,
+                basis_l1 * direction.z,
+                basis_l1 * direction.x,
+                basis_l2_mn2 * direction.x * direction.y,
+                basis_l2_mn1 * direction.y * direction.z,
+                basis_l2_m0 *
+                    (3.0f * direction.z * direction.z - 1.0f),
+                basis_l2_m1 * direction.x * direction.z,
+                basis_l2_m2 *
+                    (direction.x * direction.x -
+                        direction.y * direction.y),
+            };
+            for (size_t coefficient = 0;
+                coefficient < destination.radiance_sh.size();
+                ++coefficient)
+            {
+                destination.radiance_sh[coefficient].x +=
+                    radiance.x * basis[coefficient];
+                destination.radiance_sh[coefficient].y +=
+                    radiance.y * basis[coefficient];
+                destination.radiance_sh[coefficient].z +=
+                    radiance.z * basis[coefficient];
+            }
+            ++valid_rays;
+        }
+        if (valid_rays < ray_count * 95u / 100u)
+        {
+            error =
+                "volumetric lightmap contains too many invalid final rays";
+            return false;
+        }
+        const float normalization =
+            (4.0f * XM_PI) / static_cast<float>(valid_rays);
+        for (XMFLOAT3& coefficient : destination.radiance_sh)
+        {
+            coefficient.x *= normalization;
+            coefficient.y *= normalization;
+            coefficient.z *= normalization;
+        }
+    }
+
+    if (!result.IsValid())
+    {
+        error = "volumetric lightmap projection produced invalid data";
+        return false;
+    }
+    client_volumetric_lightmap = std::move(result);
+    volumetric_ray_readback = {};
+    volumetric_ray_count_readback = {};
+    volumetric_readback_scheduled = false;
+    wi::backlog::post(
+        "Client volumetric lightmap complete: probes=" +
+        std::to_string(client_volumetric_lightmap.probes.size()) +
+        " SH=L2 runtime_sampling=CPU-per-primitive");
+    return true;
+}
+
+void NewPipelineClientRenderPath::
+    RestoreVolumetricLightmapBakeRendererState()
+{
+    volumetric_readback_requested = false;
+    volumetric_readback_scheduled = false;
+    volumetric_readback_error.clear();
+    volumetric_ray_readback = {};
+    volumetric_ray_count_readback = {};
+    if (!volumetric_renderer_state_saved)
+        return;
+
+    wi::renderer::SetDDGIEnabled(previous_ddgi_enabled);
+    wi::renderer::SetDDGIRayCount(previous_ddgi_ray_count);
+    wi::renderer::SetDDGIMinRayCount(
+        previous_ddgi_min_ray_count);
+    wi::renderer::SetDDGIInstanceInclusionMask(
+        previous_ddgi_instance_inclusion_mask);
+    wi::renderer::SetDDGIBlendSpeed(previous_ddgi_blend_speed);
+    volumetric_renderer_state_saved = false;
+    local_scene.ddgi = std::move(previous_ddgi_scene_state);
+    previous_ddgi_scene_state = {};
+}
+
+void NewPipelineClientRenderPath::UpdateClientVolumetricLightmapInstances()
+{
+    visibilityResources.buffer_client_vlm_instances = nullptr;
+    visibilityResources.buffer_client_vlm_instances_upload = nullptr;
+    if (!render_settings.baked_lightmaps_enabled ||
+        !client_volumetric_lightmap.IsValid() ||
+        local_scene.instanceArraySize == 0)
+        return;
+
+    const uint64_t element_count =
+        static_cast<uint64_t>(local_scene.instanceArraySize) *
+        kClientVLMFloat4sPerInstance;
+    const uint64_t buffer_size =
+        element_count * sizeof(XMFLOAT4);
+    wi::graphics::GraphicsDevice* device = wi::graphics::GetDevice();
+
+    if (!volumetric_instance_buffer.IsValid() ||
+        volumetric_instance_buffer.GetDesc().size != buffer_size)
+    {
+        wi::graphics::GPUBufferDesc default_desc;
+        default_desc.size = buffer_size;
+        // visibility_shadeCS consumes this through Buffer<float4>, so this
+        // must be a typed texel buffer on DX12, Metal and Vulkan rather than
+        // a StructuredBuffer descriptor.
+        default_desc.format =
+            wi::graphics::Format::R32G32B32A32_FLOAT;
+        default_desc.bind_flags =
+            wi::graphics::BindFlag::SHADER_RESOURCE;
+        volumetric_instance_buffer = {};
+        if (!device->CreateBuffer(
+                &default_desc,
+                nullptr,
+                &volumetric_instance_buffer))
+            return;
+        device->SetName(
+            &volumetric_instance_buffer,
+            "newpipeline.client.vlm_instances");
+
+        wi::graphics::GPUBufferDesc upload_desc;
+        upload_desc.size = buffer_size;
+        upload_desc.usage = wi::graphics::Usage::UPLOAD;
+        for (size_t index = 0;
+            index < volumetric_instance_upload.size();
+            ++index)
+        {
+            volumetric_instance_upload[index] = {};
+            if (!device->CreateBuffer(
+                    &upload_desc,
+                    nullptr,
+                    &volumetric_instance_upload[index]))
+            {
+                volumetric_instance_buffer = {};
+                return;
+            }
+            device->SetName(
+                &volumetric_instance_upload[index],
+                "newpipeline.client.vlm_instances_upload");
+        }
+    }
+
+    wi::graphics::GPUBuffer& upload =
+        volumetric_instance_upload[device->GetBufferIndex()];
+    if (upload.mapped_data == nullptr ||
+        upload.GetDesc().size != buffer_size)
+        return;
+    std::memset(
+        upload.mapped_data,
+        0,
+        static_cast<size_t>(buffer_size));
+
+    auto* destination =
+        static_cast<XMFLOAT4*>(upload.mapped_data);
+    const size_t object_count = std::min(
+        local_scene.objects.GetCount(),
+        local_scene.aabb_objects.size());
+    for (size_t object_index = 0;
+        object_index < object_count;
+        ++object_index)
+    {
+        std::array<XMFLOAT3, 9> radiance_sh = {};
+        if (!client_volumetric_lightmap.SampleRadianceSH(
+                local_scene.aabb_objects[object_index].getCenter(),
+                radiance_sh))
+            continue;
+
+        float flattened[28] = {};
+        size_t component = 0;
+        for (const XMFLOAT3& coefficient : radiance_sh)
+        {
+            flattened[component++] = std::clamp(
+                coefficient.x, -40000.0f, 40000.0f);
+            flattened[component++] = std::clamp(
+                coefficient.y, -40000.0f, 40000.0f);
+            flattened[component++] = std::clamp(
+                coefficient.z, -40000.0f, 40000.0f);
+        }
+        flattened[27] = 1.0f;
+        std::memcpy(
+            destination +
+                object_index * kClientVLMFloat4sPerInstance,
+            flattened,
+            sizeof(flattened));
+    }
+
+    visibilityResources.buffer_client_vlm_instances =
+        &volumetric_instance_buffer;
+    visibilityResources.buffer_client_vlm_instances_upload =
+        &upload;
 }
 
 bool NewPipelineClientRenderPath::CommitLightmapBakeFiles(std::string& error)
@@ -2683,6 +3301,7 @@ void NewPipelineClientRenderPath::FinishLightmapBake()
         local_scene,
         lightmap_bake_completed,
         lightmap_bake_settings,
+        client_volumetric_lightmap,
         error))
     {
         wi::backlog::post("Client lightmap package diagnostics: save_failures=1 load_failures=0");
@@ -2738,6 +3357,7 @@ void NewPipelineClientRenderPath::FinishLightmapBake()
         LogLightmapSceneParity("reload verification failed");
         return;
     }
+    client_volumetric_lightmap = load_result.volumetric_lightmap;
     scene_source_root_entity = wi::ecs::INVALID_ENTITY;
     environment_probe_entity = wi::ecs::INVALID_ENTITY;
     environment_probe_created_by_client = false;
@@ -2794,6 +3414,7 @@ void NewPipelineClientRenderPath::FinishLightmapBake()
 void NewPipelineClientRenderPath::FailLightmapBake(const std::string& reason)
 {
     ClearLightmapBakeRequests(true);
+    RestoreVolumetricLightmapBakeRendererState();
     wi::renderer::SetRaytraceBounceCount(previous_raytrace_bounce_count);
     ResetLightmapBakeScheduling();
     CleanupLightmapBakeTemps();
@@ -2833,6 +3454,10 @@ void NewPipelineClientRenderPath::ReloadSceneAfterLightmapBakeAbort()
     ApplySunStateToScene(local_scene, sun_state);
     const ClientLightmapPackageResult package_result =
         client_static_lighting.LoadLightmaps(scene_asset_path, local_scene);
+    client_volumetric_lightmap =
+        package_result.success
+            ? package_result.volumetric_lightmap
+            : ClientVolumetricLightmapData{};
     if (package_result.scene_replaced)
         scene_source_root_entity = wi::ecs::INVALID_ENTITY;
     wi::backlog::post(package_result.diagnostic);

@@ -18,6 +18,7 @@ struct DDGIPushConstants
 	uint instanceInclusionMask;
 	uint frameIndex;
 	uint rayCount;
+	uint minRayCount;
 	float blendSpeed;
 };
 

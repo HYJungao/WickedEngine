@@ -55,7 +55,10 @@ void main(uint3 DTid : SV_DispatchThreadID, uint3 Gid : SV_GroupID, uint groupIn
 		}
 
 		rayCount = align(rayCount, DDGI_RAY_BUCKET_COUNT);
-		rayCount = clamp(rayCount, DDGI_RAY_BUCKET_COUNT, DDGI_MAX_RAYCOUNT);
+		const uint minimumRayCount = align(
+			clamp(push.minRayCount, DDGI_RAY_BUCKET_COUNT, push.rayCount),
+			DDGI_RAY_BUCKET_COUNT);
+		rayCount = clamp(rayCount, minimumRayCount, push.rayCount);
 
 		if(push.frameIndex == 0)
 			rayCount = DDGI_MAX_RAYCOUNT;

@@ -3,6 +3,7 @@
 #include "NewPipelineScene.h"
 
 #include <string>
+#include <array>
 #include <vector>
 
 namespace wicked_newpipeline
@@ -19,6 +20,28 @@ struct ClientLightmapBakeSettings
     uint32_t bounce_count = 3;
 };
 
+// UE's mobile path evaluates one precomputed SH sample per movable primitive.
+// The Client keeps the same runtime contract, while the bake backend remains
+// native Wicked so it works on DX12 and Metal without an RTX dependency.
+struct ClientVolumetricLightmapProbe
+{
+    std::array<XMFLOAT3, 9> radiance_sh = {};
+};
+
+struct ClientVolumetricLightmapData
+{
+    XMUINT3 dimensions = {};
+    XMFLOAT3 bounds_min = {};
+    XMFLOAT3 bounds_max = {};
+    std::vector<ClientVolumetricLightmapProbe> probes;
+
+    bool IsValid() const;
+    bool SampleRadianceSH(
+        const XMFLOAT3& position,
+        std::array<XMFLOAT3, 9>& radiance_sh) const;
+    void Clear();
+};
+
 struct ClientLightmapPackageResult
 {
     bool success = false;
@@ -26,6 +49,7 @@ struct ClientLightmapPackageResult
     uint32_t loaded_count = 0;
     uint64_t source_scene_hash = 0;
     uint64_t derived_scene_hash = 0;
+    ClientVolumetricLightmapData volumetric_lightmap;
     std::string diagnostic;
 };
 
@@ -33,10 +57,9 @@ class ClientLightmapPackage
 {
 public:
     static constexpr const char* kObjectIdMetadataKey = "newpipeline.client_lightmap_id";
-    // Version 4 invalidates packages baked before geometric-normal ray bias was
-    // introduced. The byte layout is unchanged, but the transport contract is
-    // materially different and stale v3 lighting must not be reused silently.
-    static constexpr uint32_t kPackageVersion = 4;
+    // Version 5 adds the required Client volumetric lightmap block. Older
+    // packages cannot light movable/unbaked primitives with the new contract.
+    static constexpr uint32_t kPackageVersion = 5;
     static constexpr uint32_t kDerivedSceneVersion = 2;
     static constexpr uint32_t kObjectMappingVersion = 1;
 
@@ -60,6 +83,7 @@ public:
         const wi::scene::Scene& scene,
         const std::vector<wi::ecs::Entity>& entities,
         const ClientLightmapBakeSettings& settings,
+        const ClientVolumetricLightmapData& volumetric_lightmap,
         std::string& error) const;
 };
 

@@ -83,6 +83,7 @@ public:
     void Compose(wi::graphics::CommandList cmd) const override;
     void ResizeBuffers() override;
     void PreRender() override;
+    void Render() const override;
     void RenderAO(wi::graphics::CommandList cmd) const override;
 
 private:
@@ -106,6 +107,7 @@ private:
     void ApplyRenderSettings(bool log_changes);
     void ConfigureLowEndLocalRendering();
     void ApplyShadowSettings(bool log_changes);
+    void ConfigureClientDirectionalShadowCascades();
     void ApplySSAOSettings(bool log_changes);
     void UpdateElasticLighting(float dt);
     void ApplyElasticLightingResources();
@@ -134,6 +136,12 @@ private:
     uint64_t GetActiveLightmapTexelCount() const;
     uint64_t GetLightmapBakeTotalSamples() const;
     void FinishLightmapBake();
+    void BeginVolumetricLightmapBake();
+    void UpdateVolumetricLightmapBake();
+    void ScheduleVolumetricLightmapReadback() const;
+    bool CompleteVolumetricLightmapReadback(std::string& error);
+    void RestoreVolumetricLightmapBakeRendererState();
+    void UpdateClientVolumetricLightmapInstances();
     void FailLightmapBake(const std::string& reason);
     bool SavePreparedScene(const std::string& path, std::string& error);
     bool CommitLightmapBakeFiles(std::string& error);
@@ -148,6 +156,8 @@ private:
         Idle,
         Preparing,
         Baking,
+        BakingVolume,
+        ReadingVolume,
         Saving,
         Completed,
         Cancelled,
@@ -170,6 +180,7 @@ private:
     wi::scene::Scene local_scene;
     wi::scene::CameraComponent local_camera;
     ClientStaticLighting client_static_lighting;
+    ClientVolumetricLightmapData client_volumetric_lightmap;
     ClientLightmapBakeSettings lightmap_bake_settings;
     bool lightmap_bake_denoiser_available = false;
     bool lightmap_bake_denoiser_required = false;
@@ -208,6 +219,23 @@ private:
     SceneParityFingerprint lightmap_bake_scene_fingerprint;
     bool lightmap_bake_scene_fingerprint_valid = false;
     bool lightmap_cancel_requested = false;
+    bool previous_ddgi_enabled = false;
+    uint32_t previous_ddgi_ray_count = 0;
+    uint32_t previous_ddgi_min_ray_count = 0;
+    uint8_t previous_ddgi_instance_inclusion_mask = 0xFF;
+    float previous_ddgi_blend_speed = 0.1f;
+    bool volumetric_renderer_state_saved = false;
+    wi::scene::Scene::DDGI previous_ddgi_scene_state;
+    mutable wi::graphics::GPUBuffer volumetric_ray_readback;
+    mutable wi::graphics::GPUBuffer volumetric_ray_count_readback;
+    mutable bool volumetric_readback_requested = false;
+    mutable bool volumetric_readback_scheduled = false;
+    mutable uint64_t volumetric_readback_submit_frame = 0;
+    mutable std::string volumetric_readback_error;
+    std::array<wi::graphics::GPUBuffer,
+        wi::graphics::GraphicsDevice::GetBufferCount()>
+        volumetric_instance_upload;
+    wi::graphics::GPUBuffer volumetric_instance_buffer;
     WebRTCVideoTransport webrtc_transport;
     struct RemoteVideoUploadSlot
     {

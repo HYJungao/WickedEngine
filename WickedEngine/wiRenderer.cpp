@@ -148,6 +148,8 @@ SURFEL_DEBUG SURFELGI_DEBUG = SURFEL_DEBUG_NONE;
 bool DDGI_ENABLED = false;
 bool DDGI_DEBUG_ENABLED = false;
 uint32_t DDGI_RAYCOUNT = 256u;
+uint32_t DDGI_MIN_RAYCOUNT = DDGI_RAY_BUCKET_COUNT;
+uint8_t DDGI_INSTANCE_INCLUSION_MASK = 0xFF;
 float DDGI_BLEND_SPEED = 0.1f;
 float GI_BOOST = 1.0f;
 bool MESH_SHADER_ALLOWED = false;
@@ -168,6 +170,8 @@ Texture shadowMapAtlas;
 Texture shadowMapAtlas_Transparent;
 int max_shadow_resolution_2D = 1024;
 int max_shadow_resolution_cube = 256;
+int min_shadow_resolution_2D = 0;
+int min_shadow_resolution_cube = 0;
 
 GPUBuffer indirectDebugStatsReadback[GraphicsDevice::GetBufferCount()];
 bool indirectDebugStatsReadback_available[GraphicsDevice::GetBufferCount()] = {};
@@ -3975,7 +3979,8 @@ void UpdateVisibility(Visibility& vis)
 
 				const float dist = wi::math::Distance(vis.camera->Eye, light.position);
 				const float range = light.GetRange();
-				const float amount = std::min(1.0f, range / std::max(0.001f, dist)) * iterative_scaling;
+				const float projected_amount =
+					std::min(1.0f, range / std::max(0.001f, dist));
 
 				wi::rectpacker::Rect rect = {};
 				rect.id = int(lightIndex);
@@ -4005,8 +4010,11 @@ void UpdateVisibility(Visibility& vis)
 					}
 					else
 					{
-						rect.w = int(max_shadow_resolution_2D * amount);
-						rect.h = int(max_shadow_resolution_2D * amount);
+						const float projected_resolution = std::max(
+							float(min_shadow_resolution_2D),
+							float(max_shadow_resolution_2D) * projected_amount);
+						rect.w = int(projected_resolution * iterative_scaling);
+						rect.h = int(projected_resolution * iterative_scaling);
 					}
 					break;
 				case LightComponent::POINT:
@@ -4017,8 +4025,11 @@ void UpdateVisibility(Visibility& vis)
 					}
 					else
 					{
-						rect.w = int(max_shadow_resolution_cube * amount) * 6;
-						rect.h = int(max_shadow_resolution_cube * amount);
+						const float projected_resolution = std::max(
+							float(min_shadow_resolution_cube),
+							float(max_shadow_resolution_cube) * projected_amount);
+						rect.w = int(projected_resolution * iterative_scaling) * 6;
+						rect.h = int(projected_resolution * iterative_scaling);
 					}
 					break;
 				default:
@@ -6710,11 +6721,25 @@ void DrawLensFlares(
 
 void SetShadowProps2D(int resolution)
 {
-	max_shadow_resolution_2D = resolution;
+	max_shadow_resolution_2D = std::max(0, resolution);
+	min_shadow_resolution_2D =
+		std::min(min_shadow_resolution_2D, max_shadow_resolution_2D);
 }
 void SetShadowPropsCube(int resolution)
 {
-	max_shadow_resolution_cube = resolution;
+	max_shadow_resolution_cube = std::max(0, resolution);
+	min_shadow_resolution_cube =
+		std::min(min_shadow_resolution_cube, max_shadow_resolution_cube);
+}
+void SetShadowMinResolution2D(int resolution)
+{
+	min_shadow_resolution_2D =
+		std::clamp(resolution, 0, max_shadow_resolution_2D);
+}
+void SetShadowMinResolutionCube(int resolution)
+{
+	min_shadow_resolution_cube =
+		std::clamp(resolution, 0, max_shadow_resolution_cube);
 }
 
 void DrawShadowmaps(
@@ -12357,6 +12382,28 @@ void Visibility_Shade(
 	push.elastic_indirect_diffuse_uav = elastic_indirect_diffuse_uav;
 	push.elastic_ao_uav = elastic_ao_uav;
 
+	if (res.buffer_client_vlm_instances != nullptr &&
+		res.buffer_client_vlm_instances_upload != nullptr &&
+		res.buffer_client_vlm_instances->IsValid() &&
+		res.buffer_client_vlm_instances_upload->IsValid())
+	{
+		device->Barrier(GPUBarrier::Buffer(
+			res.buffer_client_vlm_instances,
+			ResourceState::SHADER_RESOURCE,
+			ResourceState::COPY_DST), cmd);
+		device->CopyBuffer(
+			res.buffer_client_vlm_instances,
+			0,
+			res.buffer_client_vlm_instances_upload,
+			0,
+			res.buffer_client_vlm_instances_upload->GetDesc().size,
+			cmd);
+		device->Barrier(GPUBarrier::Buffer(
+			res.buffer_client_vlm_instances,
+			ResourceState::COPY_DST,
+			ResourceState::SHADER_RESOURCE), cmd);
+	}
+
 	ExternalLightingCB external = {};
 	external.external_diffuse_texture =
 		device->GetDescriptorIndex(res.texture_remote_indirect_diffuse, SubresourceType::SRV);
@@ -12372,6 +12419,10 @@ void Visibility_Shade(
 		device->GetDescriptorIndex(res.texture_remote_history_normal_roughness, SubresourceType::SRV);
 	external.external_elastic_specular_uav = elastic_specular_indirect_pre_ao_uav;
 	external.external_elastic_primary_visibility_uav = elastic_primary_light_visibility_uav;
+	external.external_client_vlm_buffer =
+		device->GetDescriptorIndex(
+			res.buffer_client_vlm_instances,
+			SubresourceType::SRV);
 	external.external_weights = XMFLOAT4(
 		res.remote_indirect_diffuse_weight,
 		res.remote_ao_weight,
@@ -13032,10 +13083,14 @@ void DDGI(
 	BindCommonResources(cmd);
 
 	DDGIPushConstants push;
-	uint8_t instanceInclusionMask = 0xFF;
-	push.instanceInclusionMask = instanceInclusionMask;
+	push.instanceInclusionMask = GetDDGIInstanceInclusionMask();
 	push.frameIndex = scene.ddgi.frame_index;
-	push.rayCount = std::min(GetDDGIRayCount(), DDGI_MAX_RAYCOUNT);
+	push.rayCount = std::clamp(
+		GetDDGIRayCount(),
+		DDGI_RAY_BUCKET_COUNT,
+		DDGI_MAX_RAYCOUNT);
+	push.rayCount -= push.rayCount % DDGI_RAY_BUCKET_COUNT;
+	push.minRayCount = std::min(GetDDGIMinRayCount(), push.rayCount);
 	push.blendSpeed = GetDDGIBlendSpeed();
 
 	// Ray allocation:
@@ -20351,6 +20406,25 @@ void SetDDGIRayCount(uint32_t value)
 uint32_t GetDDGIRayCount()
 {
 	return DDGI_RAYCOUNT;
+}
+void SetDDGIMinRayCount(uint32_t value)
+{
+	DDGI_MIN_RAYCOUNT = std::clamp(
+		value,
+		DDGI_RAY_BUCKET_COUNT,
+		DDGI_MAX_RAYCOUNT);
+}
+uint32_t GetDDGIMinRayCount()
+{
+	return DDGI_MIN_RAYCOUNT;
+}
+void SetDDGIInstanceInclusionMask(uint8_t value)
+{
+	DDGI_INSTANCE_INCLUSION_MASK = value;
+}
+uint8_t GetDDGIInstanceInclusionMask()
+{
+	return DDGI_INSTANCE_INCLUSION_MASK;
 }
 void SetDDGIBlendSpeed(float value)
 {

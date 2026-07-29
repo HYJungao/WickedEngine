@@ -447,6 +447,11 @@ namespace wi::renderer
 		wi::graphics::GPUBuffer bins;					 // material type binning
 		wi::graphics::GPUBuffer binned_tiles;			 // material type binning
 		wi::graphics::Texture texture_normal_roughness;
+		// Optional per-primitive Client volumetric-lightmap data. Seven float4
+		// elements are stored per Scene::objects instance (27 L2 RGB SH values
+		// plus validity), matching the low-cost UE Mobile query model.
+		const wi::graphics::GPUBuffer* buffer_client_vlm_instances = nullptr;
+		const wi::graphics::GPUBuffer* buffer_client_vlm_instances_upload = nullptr;
 		const wi::graphics::Texture* texture_local_indirect_diffuse = nullptr; // optional local Final GI input before remote blending (RGB includes PI)
 		const wi::graphics::Texture* texture_specular_indirect = nullptr; // optional final indirect-specular contribution for debugging
 		const wi::graphics::Texture* texture_specular_indirect_pre_ao = nullptr; // optional formal indirect specular before surface occlusion
@@ -1296,6 +1301,11 @@ namespace wi::renderer
 
 	void SetShadowProps2D(int max_resolution);
 	void SetShadowPropsCube(int max_resolution);
+	// Minimum projected resolution for non-directional shadow maps before
+	// atlas-pressure scaling is applied. A value of zero preserves the legacy
+	// distance-only behavior.
+	void SetShadowMinResolution2D(int min_resolution);
+	void SetShadowMinResolutionCube(int min_resolution);
 
 	enum WIREFRAME_MODE
 	{
@@ -1382,6 +1392,10 @@ namespace wi::renderer
 	bool GetDDGIDebugEnabled();
 	void SetDDGIRayCount(uint32_t value);
 	uint32_t GetDDGIRayCount();
+	void SetDDGIMinRayCount(uint32_t value);
+	uint32_t GetDDGIMinRayCount();
+	void SetDDGIInstanceInclusionMask(uint8_t value);
+	uint8_t GetDDGIInstanceInclusionMask();
 	void SetDDGIBlendSpeed(float value);
 	float GetDDGIBlendSpeed();
 	void SetGIBoost(float value);

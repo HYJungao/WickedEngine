@@ -25,6 +25,9 @@ namespace wicked_newpipeline
 namespace
 {
 constexpr std::array<uint8_t, 4> kMagic = {'N', 'P', 'L', 'M'};
+constexpr std::array<uint8_t, 4> kVolumetricMagic = {'N', 'P', 'V', 'L'};
+constexpr uint32_t kVolumetricVersion = 1;
+constexpr uint64_t kMaximumVolumetricProbeCount = 1'000'000u;
 constexpr uint32_t kFormatBC6H = static_cast<uint32_t>(wi::graphics::Format::BC6H_UF16);
 constexpr size_t kHeaderSize = 4 + 4 + 8 + 8 + 4 + 4 + 4 + 4 + 4 + 4 + 4;
 
@@ -50,6 +53,38 @@ bool Read(const wi::vector<uint8_t>& bytes, size_t& cursor, T& value)
         bits |= static_cast<U>(bytes[cursor++]) << (i * 8);
     value = static_cast<T>(bits);
     return true;
+}
+
+void AppendFloat(wi::vector<uint8_t>& bytes, float value)
+{
+    uint32_t bits = 0;
+    static_assert(sizeof(bits) == sizeof(value));
+    std::memcpy(&bits, &value, sizeof(bits));
+    Append(bytes, bits);
+}
+
+bool ReadFloat(const wi::vector<uint8_t>& bytes, size_t& cursor, float& value)
+{
+    uint32_t bits = 0;
+    if (!Read(bytes, cursor, bits))
+        return false;
+    std::memcpy(&value, &bits, sizeof(value));
+    return std::isfinite(value);
+}
+
+bool ComputeVolumetricProbeCount(
+    const XMUINT3& dimensions,
+    uint64_t& probe_count)
+{
+    probe_count = 0;
+    if (dimensions.x < 2 || dimensions.y < 2 || dimensions.z < 2)
+        return false;
+    const uint64_t xy =
+        static_cast<uint64_t>(dimensions.x) * dimensions.y;
+    if (xy > kMaximumVolumetricProbeCount / dimensions.z)
+        return false;
+    probe_count = xy * dimensions.z;
+    return probe_count <= kMaximumVolumetricProbeCount;
 }
 
 uint32_t CRC32(const uint8_t* data, size_t size)
@@ -111,6 +146,97 @@ struct PackageEntry
 };
 
 } // namespace
+
+bool ClientVolumetricLightmapData::IsValid() const
+{
+    uint64_t expected = 0;
+    return ComputeVolumetricProbeCount(dimensions, expected) &&
+        expected == probes.size() &&
+        std::isfinite(bounds_min.x) &&
+        std::isfinite(bounds_min.y) &&
+        std::isfinite(bounds_min.z) &&
+        std::isfinite(bounds_max.x) &&
+        std::isfinite(bounds_max.y) &&
+        std::isfinite(bounds_max.z) &&
+        bounds_max.x > bounds_min.x &&
+        bounds_max.y > bounds_min.y &&
+        bounds_max.z > bounds_min.z;
+}
+
+void ClientVolumetricLightmapData::Clear()
+{
+    dimensions = {};
+    bounds_min = {};
+    bounds_max = {};
+    probes.clear();
+}
+
+bool ClientVolumetricLightmapData::SampleRadianceSH(
+    const XMFLOAT3& position,
+    std::array<XMFLOAT3, 9>& radiance_sh) const
+{
+    radiance_sh = {};
+    if (!IsValid() ||
+        position.x < bounds_min.x || position.x > bounds_max.x ||
+        position.y < bounds_min.y || position.y > bounds_max.y ||
+        position.z < bounds_min.z || position.z > bounds_max.z)
+        return false;
+
+    const XMFLOAT3 extent(
+        bounds_max.x - bounds_min.x,
+        bounds_max.y - bounds_min.y,
+        bounds_max.z - bounds_min.z);
+    const XMFLOAT3 grid(
+        (position.x - bounds_min.x) / extent.x * float(dimensions.x - 1),
+        (position.y - bounds_min.y) / extent.y * float(dimensions.y - 1),
+        (position.z - bounds_min.z) / extent.z * float(dimensions.z - 1));
+    const XMUINT3 base(
+        std::min<uint32_t>(static_cast<uint32_t>(std::floor(grid.x)), dimensions.x - 1),
+        std::min<uint32_t>(static_cast<uint32_t>(std::floor(grid.y)), dimensions.y - 1),
+        std::min<uint32_t>(static_cast<uint32_t>(std::floor(grid.z)), dimensions.z - 1));
+    const XMUINT3 upper(
+        std::min(base.x + 1, dimensions.x - 1),
+        std::min(base.y + 1, dimensions.y - 1),
+        std::min(base.z + 1, dimensions.z - 1));
+    const XMFLOAT3 alpha(
+        std::clamp(grid.x - float(base.x), 0.0f, 1.0f),
+        std::clamp(grid.y - float(base.y), 0.0f, 1.0f),
+        std::clamp(grid.z - float(base.z), 0.0f, 1.0f));
+
+    for (uint32_t corner = 0; corner < 8; ++corner)
+    {
+        const uint32_t x = (corner & 1u) ? upper.x : base.x;
+        const uint32_t y = (corner & 2u) ? upper.y : base.y;
+        const uint32_t z = (corner & 4u) ? upper.z : base.z;
+        const float weight =
+            ((corner & 1u) ? alpha.x : 1.0f - alpha.x) *
+            ((corner & 2u) ? alpha.y : 1.0f - alpha.y) *
+            ((corner & 4u) ? alpha.z : 1.0f - alpha.z);
+        const size_t probe_index =
+            static_cast<size_t>(x) +
+            static_cast<size_t>(dimensions.x) *
+                (static_cast<size_t>(y) +
+                    static_cast<size_t>(dimensions.y) * static_cast<size_t>(z));
+        const ClientVolumetricLightmapProbe& probe = probes[probe_index];
+        for (size_t coefficient = 0; coefficient < radiance_sh.size(); ++coefficient)
+        {
+            radiance_sh[coefficient].x += probe.radiance_sh[coefficient].x * weight;
+            radiance_sh[coefficient].y += probe.radiance_sh[coefficient].y * weight;
+            radiance_sh[coefficient].z += probe.radiance_sh[coefficient].z * weight;
+        }
+    }
+    for (const XMFLOAT3& coefficient : radiance_sh)
+    {
+        if (!std::isfinite(coefficient.x) ||
+            !std::isfinite(coefficient.y) ||
+            !std::isfinite(coefficient.z))
+        {
+            radiance_sh = {};
+            return false;
+        }
+    }
+    return true;
+}
 
 uint32_t FinalizeClientLightmapDimension(uint32_t dimension)
 {
@@ -229,12 +355,13 @@ ClientLightmapPackageResult ClientLightmapPackage::LoadFromPaths(
     uint32_t sample_count = 0;
     uint32_t bounce_count = 0;
     uint32_t entry_count = 0;
-    uint32_t reserved = 0;
+    uint32_t volumetric_block_size = 0;
     if (!Read(bytes, cursor, version) || !Read(bytes, cursor, source_scene_hash) ||
         !Read(bytes, cursor, derived_scene_hash) || !Read(bytes, cursor, derived_scene_version) ||
         !Read(bytes, cursor, object_mapping_version) || !Read(bytes, cursor, resolution) ||
         !Read(bytes, cursor, sample_count) || !Read(bytes, cursor, bounce_count) ||
-        !Read(bytes, cursor, entry_count) || !Read(bytes, cursor, reserved))
+        !Read(bytes, cursor, entry_count) ||
+        !Read(bytes, cursor, volumetric_block_size))
     {
         result.diagnostic = "Client Lightmap package truncated header: " + package_path;
         return result;
@@ -259,6 +386,12 @@ ClientLightmapPackageResult ClientLightmapPackage::LoadFromPaths(
     if (resolution == 0 || sample_count == 0 || bounce_count == 0)
     {
         result.diagnostic = "Client Lightmap package contains invalid bake settings";
+        return result;
+    }
+    if (volumetric_block_size == 0)
+    {
+        result.diagnostic =
+            "Client Lightmap package has no volumetric lightmap block";
         return result;
     }
 
@@ -372,9 +505,96 @@ ClientLightmapPackageResult ClientLightmapPackage::LoadFromPaths(
         }
         expected_payload_offset += entry.coverage_size;
     }
-    if (expected_payload_offset != bytes.size())
+    if (expected_payload_offset > bytes.size() ||
+        volumetric_block_size > bytes.size() - expected_payload_offset ||
+        expected_payload_offset + volumetric_block_size != bytes.size())
     {
         result.diagnostic = "Client Lightmap package payload length mismatch";
+        return result;
+    }
+
+    const size_t volumetric_begin = static_cast<size_t>(expected_payload_offset);
+    const size_t volumetric_end =
+        volumetric_begin + static_cast<size_t>(volumetric_block_size);
+    size_t volumetric_cursor = volumetric_begin;
+    if (volumetric_cursor + kVolumetricMagic.size() > volumetric_end ||
+        !std::equal(
+            kVolumetricMagic.begin(),
+            kVolumetricMagic.end(),
+            bytes.begin() + volumetric_cursor))
+    {
+        result.diagnostic =
+            "Client Lightmap package invalid volumetric lightmap header";
+        return result;
+    }
+    volumetric_cursor += kVolumetricMagic.size();
+    uint32_t volumetric_version = 0;
+    uint32_t volumetric_probe_count = 0;
+    uint32_t volumetric_crc = 0;
+    ClientVolumetricLightmapData volumetric;
+    if (!Read(bytes, volumetric_cursor, volumetric_version) ||
+        !Read(bytes, volumetric_cursor, volumetric.dimensions.x) ||
+        !Read(bytes, volumetric_cursor, volumetric.dimensions.y) ||
+        !Read(bytes, volumetric_cursor, volumetric.dimensions.z) ||
+        !ReadFloat(bytes, volumetric_cursor, volumetric.bounds_min.x) ||
+        !ReadFloat(bytes, volumetric_cursor, volumetric.bounds_min.y) ||
+        !ReadFloat(bytes, volumetric_cursor, volumetric.bounds_min.z) ||
+        !ReadFloat(bytes, volumetric_cursor, volumetric.bounds_max.x) ||
+        !ReadFloat(bytes, volumetric_cursor, volumetric.bounds_max.y) ||
+        !ReadFloat(bytes, volumetric_cursor, volumetric.bounds_max.z) ||
+        !Read(bytes, volumetric_cursor, volumetric_probe_count) ||
+        !Read(bytes, volumetric_cursor, volumetric_crc))
+    {
+        result.diagnostic =
+            "Client Lightmap package truncated volumetric lightmap header";
+        return result;
+    }
+    uint64_t expected_probe_count = 0;
+    const bool probe_count_valid = ComputeVolumetricProbeCount(
+        volumetric.dimensions,
+        expected_probe_count);
+    constexpr size_t kProbePayloadSize =
+        9u * 3u * sizeof(float);
+    const uint64_t expected_probe_bytes =
+        expected_probe_count * kProbePayloadSize;
+    if (volumetric_version != kVolumetricVersion ||
+        !probe_count_valid ||
+        expected_probe_count != volumetric_probe_count ||
+        expected_probe_bytes >
+            static_cast<uint64_t>(volumetric_end - volumetric_cursor) ||
+        volumetric_cursor + expected_probe_bytes != volumetric_end)
+    {
+        result.diagnostic =
+            "Client Lightmap package invalid volumetric lightmap layout";
+        return result;
+    }
+    if (CRC32(
+            bytes.data() + volumetric_cursor,
+            static_cast<size_t>(expected_probe_bytes)) != volumetric_crc)
+    {
+        result.diagnostic =
+            "Client Lightmap package volumetric lightmap CRC mismatch";
+        return result;
+    }
+    volumetric.probes.resize(volumetric_probe_count);
+    for (ClientVolumetricLightmapProbe& probe : volumetric.probes)
+    {
+        for (XMFLOAT3& coefficient : probe.radiance_sh)
+        {
+            if (!ReadFloat(bytes, volumetric_cursor, coefficient.x) ||
+                !ReadFloat(bytes, volumetric_cursor, coefficient.y) ||
+                !ReadFloat(bytes, volumetric_cursor, coefficient.z))
+            {
+                result.diagnostic =
+                    "Client Lightmap package contains non-finite volumetric SH";
+                return result;
+            }
+        }
+    }
+    if (!volumetric.IsValid())
+    {
+        result.diagnostic =
+            "Client Lightmap package volumetric lightmap is invalid";
         return result;
     }
 
@@ -450,12 +670,15 @@ ClientLightmapPackageResult ClientLightmapPackage::LoadFromPaths(
     // partially attached to the caller's scene.
     scene.Clear();
     scene.Merge(derived_scene);
+    result.volumetric_lightmap = std::move(volumetric);
     result.success = true;
     result.scene_replaced = true;
     result.diagnostic = "Client Lightmap package loaded: " + std::to_string(result.loaded_count) +
         "/" + std::to_string(entry_count) + " objects, resolution=" + std::to_string(resolution) +
         " samples=" + std::to_string(sample_count) +
-        " bounces=" + std::to_string(bounce_count);
+        " bounces=" + std::to_string(bounce_count) +
+        " vlm_probes=" +
+            std::to_string(result.volumetric_lightmap.probes.size());
     return result;
 }
 
@@ -466,11 +689,17 @@ bool ClientLightmapPackage::Save(
     const wi::scene::Scene& scene,
     const std::vector<wi::ecs::Entity>& entities,
     const ClientLightmapBakeSettings& settings,
+    const ClientVolumetricLightmapData& volumetric_lightmap,
     std::string& error) const
 {
     if (source_scene_hash == 0 || derived_scene_hash == 0)
     {
         error = "source or derived scene hash is zero";
+        return false;
+    }
+    if (!volumetric_lightmap.IsValid())
+    {
+        error = "volumetric lightmap data is missing or invalid";
         return false;
     }
 
@@ -522,6 +751,59 @@ bool ClientLightmapPackage::Save(
         return false;
     }
 
+    wi::vector<uint8_t> volumetric_bytes;
+    volumetric_bytes.insert(
+        volumetric_bytes.end(),
+        kVolumetricMagic.begin(),
+        kVolumetricMagic.end());
+    Append(volumetric_bytes, kVolumetricVersion);
+    Append(volumetric_bytes, volumetric_lightmap.dimensions.x);
+    Append(volumetric_bytes, volumetric_lightmap.dimensions.y);
+    Append(volumetric_bytes, volumetric_lightmap.dimensions.z);
+    AppendFloat(volumetric_bytes, volumetric_lightmap.bounds_min.x);
+    AppendFloat(volumetric_bytes, volumetric_lightmap.bounds_min.y);
+    AppendFloat(volumetric_bytes, volumetric_lightmap.bounds_min.z);
+    AppendFloat(volumetric_bytes, volumetric_lightmap.bounds_max.x);
+    AppendFloat(volumetric_bytes, volumetric_lightmap.bounds_max.y);
+    AppendFloat(volumetric_bytes, volumetric_lightmap.bounds_max.z);
+    Append(
+        volumetric_bytes,
+        static_cast<uint32_t>(volumetric_lightmap.probes.size()));
+    const size_t volumetric_crc_offset = volumetric_bytes.size();
+    Append(volumetric_bytes, uint32_t{0});
+    const size_t volumetric_payload_offset = volumetric_bytes.size();
+    for (const ClientVolumetricLightmapProbe& probe :
+        volumetric_lightmap.probes)
+    {
+        for (const XMFLOAT3& coefficient : probe.radiance_sh)
+        {
+            if (!std::isfinite(coefficient.x) ||
+                !std::isfinite(coefficient.y) ||
+                !std::isfinite(coefficient.z))
+            {
+                error = "volumetric lightmap contains non-finite SH";
+                return false;
+            }
+            AppendFloat(volumetric_bytes, coefficient.x);
+            AppendFloat(volumetric_bytes, coefficient.y);
+            AppendFloat(volumetric_bytes, coefficient.z);
+        }
+    }
+    const uint32_t volumetric_crc = CRC32(
+        volumetric_bytes.data() + volumetric_payload_offset,
+        volumetric_bytes.size() - volumetric_payload_offset);
+    for (size_t byte = 0; byte < sizeof(volumetric_crc); ++byte)
+    {
+        volumetric_bytes[volumetric_crc_offset + byte] =
+            static_cast<uint8_t>(
+                (volumetric_crc >> (byte * 8u)) & 0xFFu);
+    }
+    if (volumetric_bytes.size() > std::numeric_limits<uint32_t>::max())
+    {
+        error = "volumetric lightmap block is too large";
+        return false;
+    }
+
     uint64_t payload_offset = table_size;
     for (PackageEntry& entry : entries)
     {
@@ -530,14 +812,18 @@ bool ClientLightmapPackage::Save(
         entry.coverage_offset = payload_offset;
         payload_offset += entry.coverage_size;
     }
-    if (payload_offset > std::numeric_limits<size_t>::max())
+    if (payload_offset > std::numeric_limits<size_t>::max() ||
+        volumetric_bytes.size() >
+            std::numeric_limits<size_t>::max() -
+                static_cast<size_t>(payload_offset))
     {
         error = "client lightmap package is too large";
         return false;
     }
 
     wi::vector<uint8_t> bytes;
-    bytes.reserve(static_cast<size_t>(payload_offset));
+    bytes.reserve(
+        static_cast<size_t>(payload_offset) + volumetric_bytes.size());
     bytes.insert(bytes.end(), kMagic.begin(), kMagic.end());
     Append(bytes, kPackageVersion);
     Append(bytes, source_scene_hash);
@@ -548,7 +834,7 @@ bool ClientLightmapPackage::Save(
     Append(bytes, settings.sample_count);
     Append(bytes, settings.bounce_count);
     Append(bytes, static_cast<uint32_t>(entries.size()));
-    Append(bytes, uint32_t{0});
+    Append(bytes, static_cast<uint32_t>(volumetric_bytes.size()));
     for (const PackageEntry& entry : entries)
     {
         Append(bytes, static_cast<uint32_t>(entry.id.size()));
@@ -568,6 +854,8 @@ bool ClientLightmapPackage::Save(
         bytes.insert(bytes.end(), entry.payload->begin(), entry.payload->end());
         bytes.insert(bytes.end(), entry.coverage_payload->begin(), entry.coverage_payload->end());
     }
+    bytes.insert(
+        bytes.end(), volumetric_bytes.begin(), volumetric_bytes.end());
 
     if (!wi::helper::FileWrite(package_path, bytes.data(), bytes.size()))
     {

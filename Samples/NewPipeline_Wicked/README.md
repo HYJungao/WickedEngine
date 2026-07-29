@@ -113,13 +113,20 @@ raytrace and denoise resources, while RT Reflection uses the High
 buffers are reported as unavailable. The Server producer path is unchanged.
 
 The Client local renderer is deliberately independent and low-end oriented:
-raster shadow maps (1024 for 2D lights, 512 for cube lights), SSAO, baked
-lightmaps, and a non-realtime 128-pixel environment probe. Local DDGI, RTAO,
+four directional cascades covering the camera far plane, raster shadow maps
+(1024 for 2D lights with a 96-pixel projected floor, 512 for cube lights with
+a 64-pixel projected floor), SSAO, baked 2D lightmaps, a Client volumetric
+lightmap, and a non-realtime 128-pixel environment probe. Local DDGI, RTAO,
 ray-traced diffuse/reflections/shadows, SSGI, SSR, screen-space shadows, and
 planar reflections are disabled. `Local Indirect (Final Input)` shows the exact local diffuse GI
-term used by Final before remote blending, including the ambient fallback on
-dynamic or otherwise unbaked geometry. Static probes contribute to Final,
-and raster shadows remain in the light shadow-map atlas. Remote DDGI and RTAO
+term used by Final before remote blending. Static surfaces use their 2D
+lightmaps; movable or otherwise unbaked objects use one CPU VLM query at the
+object bounds origin and receive L2 RGB SH per instance, following UE Mobile's
+low-cost runtime contract. Ambient is used only outside a valid volume. Static
+probes contribute to Final, and raster shadows remain in the light shadow-map
+atlas. The projected resolution floors are still reduced by atlas pressure, so
+they prevent distance-only shadow loss without making allocation unbounded.
+Remote DDGI and RTAO
 are consumed by Final through the elastic-lighting path described below,
 including formal pre-AO specular and primary-light visibility. The effective algorithms are
 printed at startup and displayed in both debug panels.
@@ -133,10 +140,10 @@ geometry bakeable. Preparation logs categorized coverage and atlas/package error
 
 ## Elastic four-buffer lighting
 
-The Client's original local lighting remains the baseline: baked Lightmap (or
-the engine's normal ambient term on unbaked geometry) for diffuse GI, SSAO for
-screen-space AO, probe/environment specular, and local primary-light
-visibility. An accepted Server frame stores
+The Client's original local lighting remains the baseline: baked 2D Lightmap
+for static surfaces, per-instance VLM SH for unbaked/movable geometry (ambient
+only outside the volume), SSAO, probe/environment specular, and local
+primary-light visibility. An accepted Server frame stores
 V3 descriptors alongside the decoded formal textures. The returned
 `source_control_frame_id` selects a fixed-capacity Client depth/normal GBuffer
 history entry. During `Visibility_Shade`, each current world-space surface is
@@ -184,13 +191,17 @@ The Client debug window's recommended `Generate Client Lighting` entry point
 persists the Client probe placement, generates missing atlas UVs with xatlas, assigns stable object
 IDs, serializes a lightmap-free scene to a temporary file, and then bakes static
 opaque objects at 256-pixel target resolution, 512 samples, and three bounces.
+After the surface bake, a bounded aspect-ratio VLM grid is converged through
+Wicked's offline-capable DDGI ray backend. The final frame forces 512 uniform
+rays per probe and projects them to L2/SH9; runtime DDGI remains disabled.
 The GPU scheduler advances multiple accumulation iterations per frame and keeps
 up to eight objects in flight, bounded by a 25% transient VRAM budget with a
 512-MiB/10% reserve. It adapts work toward a 100-ms bake frame, finalizes at most
 one synchronous readback/BC6H save per update, and never reduces bake quality to
 meet the frame target. The Client status reports active and pending objects,
 sample throughput, iterations per frame, and VRAM usage. Completion writes BC6H
-data to a temporary package and commits only the two sidecars with rollback
+and CRC-protected VLM data to a temporary package and commits only the two
+sidecars with rollback
 backups after the temporary pair passes the cold-start loader. The source hash
 is checked before preparation, before commit, and after reload. It then captures
 and reload-verifies the Reflection Probe. The individual Lightmap and Probe
