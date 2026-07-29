@@ -2725,7 +2725,7 @@ void NewPipelineClientRenderPath::BeginVolumetricLightmapBake()
         return;
     }
 
-    uint32_t dimensions[] = {};
+    uint32_t dimensions[3] = {};
     for (size_t axis = 0; axis < 3; ++axis)
     {
         dimensions[axis] = std::clamp<uint32_t>(
