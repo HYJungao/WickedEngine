@@ -165,6 +165,11 @@ void NewPipelineServerRenderPath::Update(float dt)
     InitializeSceneIfNeeded();
     MaintainWebRTC(dt);
     ApplyLatestControlPacket();
+
+    // Apply Scene::Update() before deriving the wire-visible light generation.
+    // This matches the Client lifecycle and prevents transform normalization
+    // from changing the identity after it has already been published.
+    wi::RenderPath3D::Update(dt);
     RefreshAuthoritativeShadowIdentity();
     visibilityResources.texture_primary_light_visibility =
         local_primary_light_visibility.IsValid()
@@ -173,7 +178,6 @@ void NewPipelineServerRenderPath::Update(float dt)
         authoritative_shadow_index < 16
         ? static_cast<int>(authoritative_shadow_index) : -1;
 
-    wi::RenderPath3D::Update(dt);
     LogDDGIStatusIfNeeded();
     PublishRemotePayload(dt);
 

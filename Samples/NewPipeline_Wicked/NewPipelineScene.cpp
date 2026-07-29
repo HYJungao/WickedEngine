@@ -531,19 +531,47 @@ uint32_t ComputeStableLightGeneration(
     if (light == nullptr)
         return 0;
 
-    // This generation is a content identity, not a process-local entity
-    // transition counter. Client and Server therefore derive the same value
-    // after reloads while every state change that can alter visibility produces
-    // a new descriptor generation.
+    // This generation is a cross-process content identity, not a process-local
+    // entity transition counter. Canonicalize floating-point state before
+    // hashing it: Scene::Update() can normalize the same authored direction
+    // through slightly different floating-point paths on Client and Server,
+    // while raw IEEE bit hashing would incorrectly turn that into a different
+    // shadow identity.
     SceneFingerprintBuilder builder;
-    builder.AddString("newpipeline.light-generation.v1");
+    builder.AddString("newpipeline.light-generation.v2");
     builder.AddU64(stable_light_id);
     builder.AddU32(static_cast<uint32_t>(light->GetType()));
     builder.AddBool(light->IsCastingShadow());
     builder.AddBool(light->IsInactive());
-    builder.AddFloat3(light->direction);
-    builder.AddFloat3(light->color);
-    builder.AddFloat(light->intensity);
+    const auto add_quantized = [&builder](float value, double scale) {
+        if (!std::isfinite(value))
+        {
+            builder.AddU32(0x80000000u);
+            return;
+        }
+        const double rounded = std::round(static_cast<double>(value) * scale);
+        const double bounded = std::clamp(
+            rounded,
+            static_cast<double>(std::numeric_limits<int32_t>::min()),
+            static_cast<double>(std::numeric_limits<int32_t>::max()));
+        builder.AddU32(static_cast<uint32_t>(
+            static_cast<int32_t>(bounded)));
+    };
+    XMFLOAT3 canonical_direction = light->direction;
+    const XMVECTOR direction = XMLoadFloat3(&canonical_direction);
+    if (XMVectorGetX(XMVector3LengthSq(direction)) > 0.000001f)
+    {
+        XMStoreFloat3(
+            &canonical_direction,
+            XMVector3Normalize(direction));
+    }
+    add_quantized(canonical_direction.x, 32767.0);
+    add_quantized(canonical_direction.y, 32767.0);
+    add_quantized(canonical_direction.z, 32767.0);
+    add_quantized(light->color.x, 4096.0);
+    add_quantized(light->color.y, 4096.0);
+    add_quantized(light->color.z, 4096.0);
+    add_quantized(light->intensity, 1024.0);
     const uint64_t hash = builder.GetHash();
     const uint32_t folded =
         static_cast<uint32_t>(hash) ^
