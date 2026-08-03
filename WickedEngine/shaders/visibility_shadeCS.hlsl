@@ -32,6 +32,7 @@ struct VisibilityPushConstants
 	int local_indirect_diffuse_uav;
 	int elastic_indirect_diffuse_uav;
 	int elastic_ao_uav;
+	int point_light_diagnostic;
 };
 PUSHCONSTANT(push, VisibilityPushConstants);
 
@@ -220,6 +221,347 @@ bool sample_client_volumetric_lightmap(
 		0,
 		SH::CalculateIrradiance(radiance, normal) / PI);
 	return all(isfinite(diffuse_gi));
+}
+
+half3 point_shadow_bias_compare(
+	in ShaderEntity light,
+	in float3 light_vector,
+	min16uint2 pixel,
+	half receiverNoL)
+{
+	const float3 uv_slice = cubemap_to_uv(-light_vector);
+	const float2 face_uv = uv_slice.xy;
+	const float2 face_resolution = max(
+		float2(1.0, 1.0),
+		light.shadowAtlasMulAdd.xy * GetFrame().shadow_atlas_resolution);
+	const float2 edge_distance_texels = min(face_uv, 1.0 - face_uv) * face_resolution;
+	const float nearest_edge_texels = min(
+		edge_distance_texels.x,
+		edge_distance_texels.y);
+	const half face_edge = 1.0 - saturate(nearest_edge_texels / 2.0);
+
+	// R is the exact production resolution/slope-aware receiver bias. G repeats
+	// the same lookup without any receiver bias.
+	// This helper is diagnostic-only; it does not alter shadow_cube().
+	const half3 biased_shadow = shadow_cube(
+		light,
+		light_vector,
+		pixel,
+		receiverNoL);
+	const float major_axis_distance = max(
+		max(abs(light_vector.x), abs(light_vector.y)),
+		abs(light_vector.z));
+	const float unbiased_depth =
+		light.GetCubemapDepthRemapNear() +
+		light.GetCubemapDepthRemapFar() / max(major_axis_distance, 1e-6);
+
+	float2 shadow_uv = face_uv;
+#ifdef SHADOW_SAMPLING_DISK
+	shadow_uv.x += uv_slice.z;
+	shadow_uv = mad(
+		shadow_uv,
+		light.shadowAtlasMulAdd.xy,
+		light.shadowAtlasMulAdd.zw);
+	const half3 unbiased_shadow = sample_shadow(
+		shadow_uv,
+		unbiased_depth,
+		shadow_border_clamp(light, uv_slice.z),
+		light.GetRadius(),
+		pixel);
+#else
+	shadow_border_shrink(light, shadow_uv);
+	shadow_uv.x += uv_slice.z;
+	shadow_uv = mad(
+		shadow_uv,
+		light.shadowAtlasMulAdd.xy,
+		light.shadowAtlasMulAdd.zw);
+	const half3 unbiased_shadow = sample_shadow(
+		shadow_uv,
+		unbiased_depth,
+		pixel);
+#endif
+
+	const half biased_visibility = dot(
+		biased_shadow,
+		half3(1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0));
+	const half unbiased_visibility = dot(
+		unbiased_shadow,
+		half3(1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0));
+	return saturate(half3(
+		biased_visibility,
+		unbiased_visibility,
+		face_edge));
+}
+
+bool visible_instance_boundary(
+	uint2 pixel,
+	uint center_instance_index,
+	uint2 resolution)
+{
+	static const int2 offsets[4] = {
+		int2(-1, 0),
+		int2(1, 0),
+		int2(0, -1),
+		int2(0, 1),
+	};
+
+	[unroll]
+	for (uint i = 0; i < 4; ++i)
+	{
+		const int2 neighbor_pixel = int2(pixel) + offsets[i];
+		if (any(neighbor_pixel < 0) ||
+			any(neighbor_pixel >= int2(resolution)))
+		{
+			return true;
+		}
+
+		const uint neighbor_packed_id =
+			texture_primitiveID[uint2(neighbor_pixel)];
+		if (neighbor_packed_id == 0)
+			return true;
+
+		PrimitiveID neighbor_primitive;
+		neighbor_primitive.init();
+		neighbor_primitive.unpack(neighbor_packed_id);
+		if (neighbor_primitive.instanceIndex != center_instance_index)
+			return true;
+	}
+
+	return false;
+}
+
+half2 point_shadow_center_diagnostic(
+	in ShaderEntity light,
+	in float3 light_vector,
+	out half3 depth_relation)
+{
+	depth_relation = 0;
+	const float3 uv_slice = cubemap_to_uv(-light_vector);
+	float2 shadow_uv = uv_slice.xy;
+#ifdef SHADOW_SAMPLING_DISK
+	shadow_uv.x += uv_slice.z;
+	shadow_uv = mad(
+		shadow_uv,
+		light.shadowAtlasMulAdd.xy,
+		light.shadowAtlasMulAdd.zw);
+	shadow_uv = clamp(
+		shadow_uv,
+		shadow_border_clamp(light, uv_slice.z).xy,
+		shadow_border_clamp(light, uv_slice.z).zw);
+#else
+	shadow_border_shrink(light, shadow_uv);
+	shadow_uv.x += uv_slice.z;
+	shadow_uv = mad(
+		shadow_uv,
+		light.shadowAtlasMulAdd.xy,
+		light.shadowAtlasMulAdd.zw);
+#endif
+
+	Texture2D<half4> texture_shadowatlas =
+		bindless_textures_half4[
+			descriptor_index(GetFrame().texture_shadowatlas_index)];
+	Texture2D<half4> texture_shadowatlas_transparent =
+		bindless_textures_half4[
+			descriptor_index(GetFrame().texture_shadowatlas_transparent_index)];
+	const half opaque_depth = texture_shadowatlas.SampleLevel(
+		sampler_point_clamp, shadow_uv, 0).r;
+	const half transparent_depth = texture_shadowatlas_transparent.SampleLevel(
+		sampler_point_clamp, shadow_uv, 0).a;
+
+	// Wicked uses reversed depth and clears the opaque and transparent shadow
+	// depths to zero. Any positive value therefore proves that a caster wrote
+	// the selected point-light face at this direction.
+	const half caster_coverage =
+		max(opaque_depth, transparent_depth) > 0 ? 1 : 0;
+
+	const float major_axis_distance = max(
+		max(abs(light_vector.x), abs(light_vector.y)),
+		abs(light_vector.z));
+	const float unbiased_depth =
+		light.GetCubemapDepthRemapNear() +
+		light.GetCubemapDepthRemapFar() /
+			max(major_axis_distance, 1e-6);
+
+	// Evaluate the exact center texel without the comparison sampler. Wicked's
+	// shadow maps use reversed depth, so a receiver is visible when its compare
+	// depth is greater than or equal to the stored opaque depth. This deliberately
+	// avoids both the 16-tap Vogel disk and the sampler's bilinear comparison.
+	half3 center_visibility =
+		unbiased_depth >= opaque_depth ? half3(1, 1, 1) : half3(0, 0, 0);
+	const half4 transparent_shadow =
+		texture_shadowatlas_transparent.SampleLevel(
+			sampler_point_clamp, shadow_uv, 0);
+	if (transparent_shadow.a >= unbiased_depth)
+	{
+		center_visibility *= transparent_shadow.rgb;
+	}
+	const half center_hard_visibility = dot(
+		center_visibility,
+		half3(1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0));
+
+	const float stored_depth = max(
+		(float)opaque_depth,
+		(float)transparent_depth);
+	if (stored_depth <= 0)
+	{
+		// No depth was written in this direction.
+		depth_relation = half3(0, 0, 1);
+	}
+	else
+	{
+		const float remap_near = light.GetCubemapDepthRemapNear();
+		const float remap_far = light.GetCubemapDepthRemapFar();
+		const float stored_distance =
+			remap_far / (stored_depth - remap_near);
+		const float relative_distance_delta =
+			(stored_distance - major_axis_distance) /
+			max(major_axis_distance, 1e-6);
+		const float2 face_resolution_xy = max(
+			float2(1.0, 1.0),
+			light.shadowAtlasMulAdd.xy *
+				GetFrame().shadow_atlas_resolution);
+		const float face_resolution = min(
+			face_resolution_xy.x,
+			face_resolution_xy.y);
+
+		// One cubemap texel spans approximately 2 / resolution projected units.
+		// Treat that footprint as equal-depth so D16 quantization and the existing
+		// caster raster bias cannot turn the same surface into a false "farther"
+		// classification.
+		const float same_surface_tolerance = max(
+			2.0 / face_resolution,
+			0.001);
+		if (relative_distance_delta < -same_surface_tolerance)
+		{
+			depth_relation = half3(1, 0, 0);
+		}
+		else if (relative_distance_delta > same_surface_tolerance)
+		{
+			depth_relation = half3(0, 0, 1);
+		}
+		else
+		{
+			depth_relation = half3(0, 1, 0);
+		}
+	}
+
+	return half2(caster_coverage, center_hard_visibility);
+}
+
+bool dominant_point_light_diagnostic(
+	in Surface surface,
+	in uint instance_index,
+	uint flat_tile_index,
+	ShaderCamera camera,
+	out half3 shadowed_direct,
+	out half3 bias_compare,
+	out half3 coverage_compare,
+	out half3 filter_compare,
+	out half3 depth_relation)
+{
+	shadowed_direct = 0;
+	bias_compare = 0;
+	coverage_compare = 0;
+	filter_compare = 0;
+	depth_relation = 0;
+	if (camera.buffer_entitytiles_index < 0 || pointlights().empty())
+		return false;
+
+	float best_unshadowed_luminance = 0;
+	bool found = false;
+	ShaderEntityIterator iterator = pointlights();
+	for (uint bucket = iterator.first_bucket(); bucket <= iterator.last_bucket(); ++bucket)
+	{
+		uint bucket_bits = load_entitytile(camera, flat_tile_index + bucket);
+		bucket_bits = iterator.mask_entity(bucket, bucket_bits);
+		bucket_bits = WaveReadLaneFirst(WaveActiveBitOr(bucket_bits));
+
+		[loop]
+		while (bucket_bits != 0)
+		{
+			const uint bucket_bit_index = firstbitlow(bucket_bits);
+			bucket_bits ^= 1u << bucket_bit_index;
+			const uint entity_index = bucket * 32 + bucket_bit_index;
+			ShaderEntity light = load_entity(entity_index);
+
+			if ((light.layerMask & surface.layerMask) == 0)
+				continue;
+
+			// Reuse the production point-light path twice. This keeps the
+			// diagnostic aligned with line/radius lights, light masks,
+			// transparent shadows and the exact material BRDF.
+			Surface unshadowed_surface = surface;
+			unshadowed_surface.SetReceiveShadow(false);
+			Lighting unshadowed_lighting;
+			unshadowed_lighting.create(0, 0, 0, 0);
+			light_point(light, unshadowed_surface, unshadowed_lighting);
+			const half3 unshadowed_direct =
+				(1 - surface.refraction.a) * surface.albedo *
+					unshadowed_lighting.direct.diffuse / PI +
+				unshadowed_lighting.direct.specular;
+			const float unshadowed_luminance =
+				dot(max(0, unshadowed_direct), float3(0.2126, 0.7152, 0.0722));
+			if (unshadowed_luminance <= best_unshadowed_luminance)
+				continue;
+
+			Lighting shadowed_lighting;
+			shadowed_lighting.create(0, 0, 0, 0);
+			light_point(light, surface, shadowed_lighting);
+			const half3 resolved_direct =
+				(1 - surface.refraction.a) * surface.albedo *
+					shadowed_lighting.direct.diffuse / PI +
+				shadowed_lighting.direct.specular;
+
+			best_unshadowed_luminance = unshadowed_luminance;
+			shadowed_direct = resolved_direct;
+			if (light.IsCastingShadow() && surface.IsReceiveShadow())
+			{
+				const float3 light_vector = light.position - surface.P;
+				const half receiverNoL = abs(dot(
+					surface.facenormal,
+					normalize(light_vector)));
+				bias_compare = point_shadow_bias_compare(
+					light,
+					light_vector,
+					surface.pixel,
+					receiverNoL);
+				const bool instance_boundary = visible_instance_boundary(
+					surface.pixel,
+					instance_index,
+					uint2(camera.internal_resolution));
+				half3 center_depth_relation = 0;
+				const half2 center_diagnostic =
+					point_shadow_center_diagnostic(
+						light,
+						light_vector,
+						center_depth_relation);
+				coverage_compare = half3(
+					instance_boundary ? 1 : 0,
+					center_diagnostic.x,
+					bias_compare.g);
+				filter_compare = half3(
+					center_diagnostic.y,
+					center_diagnostic.x,
+					bias_compare.g);
+				depth_relation = center_depth_relation;
+			}
+			else
+			{
+				bias_compare = half3(1, 1, 0);
+				coverage_compare = half3(
+					visible_instance_boundary(
+						surface.pixel,
+						instance_index,
+						uint2(camera.internal_resolution)) ? 1 : 0,
+					0,
+					1);
+				filter_compare = half3(1, 0, 1);
+				depth_relation = half3(0, 0, 1);
+			}
+			found = true;
+		}
+	}
+	return found;
 }
 
 [numthreads(VISIBILITY_BLOCKSIZE * VISIBILITY_BLOCKSIZE, 1, 1)]
@@ -488,8 +830,54 @@ void main(uint Gid : SV_GroupID, uint groupIndex : SV_GroupIndex)
 	{
 		RWTexture2D<float4> output_specular_indirect =
 			bindless_rwtextures[descriptor_index(push.specular_indirect_uav)];
-		output_specular_indirect[pixel] =
-			float4(max(0, local_specular_indirect_pre_ao * surface.occlusion), 1);
+		if (push.point_light_diagnostic != 0)
+		{
+			half3 point_direct = 0;
+			half3 point_bias_compare = 0;
+			half3 point_coverage_compare = 0;
+			half3 point_filter_compare = 0;
+			half3 point_depth_relation = 0;
+			const bool point_valid = dominant_point_light_diagnostic(
+				surface,
+				prim.instanceIndex,
+				entity_flat_tile_index,
+				camera,
+				point_direct,
+				point_bias_compare,
+				point_coverage_compare,
+				point_filter_compare,
+				point_depth_relation);
+			if (push.point_light_diagnostic == 1)
+			{
+				output_specular_indirect[pixel] =
+					float4(point_valid ? max(0, point_direct) : 0, 1);
+			}
+			else if (push.point_light_diagnostic == 2)
+			{
+				output_specular_indirect[pixel] =
+					float4(point_valid ? point_bias_compare : 0, 1);
+			}
+			else if (push.point_light_diagnostic == 3)
+			{
+				output_specular_indirect[pixel] =
+					float4(point_valid ? point_coverage_compare : 0, 1);
+			}
+			else if (push.point_light_diagnostic == 4)
+			{
+				output_specular_indirect[pixel] =
+					float4(point_valid ? point_filter_compare : 0, 1);
+			}
+			else
+			{
+				output_specular_indirect[pixel] =
+					float4(point_valid ? point_depth_relation : 0, 1);
+			}
+		}
+		else
+		{
+			output_specular_indirect[pixel] =
+				float4(max(0, local_specular_indirect_pre_ao * surface.occlusion), 1);
+		}
 	}
 
 	half4 color = 0;

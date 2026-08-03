@@ -368,6 +368,7 @@ union ObjectRenderingVariant
 		uint32_t alphatest : 1;		// bool
 		uint32_t sample_count : 4;	// 1, 2, 4, 8
 		uint32_t mesh_shader : 1;	// bool
+		uint32_t point_shadow : 1;	// bool
 	} bits;
 	uint32_t value;
 };
@@ -2161,6 +2162,30 @@ void LoadShaders()
 										wi::eventhandler::Subscribe_Once(wi::eventhandler::EVENT_THREAD_SAFE_POINT, [=](uint64_t userdata) {
 											*GetObjectPSO(variant) = pso;
 											});
+
+										// Point-light cube shadows use bounded receiver-side bias in
+										// shadow_cube_compare_depth(). Do not also apply the shared
+										// unbounded raster slope bias: on folded or thin geometry it
+										// pushes adjacent caster triangles apart in depth and creates
+										// visible holes. Keep a distinct PSO so directional and spot
+										// shadows retain their existing caster-side bias.
+										PipelineStateDesc point_desc = desc;
+										point_desc.rs = &rasterizers[
+											cullMode == (int)CullMode::NONE ?
+											RSTYPE_SHADOW_POINT_DOUBLESIDED :
+											RSTYPE_SHADOW_POINT];
+										PipelineState point_pso;
+										device->CreatePipelineState(
+											&point_desc,
+											&point_pso,
+											&renderpass_info);
+										ObjectRenderingVariant point_variant = variant;
+										point_variant.bits.point_shadow = 1;
+										wi::eventhandler::Subscribe_Once(
+											wi::eventhandler::EVENT_THREAD_SAFE_POINT,
+											[=](uint64_t userdata) {
+												*GetObjectPSO(point_variant) = point_pso;
+											});
 									}
 									break;
 
@@ -2297,6 +2322,18 @@ void SetUpStates()
 	rasterizers[RSTYPE_SHADOW] = rs;
 	rs.cull_mode = CullMode::NONE;
 	rasterizers[RSTYPE_SHADOW_DOUBLESIDED] = rs;
+
+	// Point-light cube shadows use the resolution-scaled, bounded receiver bias
+	// in shadow_cube_compare_depth(). Matching Unreal's one-pass point-shadow
+	// organization, their depth pass stores unbiased caster depth instead of
+	// stacking the shared unbounded raster slope bias on top of receiver bias.
+	rs.cull_mode = CullMode::BACK;
+	rs.depth_bias = 0;
+	rs.slope_scaled_depth_bias = 0;
+	rs.depth_bias_clamp = 0;
+	rasterizers[RSTYPE_SHADOW_POINT] = rs;
+	rs.cull_mode = CullMode::NONE;
+	rasterizers[RSTYPE_SHADOW_POINT_DOUBLESIDED] = rs;
 
 	rs.fill_mode = FillMode::WIREFRAME;
 	rs.cull_mode = CullMode::BACK;
@@ -3128,7 +3165,8 @@ void RenderMeshes(
 	uint32_t filterMask,
 	CommandList cmd,
 	uint32_t flags = 0,
-	uint32_t camera_count = 1
+	uint32_t camera_count = 1,
+	bool point_shadow = false
 )
 {
 	if (renderQueue.empty())
@@ -3308,6 +3346,7 @@ void RenderMeshes(
 					variant.bits.alphatest = material.IsAlphaTestEnabled() || forceAlphaTestForDithering;
 					variant.bits.sample_count = renderpass_info.sample_count;
 					variant.bits.mesh_shader = meshShaderRequested;
+					variant.bits.point_shadow = shadowRendering && point_shadow;
 
 					pso = GetObjectPSO(variant);
 
@@ -7302,7 +7341,7 @@ void DrawShadowmaps(
 				);
 			}
 
-			if (!renderQueue.empty() || renderQueue_transparent.empty())
+			if (!renderQueue.empty() || !renderQueue_transparent.empty())
 			{
 				device->BindDynamicConstantBuffer(cb, CBSLOT_RENDERER_CAMERA, cmd);
 				device->BindViewports(arraysize(vp), vp, cmd);
@@ -7310,8 +7349,8 @@ void DrawShadowmaps(
 
 				renderQueue.sort_opaque();
 				renderQueue_transparent.sort_transparent();
-				RenderMeshes(vis, renderQueue, RENDERPASS_SHADOW, FILTER_OPAQUE, cmd, 0, camera_count);
-				RenderMeshes(vis, renderQueue_transparent, RENDERPASS_SHADOW, FILTER_TRANSPARENT | FILTER_WATER, cmd, 0, camera_count);
+				RenderMeshes(vis, renderQueue, RENDERPASS_SHADOW, FILTER_OPAQUE, cmd, 0, camera_count, true);
+				RenderMeshes(vis, renderQueue_transparent, RENDERPASS_SHADOW, FILTER_TRANSPARENT | FILTER_WATER, cmd, 0, camera_count, true);
 			}
 
 			if (!vis.visibleHairs.empty())
@@ -12371,8 +12410,9 @@ void Visibility_Shade(
 		int32_t local_indirect_diffuse_uav;
 		int32_t elastic_indirect_diffuse_uav;
 		int32_t elastic_ao_uav;
+		int32_t point_light_diagnostic;
 	};
-	static_assert(sizeof(VisibilityShadePushConstants) == 32);
+	static_assert(sizeof(VisibilityShadePushConstants) == 36);
 	VisibilityShadePushConstants push = {};
 	push.specular_indirect_uav = specular_indirect_uav;
 	push.specular_indirect_pre_ao_uav = specular_indirect_pre_ao_uav;
@@ -12381,6 +12421,7 @@ void Visibility_Shade(
 	push.local_indirect_diffuse_uav = local_indirect_diffuse_uav;
 	push.elastic_indirect_diffuse_uav = elastic_indirect_diffuse_uav;
 	push.elastic_ao_uav = elastic_ao_uav;
+	push.point_light_diagnostic = res.point_light_diagnostic;
 
 	if (res.buffer_client_vlm_instances != nullptr &&
 		res.buffer_client_vlm_instances_upload != nullptr &&

@@ -240,7 +240,14 @@ inline void light_point(in ShaderEntity light, in Surface surface, inout Lightin
 		if ((GetFrame().options & OPTION_BIT_RAYTRACED_SHADOWS) == 0 || GetCamera().texture_rtshadow_index < 0 || (GetCamera().options & SHADERCAMERA_OPTION_USE_SHADOW_MASK) == 0)
 #endif // SHADOW_MASK_ENABLED
 		{
-			light_color *= shadow_cube(light, LunnormalizedShadow, surface.pixel);
+			const half receiverNoL = abs(dot(
+				surface.facenormal,
+				normalize(LunnormalizedShadow)));
+			light_color *= shadow_cube(
+				light,
+				LunnormalizedShadow,
+				surface.pixel,
+				receiverNoL);
 		}
 		
 		if (!any(light_color))

@@ -6,6 +6,49 @@
 //#define SHADOW_SAMPLING_DITHERING		// enables dithering and temporal dithering for sampling, with this, shadows can use lower sample count but noise might be visible
 //#define SHADOW_SAMPLING_PCSS			// enables penumbra computation based on blocker search (percentage closer soft shadows)
 
+// Point-light receiver bias is expressed in cubemap-face texels. The shadow
+// raster pass already applies caster-side constant and slope depth bias, so the
+// receiver adjustment is deliberately sub-texel and bounded. This avoids the
+// old fixed 0.989 distance scale, whose world-space offset grew with distance
+// and covered multiple texels as shadow resolution increased.
+inline float shadow_cube_compare_depth(
+	in ShaderEntity light,
+	in float3 Lunnormalized,
+	in half receiverNoL)
+{
+	const float major_axis_distance = max(
+		max(abs(Lunnormalized.x), abs(Lunnormalized.y)),
+		abs(Lunnormalized.z));
+	const float2 face_resolution_xy = max(
+		float2(1.0, 1.0),
+		light.shadowAtlasMulAdd.xy * GetFrame().shadow_atlas_resolution);
+	const float face_resolution = min(
+		face_resolution_xy.x,
+		face_resolution_xy.y);
+
+	// Match the standard constant + receiver-slope structure used by mature
+	// shadow implementations. facenormal is supplied by the lighting path, so
+	// normal maps cannot destabilize the bias.
+	const float constant_bias_texels = 0.25;
+	const float slope_bias_texels = 0.25 * (1.0 - saturate(abs(receiverNoL)));
+	const float bias_texels = min(
+		constant_bias_texels + slope_bias_texels,
+		0.5);
+
+	// A 90-degree cubemap face spans two projected units. Clamp the relative
+	// receiver offset as well, so very low-resolution shadows cannot turn the
+	// sub-texel rule into large world-space peter-panning or light leaks.
+	const float relative_bias = min(
+		2.0 * bias_texels / face_resolution,
+		0.005);
+	const float biased_distance = max(
+		major_axis_distance * (1.0 - relative_bias),
+		1e-6);
+
+	return light.GetCubemapDepthRemapNear() +
+		light.GetCubemapDepthRemapFar() / biased_distance;
+}
+
 #ifdef SHADOW_SAMPLING_DISK
 
 // "Vogel disk" sampling pattern based on: https://github.com/corporateshark/poisson-disk-generator/blob/master/PoissonGenerator.h
@@ -242,9 +285,16 @@ inline half3 shadow_2D(in ShaderEntity light, in float z, in float2 shadow_uv, i
 	return sample_shadow(shadow_uv, z, shadow_border_clamp(light, cascade), light.GetType() == ENTITY_TYPE_RECTLIGHT ? (half2(light.GetRadius(), light.GetLength()) * 0.025) : light.GetRadius(), pixel);
 }
 
-inline half3 shadow_cube(in ShaderEntity light, in float3 Lunnormalized, min16uint2 pixel = 0)
+inline half3 shadow_cube(
+	in ShaderEntity light,
+	in float3 Lunnormalized,
+	min16uint2 pixel = 0,
+	half receiverNoL = 1)
 {
-	const float remapped_distance = light.GetCubemapDepthRemapNear() + light.GetCubemapDepthRemapFar() / (max(max(abs(Lunnormalized.x), abs(Lunnormalized.y)), abs(Lunnormalized.z)) * 0.989); // little bias to avoid artifact
+	const float remapped_distance = shadow_cube_compare_depth(
+		light,
+		Lunnormalized,
+		receiverNoL);
 	const float3 uv_slice = cubemap_to_uv(-Lunnormalized);
 	float2 shadow_uv = uv_slice.xy;
 	shadow_uv.x += uv_slice.z;
@@ -304,9 +354,16 @@ inline half3 shadow_2D(in ShaderEntity light, in float z, in float2 shadow_uv, i
 	return sample_shadow(shadow_uv, z, pixel);
 }
 
-inline half3 shadow_cube(in ShaderEntity light, in float3 Lunnormalized, in min16uint2 pixel = 0)
+inline half3 shadow_cube(
+	in ShaderEntity light,
+	in float3 Lunnormalized,
+	in min16uint2 pixel = 0,
+	in half receiverNoL = 1)
 {
-	const float remapped_distance = light.GetCubemapDepthRemapNear() + light.GetCubemapDepthRemapFar() / (max(max(abs(Lunnormalized.x), abs(Lunnormalized.y)), abs(Lunnormalized.z)) * 0.989); // little bias to avoid artifact
+	const float remapped_distance = shadow_cube_compare_depth(
+		light,
+		Lunnormalized,
+		receiverNoL);
 	const float3 uv_slice = cubemap_to_uv(-Lunnormalized);
 	float2 shadow_uv = uv_slice.xy;
 	shadow_border_shrink(light, shadow_uv);

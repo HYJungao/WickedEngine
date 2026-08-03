@@ -63,6 +63,11 @@ void NewPipelineClientApp::CreateDebugUI()
     preview_buffer_combo.AddItem("Local Specular Formal (Pre-AO)", static_cast<uint64_t>(DebugPreviewMode::LocalSpecularIndirectPreAO));
     preview_buffer_combo.AddItem("Local Probe Cubemap", static_cast<uint64_t>(DebugPreviewMode::LocalReflectionProbe));
     preview_buffer_combo.AddItem("Local Primary Visibility", static_cast<uint64_t>(DebugPreviewMode::LocalShadowVisibility));
+    preview_buffer_combo.AddItem("Dominant Point Direct", static_cast<uint64_t>(DebugPreviewMode::LocalDominantPointDirect));
+    preview_buffer_combo.AddItem("Dominant Point Bias Compare (R=current G=unbiased B=face-edge)", static_cast<uint64_t>(DebugPreviewMode::LocalDominantPointBiasCompare));
+    preview_buffer_combo.AddItem("Dominant Point Coverage (R=instance-edge G=caster B=unbiased-visible)", static_cast<uint64_t>(DebugPreviewMode::LocalDominantPointCoverage));
+    preview_buffer_combo.AddItem("Dominant Point Filter Compare (R=center-hard G=caster B=PCF)", static_cast<uint64_t>(DebugPreviewMode::LocalDominantPointFilterCompare));
+    preview_buffer_combo.AddItem("Dominant Point Depth Relation (R=nearer G=same B=farther/missing)", static_cast<uint64_t>(DebugPreviewMode::LocalDominantPointDepthRelation));
     preview_buffer_combo.AddItem("Remote Indirect Diffuse", static_cast<uint64_t>(DebugPreviewMode::RemoteIndirectDiffuse));
     preview_buffer_combo.AddItem("Remote AO", static_cast<uint64_t>(DebugPreviewMode::RemoteAO));
     preview_buffer_combo.AddItem("Remote Specular Indirect", static_cast<uint64_t>(DebugPreviewMode::RemoteSpecularIndirect));
