@@ -12410,9 +12410,8 @@ void Visibility_Shade(
 		int32_t local_indirect_diffuse_uav;
 		int32_t elastic_indirect_diffuse_uav;
 		int32_t elastic_ao_uav;
-		int32_t point_light_diagnostic;
 	};
-	static_assert(sizeof(VisibilityShadePushConstants) == 36);
+	static_assert(sizeof(VisibilityShadePushConstants) == 32);
 	VisibilityShadePushConstants push = {};
 	push.specular_indirect_uav = specular_indirect_uav;
 	push.specular_indirect_pre_ao_uav = specular_indirect_pre_ao_uav;
@@ -12421,7 +12420,6 @@ void Visibility_Shade(
 	push.local_indirect_diffuse_uav = local_indirect_diffuse_uav;
 	push.elastic_indirect_diffuse_uav = elastic_indirect_diffuse_uav;
 	push.elastic_ao_uav = elastic_ao_uav;
-	push.point_light_diagnostic = res.point_light_diagnostic;
 
 	if (res.buffer_client_vlm_instances != nullptr &&
 		res.buffer_client_vlm_instances_upload != nullptr &&

@@ -786,14 +786,7 @@ void NewPipelineClientRenderPath::AdvanceSceneGeneration(
 void NewPipelineClientRenderPath::EnsureSpecularIndirectDebugTexture()
 {
     visibilityResources.texture_specular_indirect = nullptr;
-    visibilityResources.point_light_diagnostic =
-        debug_preview_mode == DebugPreviewMode::LocalDominantPointDirect ? 1 :
-        debug_preview_mode == DebugPreviewMode::LocalDominantPointBiasCompare ? 2 :
-        debug_preview_mode == DebugPreviewMode::LocalDominantPointCoverage ? 3 :
-        debug_preview_mode == DebugPreviewMode::LocalDominantPointFilterCompare ? 4 :
-        debug_preview_mode == DebugPreviewMode::LocalDominantPointDepthRelation ? 5 : 0;
-    if (debug_preview_mode != DebugPreviewMode::LocalSpecularIndirect &&
-        visibilityResources.point_light_diagnostic == 0)
+    if (debug_preview_mode != DebugPreviewMode::LocalSpecularIndirect)
     {
         local_specular_indirect = {};
         return;
@@ -4202,11 +4195,6 @@ const wi::graphics::Texture* NewPipelineClientRenderPath::GetDebugPreviewTexture
     case DebugPreviewMode::LocalAO:
         return local_ao_snapshot.IsValid() ? &local_ao_snapshot : nullptr;
     case DebugPreviewMode::LocalSpecularIndirect:
-    case DebugPreviewMode::LocalDominantPointDirect:
-    case DebugPreviewMode::LocalDominantPointBiasCompare:
-    case DebugPreviewMode::LocalDominantPointCoverage:
-    case DebugPreviewMode::LocalDominantPointFilterCompare:
-    case DebugPreviewMode::LocalDominantPointDepthRelation:
         return local_specular_indirect.IsValid() ? &local_specular_indirect : nullptr;
     case DebugPreviewMode::LocalSpecularIndirectPreAO:
         return local_specular_indirect_pre_ao.IsValid() ? &local_specular_indirect_pre_ao : nullptr;
@@ -4298,7 +4286,6 @@ void NewPipelineClientRenderPath::Compose(wi::graphics::CommandList cmd) const
             fx.color = XMFLOAT4(0.0f, 0.0f, 4.0f, 1.0f);
         else if (debug_preview_mode == DebugPreviewMode::LocalIndirectFinalInput ||
             debug_preview_mode == DebugPreviewMode::LocalSpecularIndirect ||
-            debug_preview_mode == DebugPreviewMode::LocalDominantPointDirect ||
             debug_preview_mode == DebugPreviewMode::LocalSpecularIndirectPreAO ||
             debug_preview_mode == DebugPreviewMode::LocalReflectionProbe ||
             debug_preview_mode == DebugPreviewMode::RemoteIndirectDiffuse ||

@@ -266,11 +266,6 @@ const char* ToString(DebugPreviewMode mode)
     case DebugPreviewMode::TransportShadowVisibility: return "transport_shadow_visibility";
     case DebugPreviewMode::LocalReflectionProbe: return "local_reflection_probe";
     case DebugPreviewMode::LocalIndirectFinalInput: return "local_indirect_final_input";
-    case DebugPreviewMode::LocalDominantPointDirect: return "local_dominant_point_direct";
-    case DebugPreviewMode::LocalDominantPointBiasCompare: return "local_dominant_point_bias_compare";
-    case DebugPreviewMode::LocalDominantPointCoverage: return "local_dominant_point_coverage";
-    case DebugPreviewMode::LocalDominantPointFilterCompare: return "local_dominant_point_filter_compare";
-    case DebugPreviewMode::LocalDominantPointDepthRelation: return "local_dominant_point_depth_relation";
     default: return "unknown";
     }
 }

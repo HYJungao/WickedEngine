@@ -454,10 +454,6 @@ namespace wi::renderer
 		const wi::graphics::GPUBuffer* buffer_client_vlm_instances_upload = nullptr;
 		const wi::graphics::Texture* texture_local_indirect_diffuse = nullptr; // optional local Final GI input before remote blending (RGB includes PI)
 		const wi::graphics::Texture* texture_specular_indirect = nullptr; // optional final indirect-specular contribution for debugging
-		// Temporary NewPipeline Client diagnostic written through
-		// texture_specular_indirect: 0=specular, 1=dominant point direct,
-		// 2=dominant point shadow visibility.
-		int point_light_diagnostic = 0;
 		const wi::graphics::Texture* texture_specular_indirect_pre_ao = nullptr; // optional formal indirect specular before surface occlusion
 		const wi::graphics::Texture* texture_primary_light_visibility = nullptr; // optional scalar visibility for primary_light_shadow_index
 		int primary_light_shadow_index = -1; // per-frame Scene::lights index resolved from persistent identity
@@ -501,7 +497,6 @@ namespace wi::renderer
 			texture_normal_roughness = {};
 			texture_local_indirect_diffuse = nullptr;
 			texture_specular_indirect = nullptr;
-			point_light_diagnostic = 0;
 			texture_specular_indirect_pre_ao = nullptr;
 			texture_primary_light_visibility = nullptr;
 			primary_light_shadow_index = -1;

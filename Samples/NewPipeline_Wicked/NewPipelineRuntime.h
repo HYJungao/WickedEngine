@@ -118,11 +118,6 @@ enum class DebugPreviewMode : uint8_t
     TransportShadowVisibility,
     LocalReflectionProbe,
     LocalIndirectFinalInput,
-    LocalDominantPointDirect,
-    LocalDominantPointBiasCompare,
-    LocalDominantPointCoverage,
-    LocalDominantPointFilterCompare,
-    LocalDominantPointDepthRelation,
 };
 
 struct RemoteFrameMetadata
