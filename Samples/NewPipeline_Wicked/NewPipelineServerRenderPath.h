@@ -83,7 +83,7 @@ private:
         uint32_t uv_stride = 0;
         uint32_t u_offset = 0;
         uint32_t v_offset = 0;
-        uint64_t gpu_ready_frame = 0;
+        uint64_t gpu_submit_frame = 0;
         bool pending = false;
     };
     std::array<PackedReadbackSlot, kReadbackRingSize> packed_readback_ring;
@@ -148,6 +148,7 @@ private:
     std::atomic<uint64_t> publish_queue_drops{0};
     uint64_t remote_capture_count = 0;
     uint64_t remote_capture_drops = 0;
+    uint64_t remote_readback_latency_drops = 0;
     uint64_t gpu_readback_bytes = 0;
     float transport_telemetry_window_seconds = 0.0f;
     uint64_t transport_telemetry_previous_bytes = 0;

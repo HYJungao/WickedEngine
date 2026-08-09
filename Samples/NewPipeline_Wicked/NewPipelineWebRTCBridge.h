@@ -20,6 +20,12 @@ typedef enum NPWebRTCBridgeState
     NP_WEBRTC_FAILED = 4,
 } NPWebRTCBridgeState;
 
+typedef enum NPWebRTCEncoderPreference
+{
+    NP_WEBRTC_ENCODER_HARDWARE = 0,
+    NP_WEBRTC_ENCODER_SOFTWARE = 1,
+} NPWebRTCEncoderPreference;
+
 typedef struct NPWebRTCBridgeStats
 {
     uint32_t state;
@@ -38,6 +44,11 @@ typedef struct NPWebRTCBridgeStats
     uint32_t power_efficient_codec;
     char codec_name[64];
     char codec_implementation[64];
+    char requested_encoder_mode[32];
+    char active_encoder_mode[32];
+    char input_surface[32];
+    char codec_profile[64];
+    char fallback_reason[128];
     char status[256];
 } NPWebRTCBridgeStats;
 
@@ -45,7 +56,8 @@ NPWebRTCBridge* np_webrtc_bridge_create(
     int is_server,
     const char* signaling_url,
     const char* room_id,
-    int use_internet_ice);
+    int use_internet_ice,
+    int encoder_preference);
 void np_webrtc_bridge_destroy(NPWebRTCBridge* bridge);
 
 int np_webrtc_bridge_send_i420(

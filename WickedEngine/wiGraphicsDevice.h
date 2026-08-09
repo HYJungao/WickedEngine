@@ -126,6 +126,14 @@ namespace wi::graphics
 
 		// The CPU will wait until all submitted GPU work is finished execution
 		virtual void WaitForGPU() const = 0;
+		// Non-blocking completion query for work recorded during a submitted frame.
+		// Backends with an explicit frame fence override this; the conservative
+		// default preserves the buffered-resource safety interval.
+		virtual bool IsFrameComplete(uint64_t submitted_frame, QUEUE_TYPE queue = QUEUE_GRAPHICS) const
+		{
+			(void)queue;
+			return GetFrameCount() >= submitted_frame + GetBufferCount();
+		}
 
 		// The current PipelineState cache will be cleared. It is useful to clear this when reloading shaders, to avoid accumulating unused pipeline states
 		virtual void ClearPipelineStateCache() = 0;

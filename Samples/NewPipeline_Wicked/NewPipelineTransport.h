@@ -136,6 +136,11 @@ struct WebRTCTransportStats
     std::string codec_implementation = "unknown";
     bool power_efficient_codec = false;
     bool native_codec = false;
+    std::string requested_encoder_mode = "unknown";
+    std::string active_encoder_mode = "unknown";
+    std::string input_surface = "unknown";
+    std::string codec_profile = "unknown";
+    std::string fallback_reason = "none";
     std::string status;
 };
 

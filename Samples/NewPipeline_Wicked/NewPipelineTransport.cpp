@@ -1,4 +1,8 @@
 #include "NewPipelineTransport.h"
+#if defined(__APPLE__)
+extern "C" int np_validate_apple_video_codec_factories(
+    char* error, size_t error_capacity);
+#endif
 #include "NewPipelineWebRTCBridge.h"
 
 #include <algorithm>
@@ -747,6 +751,34 @@ bool DecodeRemoteVideoFrameLayout(
 
 bool ValidateRemoteTransportSelfTest(std::string* error)
 {
+    char program[] = "newpipeline";
+    char software_argument[] = "--remote_encoder=software";
+    char invalid_argument[] = "--remote_encoder=invalid";
+    char* default_arguments[] = {program};
+    char* software_arguments[] = {program, software_argument};
+    char* invalid_arguments[] = {program, invalid_argument};
+    const RuntimeConfig default_config = ParseRuntimeConfig(1, default_arguments);
+    const RuntimeConfig software_config = ParseRuntimeConfig(2, software_arguments);
+    const RuntimeConfig invalid_config = ParseRuntimeConfig(2, invalid_arguments);
+    if (default_config.remote_encoder != RemoteEncoderPreference::Hardware ||
+        software_config.remote_encoder != RemoteEncoderPreference::Software ||
+        invalid_config.remote_encoder != RemoteEncoderPreference::Hardware ||
+        invalid_config.parse_warnings.empty())
+    {
+        SetError(error, "remote encoder command-line selection self-test failed");
+        return false;
+    }
+#if defined(__APPLE__)
+    char apple_codec_error[256] = {};
+    if (np_validate_apple_video_codec_factories(
+            apple_codec_error, sizeof(apple_codec_error)) != 1)
+    {
+        SetError(error, apple_codec_error[0] != '\0'
+            ? apple_codec_error : "Apple codec factory self-test failed");
+        return false;
+    }
+#endif
+
     if (!ValidateFormalLightingBlendV3Reference(error) ||
         !ValidateRemoteFrameContractV3SelfTest(error) ||
         !ValidateRemoteProtocolNegotiationSelfTest(error))
@@ -1302,6 +1334,11 @@ struct WebRTCVideoTransport::Impl
         result.codec_name = native.codec_name;
         result.codec_implementation = native.codec_implementation;
         result.power_efficient_codec = native.power_efficient_codec != 0;
+        result.requested_encoder_mode = native.requested_encoder_mode;
+        result.active_encoder_mode = native.active_encoder_mode;
+        result.input_surface = native.input_surface;
+        result.codec_profile = native.codec_profile;
+        result.fallback_reason = native.fallback_reason;
         result.status = native.status;
         return result;
     }
@@ -1355,7 +1392,21 @@ struct WebRTCVideoTransport::Impl
     {
         uint64_t applied_revision = 0;
         uint32_t retry_attempt = 0;
+        bool force_software_fallback = false;
         auto next_retry = std::chrono::steady_clock::now();
+
+        const auto apply_encoder_request = [&](WebRTCTransportStats& stats,
+            bool role_server, const RuntimeConfig& config) {
+            if (!role_server)
+                return;
+            stats.requested_encoder_mode = ToString(config.remote_encoder);
+            if (config.remote_encoder == RemoteEncoderPreference::Hardware &&
+                force_software_fallback)
+            {
+                stats.active_encoder_mode = "fallback-software";
+                stats.fallback_reason = "hardware-runtime-failed";
+            }
+        };
 
         for (;;)
         {
@@ -1385,6 +1436,7 @@ struct WebRTCVideoTransport::Impl
                 DestroyBridge();
                 applied_revision = revision;
                 retry_attempt = 0;
+                force_software_fallback = false;
                 next_retry = std::chrono::steady_clock::now();
             }
 
@@ -1413,6 +1465,7 @@ struct WebRTCVideoTransport::Impl
                     std::lock_guard lock(bridge_mutex);
                     stats = ReadNativeStats(bridge);
                 }
+                apply_encoder_request(stats, role_server, config);
                 if (!role_server && stats.state == WebRTCTransportState::Connected &&
                     control_pending.load(std::memory_order_acquire))
                 {
@@ -1434,10 +1487,23 @@ struct WebRTCVideoTransport::Impl
                 if (stats.state != WebRTCTransportState::Failed)
                     continue;
 
+                const bool switch_to_software = role_server &&
+                    config.remote_encoder == RemoteEncoderPreference::Hardware &&
+                    !force_software_fallback &&
+                    stats.fallback_reason == "hardware-runtime-failed";
                 DestroyBridge();
-                const auto delay = RetryDelay(retry_attempt++, applied_revision);
+                if (switch_to_software)
+                {
+                    force_software_fallback = true;
+                    retry_attempt = 0;
+                }
+                const auto delay = switch_to_software
+                    ? std::chrono::milliseconds(0)
+                    : RetryDelay(retry_attempt++, applied_revision);
                 next_retry = std::chrono::steady_clock::now() + delay;
-                stats.status += "; retry in " + std::to_string(delay.count()) + " ms";
+                stats.status += switch_to_software
+                    ? "; restarting with software encoder"
+                    : "; retry in " + std::to_string(delay.count()) + " ms";
                 PublishStats(std::move(stats));
                 continue;
             }
@@ -1463,7 +1529,11 @@ struct WebRTCVideoTransport::Impl
                 role_server ? 1 : 0,
                 config.signaling_url.c_str(),
                 config.room_id.c_str(),
-                config.use_internet_ice ? 1 : 0);
+                config.use_internet_ice ? 1 : 0,
+                config.remote_encoder == RemoteEncoderPreference::Software ||
+                    force_software_fallback
+                    ? NP_WEBRTC_ENCODER_SOFTWARE
+                    : NP_WEBRTC_ENCODER_HARDWARE);
             lifecycle_last_duration_usec.store(NowUsec() - begin, std::memory_order_relaxed);
 
             bool discard_candidate = false;
@@ -1486,6 +1556,7 @@ struct WebRTCVideoTransport::Impl
             }
 
             WebRTCTransportStats stats = ReadNativeStats(candidate);
+            apply_encoder_request(stats, role_server, config);
             if (candidate == nullptr || stats.state == WebRTCTransportState::Failed)
             {
                 if (candidate != nullptr)

@@ -315,6 +315,7 @@ namespace wi::graphics
 		void SubmitCommandLists() override;
 
 		void WaitForGPU() const override;
+		bool IsFrameComplete(uint64_t submitted_frame, QUEUE_TYPE queue = QUEUE_GRAPHICS) const override;
 		void ClearPipelineStateCache() override;
 		size_t GetActivePipelineCount() const override { return 0; }
 

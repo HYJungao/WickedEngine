@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 
 namespace wicked_newpipeline
@@ -91,10 +92,15 @@ std::string NewPipelineServerRenderPath::GetDebugStatusSummary() const
         }
     }
     const std::string transport_status =
-        "\nWebRTC: " + std::string{ToString(transport.state)} + " " + transport.codec_name +
-            (transport.native_codec ? " native-surface" :
-                (transport.power_efficient_codec ? " power-efficient" : " software-surface")) +
+        "\nWebRTC: " + std::string{ToString(transport.state)} +
+            "\nEncoder: requested=" + transport.requested_encoder_mode +
+            " active=" + transport.active_encoder_mode +
+            " codec=" + transport.codec_name +
+            " profile=" + transport.codec_profile +
             " impl=" + transport.codec_implementation +
+            "\nSurface: " + transport.input_surface +
+            " power-efficient=" + (transport.power_efficient_codec ? "yes" : "no") +
+            " fallback=" + transport.fallback_reason +
             " encode-avg=" + std::to_string(
                 transport.frames_encoded > 0
                     ? transport.total_encode_time_usec /
@@ -104,6 +110,7 @@ std::string NewPipelineServerRenderPath::GetDebugStatusSummary() const
             " bitrate=" + std::to_string(transport_bitrate_bps / 1000u) + " kbps" +
             " captures=" + std::to_string(remote_capture_count) +
             " capture-drop=" + std::to_string(remote_capture_drops) +
+            " stale-readback-drop=" + std::to_string(remote_readback_latency_drops) +
             " queue-drop=" + std::to_string(publish_queue_drops.load(std::memory_order_relaxed)) +
             " readback=" + std::to_string(gpu_readback_bytes / 1024u) + " KiB" +
             " cpu-copy=" + std::to_string(
@@ -142,6 +149,8 @@ void NewPipelineServerRenderPath::Start()
     wi::backlog::post(std::string{"Server DDGI: "} + (settings.ddgi_enabled ? "enabled" : "disabled"));
     wi::backlog::post("Server DDGI ray count: " + std::to_string(settings.ddgi_ray_count));
     wi::backlog::post("Server remote publish FPS: " + std::to_string(settings.remote_publish_fps));
+    wi::backlog::post(std::string{"Server remote encoder requested: "} +
+        ToString(config.remote_encoder));
     wi::backlog::post(std::string{"Server DDGI formal debug preview: "} +
         (settings.ddgi_enabled && settings.ddgi_debug_formal ? "enabled" : "disabled"));
     status_logged = true;
@@ -628,10 +637,11 @@ void NewPipelineServerRenderPath::PublishRemotePayload(float dt)
     }
 
     const float publish_interval = 1.0f / std::max(0.001f, settings.remote_publish_fps);
-    publish_accumulator += dt;
+    publish_accumulator = std::min(
+        publish_accumulator + std::max(0.0f, dt), publish_interval * 2.0f);
     if (publish_accumulator < publish_interval)
         return;
-    publish_accumulator = 0.0f;
+    publish_accumulator = std::fmod(publish_accumulator, publish_interval);
     remote_capture_requested = true;
 }
 
@@ -667,12 +677,27 @@ void NewPipelineServerRenderPath::CapturePackedRemoteFrame(
         }
         return;
     }
-    PackedReadbackSlot& slot = packed_readback_ring[packed_readback_write_index];
-    if (slot.pending || (slot.readback && slot.readback.use_count() > 1))
+    PackedReadbackSlot* selected_slot = nullptr;
+    size_t selected_slot_index = packed_readback_write_index;
+    for (size_t offset = 0; offset < packed_readback_ring.size(); ++offset)
+    {
+        const size_t index =
+            (packed_readback_write_index + offset) % packed_readback_ring.size();
+        PackedReadbackSlot& candidate = packed_readback_ring[index];
+        if (!candidate.pending &&
+            (!candidate.readback || candidate.readback.use_count() == 1))
+        {
+            selected_slot = &candidate;
+            selected_slot_index = index;
+            break;
+        }
+    }
+    if (selected_slot == nullptr)
     {
         ++remote_capture_drops;
         return;
     }
+    PackedReadbackSlot& slot = *selected_slot;
 
     RemoteFrameSource contract;
     uint32_t available_mask = 0;
@@ -1092,10 +1117,9 @@ void NewPipelineServerRenderPath::CapturePackedRemoteFrame(
     slot.u_offset = u_offset;
     slot.v_offset = v_offset;
     slot.pending = true;
-    // Wicked waits for the fence associated with a buffered frame index before
-    // reusing that index.  At this frame count the copy recorded below is
-    // therefore complete without a render-thread WaitForGPU().
-    slot.gpu_ready_frame = device->GetFrameCount() + wi::graphics::GraphicsDevice::GetBufferCount();
+    // Record the frame whose graphics-queue fence will cover this copy. The
+    // consumer polls that fence and never waits on the render thread.
+    slot.gpu_submit_frame = device->GetFrameCount();
     remote_frame_id = metadata.frame_id;
     packed_layout_width = slot.layout.video_width;
     packed_layout_height = slot.layout.video_height;
@@ -1116,7 +1140,7 @@ void NewPipelineServerRenderPath::CapturePackedRemoteFrame(
     camera_cut_pending = false;
     ++remote_capture_count;
     gpu_readback_bytes += packed_size;
-    packed_readback_write_index = (packed_readback_write_index + 1u) % kReadbackRingSize;
+    packed_readback_write_index = (selected_slot_index + 1u) % kReadbackRingSize;
 }
 
 void NewPipelineServerRenderPath::ConsumeCompletedPackedReadback()
@@ -1134,14 +1158,28 @@ void NewPipelineServerRenderPath::ConsumeCompletedPackedReadback()
         }
         if (!candidate.pending || !candidate.readback ||
             candidate.readback->buffer.mapped_data == nullptr ||
-            device->GetFrameCount() < candidate.gpu_ready_frame)
+            !device->IsFrameComplete(
+                candidate.gpu_submit_frame, wi::graphics::QUEUE_GRAPHICS))
             continue;
         if (completed == nullptr ||
-            candidate.layout.metadata.frame_id < completed->layout.metadata.frame_id)
+            candidate.layout.metadata.frame_id > completed->layout.metadata.frame_id)
             completed = &candidate;
     }
     if (completed == nullptr)
         return;
+
+    for (PackedReadbackSlot& candidate : packed_readback_ring)
+    {
+        if (&candidate == completed || !candidate.pending || !candidate.readback ||
+            candidate.readback->buffer.mapped_data == nullptr ||
+            !device->IsFrameComplete(
+                candidate.gpu_submit_frame, wi::graphics::QUEUE_GRAPHICS))
+        {
+            continue;
+        }
+        candidate.pending = false;
+        ++remote_readback_latency_drops;
+    }
 
     PackedReadbackSlot& slot = *completed;
     const uint8_t* bytes = static_cast<const uint8_t*>(slot.readback->buffer.mapped_data);

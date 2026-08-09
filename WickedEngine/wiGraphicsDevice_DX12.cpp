@@ -5764,6 +5764,16 @@ std::mutex queue_locker;
 #endif // PLATFORM_WINDOWS_DESKTOP
 	}
 
+	bool GraphicsDevice_DX12::IsFrameComplete(uint64_t submitted_frame, QUEUE_TYPE queue) const
+	{
+		if (submitted_frame >= GetFrameCount() || queue >= QUEUE_COUNT)
+			return false;
+		const uint32_t buffer_index = static_cast<uint32_t>(submitted_frame % BUFFERCOUNT);
+		const uint64_t fence_value = submitted_frame / BUFFERCOUNT + 1u;
+		ID3D12Fence* fence = frame_fence[buffer_index][queue].Get();
+		return fence != nullptr && fence->GetCompletedValue() >= fence_value;
+	}
+
 	void GraphicsDevice_DX12::WaitForGPU() const
 	{
 		ComPtr<ID3D12Fence> fence;

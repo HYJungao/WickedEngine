@@ -15,7 +15,7 @@ void NewPipelineServerApp::CreateDebugUI()
     debug_window.Create("NewPipeline Server Debug",
         wi::gui::Window::WindowControls::MOVE | wi::gui::Window::WindowControls::COLLAPSE);
     debug_window.SetPos(XMFLOAT2(20.0f, 80.0f));
-    debug_window.SetSize(XMFLOAT2(360.0f, 185.0f));
+    debug_window.SetSize(XMFLOAT2(520.0f, 265.0f));
 
     preview_buffer_combo.Create("Preview Buffer: ");
     preview_buffer_combo.SetPos(XMFLOAT2(165.0f, 10.0f));
@@ -39,7 +39,7 @@ void NewPipelineServerApp::CreateDebugUI()
     algorithm_label.Create("Effective algorithms");
     algorithm_label.SetText(render_path.GetDebugStatusSummary());
     algorithm_label.SetPos(XMFLOAT2(10.0f, 48.0f));
-    algorithm_label.SetSize(XMFLOAT2(325.0f, 85.0f));
+    algorithm_label.SetSize(XMFLOAT2(490.0f, 185.0f));
     debug_window.AddWidget(&algorithm_label);
 
     render_path.GetGUI().AddWidget(&debug_window);

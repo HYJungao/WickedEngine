@@ -3370,6 +3370,15 @@ using namespace metal_internal;
 			event->waitUntilSignaledValue(1, ~0ull);
 		}
 	}
+	bool GraphicsDevice_Metal::IsFrameComplete(uint64_t submitted_frame, QUEUE_TYPE queue) const
+	{
+		if (submitted_frame >= GetFrameCount() || queue >= QUEUE_COUNT)
+			return false;
+		const uint32_t buffer_index = static_cast<uint32_t>(submitted_frame % BUFFERCOUNT);
+		const uint64_t fence_value = submitted_frame / BUFFERCOUNT + 1u;
+		MTL::SharedEvent* fence = frame_fence[buffer_index][queue].get();
+		return fence != nullptr && fence->signaledValue() >= fence_value;
+	}
 	void GraphicsDevice_Metal::ClearPipelineStateCache()
 	{
 		std::scoped_lock locker(allocationhandler->destroylocker);

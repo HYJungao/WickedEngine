@@ -348,12 +348,14 @@ std::string NewPipelineClientRenderPath::GetDebugStatusSummary() const
 {
     const WebRTCTransportStats transport = webrtc_transport.GetStats();
     const std::string transport_status =
-        "\nWebRTC: " + std::string{ToString(transport.state)} + " " + transport.codec_name +
-            (transport.native_codec ? " native-surface" :
-                (transport.power_efficient_codec ? " power-efficient" : " software-surface")) +
+        "\nWebRTC: " + std::string{ToString(transport.state)} +
+            "\nDecoder: codec=" + transport.codec_name +
+            " profile=" + transport.codec_profile +
+            " impl=" + transport.codec_implementation +
+            " power-efficient=" + (transport.power_efficient_codec ? "yes" : "no") +
+            " surface=" + transport.input_surface +
             " retained=" + std::to_string(transport.retained_frame_acquires) +
             " decode-q=" + std::to_string(transport.decoded_queue_depth) +
-            " impl=" + transport.codec_implementation +
             " decode-avg=" + std::to_string(
                 transport.frames_decoded > 0
                     ? transport.total_decode_time_usec /
@@ -1027,48 +1029,54 @@ void NewPipelineClientRenderPath::MaintainWebRTC(float dt)
 
 void NewPipelineClientRenderPath::PollRemoteFrameMetadata()
 {
-    RemoteVideoFrameLayout layout;
-    RemoteStreamStatus stream_status;
-    if (!webrtc_transport.TryReceiveFrameMetadata(layout, &stream_status))
+    for (size_t receive_count = 0; receive_count < kMaxPendingRemotePairs * 2u;
+        ++receive_count)
     {
-        if (stream_status.control_frame_id == 0)
-            return;
-        if (stream_status.control_frame_id <=
-            negotiated_stream_control_frame_id)
+        RemoteVideoFrameLayout layout;
+        RemoteStreamStatus stream_status;
+        if (!webrtc_transport.TryReceiveFrameMetadata(layout, &stream_status))
         {
-            ++downstream_stale_status_drops;
-            return;
+            if (stream_status.control_frame_id == 0)
+                break;
+            if (stream_status.control_frame_id <=
+                negotiated_stream_control_frame_id)
+            {
+                ++downstream_stale_status_drops;
+                continue;
+            }
+            negotiated_stream_control_frame_id = stream_status.control_frame_id;
+            negotiated_stream_selection = stream_status.selection;
+            negotiated_stream_selection_valid =
+                stream_status.code == RemoteStreamStatusCode::Selected;
+            if (!negotiated_stream_selection_valid)
+            {
+                const char* reason = "no common protocol";
+                if (stream_status.code ==
+                    RemoteStreamStatusCode::NoCommonEncodingProfile)
+                    reason = "no common encoding profile";
+                else if (stream_status.code ==
+                    RemoteStreamStatusCode::NoCommonQualityTier)
+                    reason = "no common quality tier";
+                InvalidateRemote(std::string{"remote negotiation rejected: "} + reason);
+            }
+            continue;
         }
-        negotiated_stream_control_frame_id = stream_status.control_frame_id;
-        negotiated_stream_selection = stream_status.selection;
-        negotiated_stream_selection_valid =
-            stream_status.code == RemoteStreamStatusCode::Selected;
-        if (!negotiated_stream_selection_valid)
+        for (auto iterator = downstream_metadata_cache.begin();
+            iterator != downstream_metadata_cache.end();)
         {
-            const char* reason = "no common protocol";
-            if (stream_status.code ==
-                RemoteStreamStatusCode::NoCommonEncodingProfile)
-                reason = "no common encoding profile";
-            else if (stream_status.code ==
-                RemoteStreamStatusCode::NoCommonQualityTier)
-                reason = "no common quality tier";
-            InvalidateRemote(std::string{"remote negotiation rejected: "} + reason);
+            if (iterator->metadata.frame_id == layout.metadata.frame_id &&
+                iterator->metadata.source_generation ==
+                    layout.metadata.source_generation)
+                iterator = downstream_metadata_cache.erase(iterator);
+            else
+                ++iterator;
         }
-        return;
-    }
-    for (auto iterator = downstream_metadata_cache.begin(); iterator != downstream_metadata_cache.end();)
-    {
-        if (iterator->metadata.frame_id == layout.metadata.frame_id &&
-            iterator->metadata.source_generation == layout.metadata.source_generation)
-            iterator = downstream_metadata_cache.erase(iterator);
-        else
-            ++iterator;
-    }
-    downstream_metadata_cache.push_back(std::move(layout));
-    while (downstream_metadata_cache.size() > kMaxPendingRemotePairs)
-    {
-        downstream_metadata_cache.pop_front();
-        ++downstream_pair_expirations;
+        downstream_metadata_cache.push_back(std::move(layout));
+        while (downstream_metadata_cache.size() > kMaxPendingRemotePairs)
+        {
+            downstream_metadata_cache.pop_front();
+            ++downstream_pair_expirations;
+        }
     }
 }
 
@@ -3998,19 +4006,30 @@ void NewPipelineClientRenderPath::AcquireRemoteVideoFrame(float dt)
     RetainedI420Frame retained_frame;
     RemoteVideoFrameLayout video_layout;
     std::string error;
+    std::string last_decode_error;
+    bool had_decode_error = false;
     bool received = false;
     bool queued_video_without_metadata = false;
-    RetainedI420Frame acquired_frame;
-    if (webrtc_transport.TryAcquireI420Frame(acquired_frame))
+    for (size_t receive_count = 0; receive_count < kMaxPendingRemotePairs;
+        ++receive_count)
     {
+        RetainedI420Frame acquired_frame;
+        if (!webrtc_transport.TryAcquireI420Frame(acquired_frame))
+            break;
         RemoteVideoFrameLayout pixel_layout;
         if (!DecodeRemoteVideoFrameLayout(
                 acquired_frame, pixel_layout, &error))
         {
-            InvalidateRemote(error.empty()
-                ? "video metadata-band decode failed" : error);
-            return;
+            had_decode_error = true;
+            last_decode_error = error.empty()
+                ? "video metadata-band decode failed" : error;
+            wi::backlog::post(
+                "Client dropped malformed decoded video frame: " +
+                last_decode_error);
+            error.clear();
+            continue;
         }
+        error.clear();
         auto duplicate = std::find_if(
             pending_remote_video_frames.begin(), pending_remote_video_frames.end(),
             [&pixel_layout](const PendingRemoteVideoFrame& pending) {
@@ -4058,14 +4077,11 @@ void NewPipelineClientRenderPath::AcquireRemoteVideoFrame(float dt)
             remote_consume.invalid_reason = "waiting for matching video frame";
         }
 
-        if (!error.empty())
+        if (had_decode_error && !remote_consume.accepted_valid &&
+            pending_remote_video_frames.empty() &&
+            downstream_metadata_cache.empty())
         {
-            if (remote_consume.invalid_reason != error)
-            {
-                wi::backlog::post(
-                    "Client WebRTC video-track acquire failed: " + error);
-            }
-            InvalidateRemote(error);
+            InvalidateRemote(last_decode_error);
         }
         else if (remote_consume.accepted_valid)
         {

@@ -5,6 +5,14 @@ the `np.remote.video` track; frame metadata is paired through the video metadata
 and `np.frame_meta` DataChannel. `np.control` remains client-to-server only.
 Remote Video V3 is the only production transport path.
 
+`np.control` currently uses reliable, ordered delivery. Control Wire V2 serializes an
+absolute camera/scene/lighting snapshot, and the sender may coalesce unsent snapshots.
+Changing snapshot delivery to a latest-only unordered/partially reliable path is a
+recorded latency direction, but it is explicitly deferred: future cloud-gaming protocol
+versions may also carry incremental commands that cannot be dropped or reordered. Any
+future change must first distinguish versioned snapshot and incremental-command
+semantics; the current V2 channel configuration is unchanged.
+
 This README is the source of truth for the current build, runtime and architecture.
 Only unfinished production work belongs in [`docs/ROADMAP.md`](docs/ROADMAP.md).
 The signaling relay has its own scoped [README](WebRTC/signaling/README.md).
@@ -26,7 +34,12 @@ WebRTC\signaling\start_signaling.cmd
 The default endpoint and room are `ws://127.0.0.1:39876` and
 `NewPipeline.Wicked.V1`. No Client or Server arguments are needed for the local
 real-WebRTC path. `--webrtc_signal`, `--webrtc_room`, `--webrtc_internet`,
-and `--remote_fps` override connection or publication-rate defaults. Protocol
+`--remote_fps`, and `--remote_encoder=hardware|software` override connection,
+publication-rate, or codec defaults. `hardware` is the default. On macOS it
+prefers VideoToolbox H.264; an unavailable or failed hardware encoder restarts
+the session once with libvpx VP8. `software` forces VP8 without probing hardware.
+Windows currently reports `hardware-backend-not-built` and uses the same VP8
+fallback until the external VS2022 WebRTC package/backend is available. Protocol
 selection is not a command-line switch: peers must negotiate V3. The production
 policy requests High; reduced tiers remain self-test-only until exposed through
 a persistent application setting and accepted by visual/bitrate soak.
@@ -246,7 +259,7 @@ the `[0,16]` range, then restored to `RGBA16F` by the Client. AO and Shadow use
 I420 Y only with neutral chroma. A deterministic compact atlas gives every rect
 four texels of true edge-dilated padding to isolate linear and 4:2:0 filtering.
 
-The live software-codec path first produces four canonical RGBA8 transport
+The live I420 input path first produces four canonical RGBA8 transport
 surfaces (Log2 HDR for indirect buffers, replicated scalar for AO/shadow). These
 same resources drive the Server `Transport` previews and are copied into their
 authoritative rectangles in one canonical RGBA8 atlas; there is no separate
@@ -267,7 +280,8 @@ inter-frame codec sees unchanged content. Descriptors carry each semantic's
 actual content frame, generation and confidence.
 
 The video luma band carries only the V3 frame identity and descriptor checksum
-needed to pair decoded pixels. The unordered, unreliable `np.frame_meta`
+needed to pair decoded pixels. The unordered, partially reliable `np.frame_meta`
+(`maxRetransmits=1`)
 DataChannel carries an explicit endian-safe V3 metadata record and descriptor
 contract. The Client retains video frames and metadata in separate bounded queues and accepts
 the newest pair whose pixel-band `frame_id` and `source_generation` match the
@@ -286,14 +300,16 @@ GPU profiler ranges separately expose joint downsample, I420 pack and I420 unpac
 Server Transport previews use only canonical semantic surfaces committed for the
 current transport generation; resize, reconnect, camera cut and negotiation
 boundaries invalidate stale preview availability.
-`power-efficient` and `native-surface` are separate modes: the bundled bridge still
-uses the software-I420 codec surface path until a custom Windows DX12 H.264/NV12
-encoder/decoder backend is integrated.
+`power-efficient` and `native-surface` are separate facts. The macOS VideoToolbox
+H.264 backend is hardware accelerated but still consumes the packed frame through
+the existing CPU-addressable I420/readback path. Native NV12/Metal or DX12 surfaces
+remain follow-up work; the panel therefore continues to report
+`surface=i420-readback` even when `active=hardware`.
 
 The Server panel and Client remote status report DDGI frame/convergence state.
 Scene-generation and significant authoritative-sun changes clear Server DDGI
 history and publish the reset reason in the video metadata. `--transport_selftest`
-runs V3 descriptor/status checks, High/Balanced atlas-area
+runs command-line encoder-selection checks, V3 descriptor/status checks, High/Balanced atlas-area
 checks, retained-content cadence, scalar I420 numeric tolerance, formal blend
 endpoints and pixel-band/DataChannel agreement without opening a window. See
 [`docs/ROADMAP.md`](docs/ROADMAP.md) for the remaining platform/runtime

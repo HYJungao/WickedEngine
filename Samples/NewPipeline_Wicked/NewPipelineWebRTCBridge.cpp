@@ -24,6 +24,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cctype>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -64,6 +65,10 @@
 #include "rtc_base/logging.h"
 #include "rtc_base/ssl_adapter.h"
 #include "rtc_base/thread.h"
+
+#if defined(__APPLE__)
+#include "NewPipelineWebRTCAppleCodecFactory.h"
+#endif
 
 namespace
 {
@@ -686,6 +691,7 @@ struct CodecTelemetry
     std::mutex text_mutex;
     std::string codec_name = "unknown";
     std::string implementation = "unknown";
+    std::string codec_profile = "unknown";
 };
 
 class CodecStatsCallback : public webrtc::RTCStatsCollectorCallback
@@ -733,6 +739,7 @@ public:
             power_efficient = power_efficient || stats->power_efficient_decoder.value_or(false);
         }
         std::string codec_name;
+        std::string codec_profile;
         if (!codec_id.empty())
         {
             for (const webrtc::RTCCodecStats* codec : report->GetStatsOfType<webrtc::RTCCodecStats>())
@@ -740,6 +747,7 @@ public:
                 if (codec->id() == codec_id && codec->mime_type)
                 {
                     codec_name = *codec->mime_type;
+                    codec_profile = codec->sdp_fmtp_line.value_or("unknown");
                     break;
                 }
             }
@@ -752,6 +760,8 @@ public:
                 telemetry_->codec_name = std::move(codec_name);
             if (!implementation.empty())
                 telemetry_->implementation = std::move(implementation);
+            if (!codec_profile.empty())
+                telemetry_->codec_profile = std::move(codec_profile);
         }
     }
 
@@ -762,10 +772,26 @@ private:
 class WebRTCSession final : public webrtc::PeerConnectionObserver
 {
 public:
-    WebRTCSession(bool server, std::string signaling_url, std::string room_id, bool use_internet_ice) :
+    WebRTCSession(bool server, std::string signaling_url, std::string room_id,
+        bool use_internet_ice, NPWebRTCEncoderPreference encoder_preference) :
         server_(server), signaling_url_(std::move(signaling_url)), room_id_(std::move(room_id)),
-        use_internet_ice_(use_internet_ice)
+        use_internet_ice_(use_internet_ice), encoder_preference_(encoder_preference)
     {
+        if (server_)
+        {
+            requested_encoder_mode_ = encoder_preference_ == NP_WEBRTC_ENCODER_SOFTWARE
+                ? "software" : "hardware";
+            active_encoder_mode_ = encoder_preference_ == NP_WEBRTC_ENCODER_SOFTWARE
+                ? "software" : "fallback-software";
+            fallback_reason_ = encoder_preference_ == NP_WEBRTC_ENCODER_SOFTWARE
+                ? "none" : "hardware-backend-not-built";
+        }
+        else
+        {
+            requested_encoder_mode_ = "remote";
+            active_encoder_mode_ = "decoder";
+            input_surface_ = "i420-decoded";
+        }
         Initialize();
     }
 
@@ -776,6 +802,11 @@ public:
 
     NPWebRTCBridgeState GetState() const
     {
+#if defined(__APPLE__)
+        if (hardware_encoder_failure_ &&
+            hardware_encoder_failure_->failed.load(std::memory_order_acquire))
+            return NP_WEBRTC_FAILED;
+#endif
         if (failed_.load())
             return NP_WEBRTC_FAILED;
         if (!initialized_.load())
@@ -785,6 +816,11 @@ public:
 
     std::string GetStatus() const
     {
+#if defined(__APPLE__)
+        if (hardware_encoder_failure_ &&
+            hardware_encoder_failure_->failed.load(std::memory_order_acquire))
+            return "VideoToolbox H264 encoder failed; requesting software fallback";
+#endif
         std::lock_guard<std::mutex> lock(status_mutex_);
         return status_;
     }
@@ -973,6 +1009,14 @@ public:
     void ReadCodecTelemetry(NPWebRTCBridgeStats& stats)
     {
         MaybeRequestCodecTelemetry();
+#if defined(__APPLE__)
+        if (hardware_encoder_failure_ &&
+            hardware_encoder_failure_->failed.load(std::memory_order_acquire))
+        {
+            active_encoder_mode_ = "fallback-software";
+            fallback_reason_ = "hardware-runtime-failed";
+        }
+#endif
         stats.compressed_bytes_sent = codec_telemetry_->compressed_bytes_sent.load(std::memory_order_relaxed);
         stats.compressed_bytes_received = codec_telemetry_->compressed_bytes_received.load(std::memory_order_relaxed);
         stats.total_encode_time_usec = codec_telemetry_->total_encode_time_usec.load(std::memory_order_relaxed);
@@ -981,11 +1025,44 @@ public:
         stats.frames_decoded = codec_telemetry_->frames_decoded.load(std::memory_order_relaxed);
         stats.power_efficient_codec = codec_telemetry_->power_efficient.load(std::memory_order_relaxed) ? 1u : 0u;
         std::lock_guard lock(codec_telemetry_->text_mutex);
+        if (server_ && codec_telemetry_->codec_name != "unknown")
+        {
+            std::string negotiated_codec = codec_telemetry_->codec_name;
+            std::transform(negotiated_codec.begin(), negotiated_codec.end(),
+                negotiated_codec.begin(), [](unsigned char value) {
+                    return static_cast<char>(std::tolower(value));
+                });
+            if (negotiated_codec.find("vp8") != std::string::npos)
+            {
+                active_encoder_mode_ = encoder_preference_ == NP_WEBRTC_ENCODER_SOFTWARE
+                    ? "software" : "fallback-software";
+                if (encoder_preference_ == NP_WEBRTC_ENCODER_HARDWARE &&
+                    fallback_reason_ == "none")
+                    fallback_reason_ = "peer-negotiated-software";
+            }
+            else if (negotiated_codec.find("h264") != std::string::npos &&
+                encoder_preference_ == NP_WEBRTC_ENCODER_HARDWARE)
+            {
+                active_encoder_mode_ = "hardware";
+                fallback_reason_ = "none";
+            }
+        }
         const size_t codec_count = std::min(codec_telemetry_->codec_name.size(), sizeof(stats.codec_name) - 1u);
         std::memcpy(stats.codec_name, codec_telemetry_->codec_name.data(), codec_count);
         const size_t implementation_count =
             std::min(codec_telemetry_->implementation.size(), sizeof(stats.codec_implementation) - 1u);
         std::memcpy(stats.codec_implementation, codec_telemetry_->implementation.data(), implementation_count);
+        const auto copy_text = [](char* destination, size_t capacity, const std::string& source) {
+            const size_t count = std::min(source.size(), capacity - 1u);
+            std::memcpy(destination, source.data(), count);
+        };
+        copy_text(stats.requested_encoder_mode, sizeof(stats.requested_encoder_mode), requested_encoder_mode_);
+        copy_text(stats.active_encoder_mode, sizeof(stats.active_encoder_mode), active_encoder_mode_);
+        copy_text(stats.input_surface, sizeof(stats.input_surface), input_surface_);
+        copy_text(stats.codec_profile, sizeof(stats.codec_profile),
+            codec_telemetry_->codec_profile == "unknown"
+                ? codec_profile_ : codec_telemetry_->codec_profile);
+        copy_text(stats.fallback_reason, sizeof(stats.fallback_reason), fallback_reason_);
     }
 
 private:
@@ -1158,8 +1235,34 @@ private:
         if (!task_queue_factory_)
             return Fail("Could not create WebRTC task queue factory");
         stats_callback_ = webrtc::make_ref_counted<CodecStatsCallback>(codec_telemetry_);
-        auto encoder_factory = std::make_unique<webrtc::VideoEncoderFactoryTemplate<webrtc::LibvpxVp8EncoderTemplateAdapter>>();
-        auto decoder_factory = std::make_unique<webrtc::VideoDecoderFactoryTemplate<webrtc::LibvpxVp8DecoderTemplateAdapter>>();
+        std::unique_ptr<webrtc::VideoEncoderFactory> encoder_factory;
+        std::unique_ptr<webrtc::VideoDecoderFactory> decoder_factory;
+#if defined(__APPLE__)
+        NPAppleVideoCodecFactories apple_factories =
+            np_create_apple_video_codec_factories(
+                server_ && encoder_preference_ == NP_WEBRTC_ENCODER_HARDWARE);
+        hardware_encoder_failure_ = apple_factories.hardware_failure;
+        encoder_factory = std::move(apple_factories.encoder);
+        decoder_factory = std::move(apple_factories.decoder);
+        if (server_ && encoder_preference_ == NP_WEBRTC_ENCODER_HARDWARE)
+        {
+            if (apple_factories.hardware_encoder_available)
+            {
+                active_encoder_mode_ = "hardware";
+                fallback_reason_ = "none";
+            }
+            else
+            {
+                active_encoder_mode_ = "fallback-software";
+                fallback_reason_ = "hardware-capability-probe-failed";
+            }
+        }
+#else
+        encoder_factory = std::make_unique<webrtc::VideoEncoderFactoryTemplate<
+            webrtc::LibvpxVp8EncoderTemplateAdapter>>();
+        decoder_factory = std::make_unique<webrtc::VideoDecoderFactoryTemplate<
+            webrtc::LibvpxVp8DecoderTemplateAdapter>>();
+#endif
         peer_factory_ = webrtc::CreatePeerConnectionFactory(
             network_thread_, worker_thread_, signaling_thread_, nullptr,
             webrtc::CreateBuiltinAudioEncoderFactory(), webrtc::CreateBuiltinAudioDecoderFactory(),
@@ -1354,7 +1457,7 @@ private:
     {
         webrtc::DataChannelInit init = {};
         init.ordered = false;
-        init.maxRetransmits = 0;
+        init.maxRetransmits = 1;
         auto channel_or_error = peer_connection_->CreateDataChannelOrError("np.frame_meta", &init);
         if (channel_or_error.ok())
             AttachFrameMetadataChannel(channel_or_error.MoveValue());
@@ -1620,6 +1723,15 @@ private:
     std::string signaling_url_;
     std::string room_id_;
     bool use_internet_ice_ = false;
+    NPWebRTCEncoderPreference encoder_preference_ = NP_WEBRTC_ENCODER_HARDWARE;
+    std::string requested_encoder_mode_ = "unknown";
+    std::string active_encoder_mode_ = "unknown";
+    std::string input_surface_ = "i420-readback";
+    std::string codec_profile_ = "unknown";
+    std::string fallback_reason_ = "none";
+#if defined(__APPLE__)
+    std::shared_ptr<NPHardwareEncoderFailureSignal> hardware_encoder_failure_;
+#endif
     std::atomic_bool initialized_{false};
     std::atomic_bool stop_requested_{false};
     std::atomic_bool peer_connected_{false};
@@ -1689,12 +1801,17 @@ struct NPWebRTCVideoFrame
 };
 
 extern "C" NPWebRTCBridge* np_webrtc_bridge_create(
-    int is_server, const char* signaling_url, const char* room_id, int use_internet_ice)
+    int is_server, const char* signaling_url, const char* room_id,
+    int use_internet_ice, int encoder_preference)
 {
     if (!signaling_url || !room_id || signaling_url[0] == '\0' || room_id[0] == '\0')
         return nullptr;
     auto bridge = std::make_unique<NPWebRTCBridge>();
-    bridge->session = std::make_unique<WebRTCSession>(is_server != 0, signaling_url, room_id, use_internet_ice != 0);
+    const NPWebRTCEncoderPreference preference =
+        encoder_preference == NP_WEBRTC_ENCODER_SOFTWARE
+        ? NP_WEBRTC_ENCODER_SOFTWARE : NP_WEBRTC_ENCODER_HARDWARE;
+    bridge->session = std::make_unique<WebRTCSession>(
+        is_server != 0, signaling_url, room_id, use_internet_ice != 0, preference);
     return bridge.release();
 }
 

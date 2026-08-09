@@ -59,6 +59,12 @@ enum class RemoteQualityTierV3 : uint8_t
     Low = 2,
 };
 
+enum class RemoteEncoderPreference : uint8_t
+{
+    Hardware,
+    Software,
+};
+
 struct FormalLightingBlendV3
 {
     XMFLOAT3 diffuse_local = {};
@@ -160,6 +166,7 @@ struct RuntimeConfig
     std::string             signaling_url = "ws://127.0.0.1:39876";
     std::string             room_id = "NewPipeline.Wicked.V1";
     RemoteQualityTierV3     remote_quality_tier = RemoteQualityTierV3::High;
+    RemoteEncoderPreference remote_encoder = RemoteEncoderPreference::Hardware;
     bool                    use_internet_ice = false;
     std::vector<std::string> parse_warnings;
 };
@@ -204,6 +211,7 @@ const char* ToString(RemoteDynamicRange range);
 const char* ToString(DebugPreviewMode mode);
 const char* ToString(RemoteBufferEncoding encoding);
 const char* ToString(RemoteQualityTierV3 tier);
+const char* ToString(RemoteEncoderPreference preference);
 const char* ToString(DDGIResetReason reason);
 
 RuntimeConfig ParseRuntimeConfig(int argc, char* argv[], RuntimeConfig fallback = {});

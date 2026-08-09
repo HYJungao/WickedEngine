@@ -4,6 +4,9 @@ This document contains only work that remains after the current implementation i
 the project [README](../README.md). Completed migration phases and exploratory design
 notes are intentionally not repeated here.
 
+The staged latency and selectable hardware-codec work is specified in the
+[remote latency and hardware codec implementation plan](REMOTE_LATENCY_AND_HARDWARE_CODEC_PLAN.md).
+
 ## Engineering invariants
 
 - The implementation must remain scene-independent. Scene names, object IDs, fixed
@@ -19,8 +22,11 @@ notes are intentionally not repeated here.
 - Metadata and video pixels are accepted only as a matching frame/generation pair.
 - Server capture runs after the matching frame's formal lighting outputs are recorded,
   so pixels and `source_control_frame_id` never straddle two camera frames.
-- Software I420/VP8 remains the portable production path until a native codec path
-  passes the same correctness and lifecycle tests.
+- The current `np.control` V2 path remains reliable and ordered. A semantic-specific
+  snapshot/command delivery optimization is recorded in the implementation plan but is
+  explicitly deferred until the future incremental-command contract is defined.
+- Software I420/VP8 remains a mandatory portable fallback and explicit command-line
+  mode even after a hardware encoder becomes the default.
 
 ## Completed implementation: remote V3 semantic path
 
@@ -36,9 +42,11 @@ and latency results on both target platforms.
 
 ## Priority 1: Windows DX12 native video path
 
-The current WebRTC bridge uses software I420 codec surfaces. The next production
-performance step is a capability-driven native Windows path that keeps uncompressed
-remote-lighting pixels on the GPU.
+The macOS bridge now prefers VideoToolbox H.264, but Stage 5A still feeds it through
+the existing I420 readback surface. Windows currently falls back to VP8 because its
+external VS2022 WebRTC hardware factory/library is not present in this checkout. The
+next production performance step is a capability-driven native Windows path that keeps
+uncompressed remote-lighting pixels on the GPU.
 
 Required work:
 
@@ -96,6 +104,7 @@ Run the following matrix before declaring the remote path production-ready:
 | Metadata loss/reorder | Metadata is never applied to the wrong video frame |
 | Four semantic previews | Server Local/Transport and Client Remote identities agree |
 | Software codec path | Correct output on Windows and macOS |
+| macOS hardware codec path | VideoToolbox H.264 selection, runtime fallback, and four-buffer visual identity |
 | Native Windows path | Zero raw-frame PCIe transfer according to counters |
 | Second non-Sponza scene | No source change or scene-specific workaround required |
 

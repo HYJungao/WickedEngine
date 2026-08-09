@@ -1,6 +1,7 @@
 #include "NewPipelineRuntime.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <iterator>
 #include <limits>
@@ -57,6 +58,24 @@ bool HasArgument(const std::vector<std::string>& args, const std::string& name)
     return std::any_of(args.begin(), args.end(), [&name](const std::string& arg) {
         return IsNameMatch(arg, name);
     });
+}
+
+bool HasNamedArgument(const std::vector<std::string>& args, const std::string& name)
+{
+    const std::string plain_prefix = name + "=";
+    const std::string dash_prefix = "--" + name + "=";
+    return std::any_of(args.begin(), args.end(), [&](const std::string& arg) {
+        return IsNameMatch(arg, name) || arg.rfind(plain_prefix, 0) == 0 ||
+            arg.rfind(dash_prefix, 0) == 0;
+    });
+}
+
+std::string LowerASCII(std::string value)
+{
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char character) {
+        return static_cast<char>(std::tolower(character));
+    });
+    return value;
 }
 
 float SafeBlendWeight(float value)
@@ -292,6 +311,16 @@ const char* ToString(RemoteQualityTierV3 tier)
     }
 }
 
+const char* ToString(RemoteEncoderPreference preference)
+{
+    switch (preference)
+    {
+    case RemoteEncoderPreference::Hardware: return "hardware";
+    case RemoteEncoderPreference::Software: return "software";
+    default: return "unknown";
+    }
+}
+
 const char* ToString(DDGIResetReason reason)
 {
     switch (reason)
@@ -320,6 +349,24 @@ RuntimeConfig ParseRuntimeConfig(int argc, char* argv[], RuntimeConfig fallback)
         config.room_id = room_id;
 
     config.use_internet_ice = HasArgument(args, "webrtc_internet");
+
+    const std::string encoder_value =
+        LowerASCII(GetArgumentValue(args, "remote_encoder"));
+    if (encoder_value == "hardware")
+    {
+        config.remote_encoder = RemoteEncoderPreference::Hardware;
+    }
+    else if (encoder_value == "software")
+    {
+        config.remote_encoder = RemoteEncoderPreference::Software;
+    }
+    else if (HasNamedArgument(args, "remote_encoder"))
+    {
+        config.remote_encoder = RemoteEncoderPreference::Hardware;
+        config.parse_warnings.push_back(
+            "Unknown --remote_encoder value '" + encoder_value +
+            "', using hardware");
+    }
 
     return config;
 }
