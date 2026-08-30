@@ -491,6 +491,7 @@ namespace wi::graphics
 		VIDEO_DECODE_DST = 1 << 16,			// video decode operation destination output texture
 		VIDEO_DECODE_DPB = 1 << 17,			// video decode operation destination DPB texture
 		SWAPCHAIN = 1 << 18,				// resource state of swap chain's back buffer texture when it's not rendering
+		COMMON = 1 << 19,					// preserved neutral/shared state (D3D12 COMMON, Vulkan GENERAL)
 	};
 
 	enum class RenderPassFlags

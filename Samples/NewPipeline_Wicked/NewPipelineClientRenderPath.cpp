@@ -28,7 +28,11 @@ namespace
 constexpr float kRemoteStaleTimeoutSeconds = 5.0f;
 constexpr uint64_t kMaxRemoteFrameAgeUsec = 5'000'000;
 constexpr uint64_t kRemotePairTimeoutUsec = 1'000'000;
-constexpr size_t kMaxPendingRemotePairs = 8;
+// This queue also owns retained native decoder surfaces. Keep it below the
+// decoder's 8-slot ring so unmatched metadata can never stop decode progress.
+constexpr size_t kMaxPendingRemotePairs = 3;
+constexpr size_t kMaxPendingRemoteMetadata = 8;
+constexpr size_t kMaxMetadataReceivesPerTick = 16;
 constexpr float kRemoteFullQualitySeconds = 1.5f;
 constexpr float kElasticBlendAttackSpeed = 5.0f;
 constexpr float kElasticBlendReleaseSpeed = 10.0f;
@@ -354,6 +358,7 @@ std::string NewPipelineClientRenderPath::GetDebugStatusSummary() const
             " impl=" + transport.codec_implementation +
             " power-efficient=" + (transport.power_efficient_codec ? "yes" : "no") +
             " surface=" + transport.input_surface +
+            " zero-raw-upload=" + (transport.native_codec ? "yes" : "no") +
             " retained=" + std::to_string(transport.retained_frame_acquires) +
             " decode-q=" + std::to_string(transport.decoded_queue_depth) +
             " decode-avg=" + std::to_string(
@@ -363,7 +368,7 @@ std::string NewPipelineClientRenderPath::GetDebugStatusSummary() const
                     : 0u) + " ms" +
             " net=" + std::to_string(transport.compressed_bytes_received / 1024u) + " KiB" +
             " bitrate=" + std::to_string(transport_bitrate_bps / 1000u) + " kbps" +
-            " I420=" + std::to_string(transport.retained_i420_bytes / 1024u) + " KiB" +
+            " retained-I420=" + std::to_string(transport.retained_i420_bytes / 1024u) + " KiB" +
             " cpu-copy=" + std::to_string(transport.cpu_full_frame_copy_bytes / 1024u) + " KiB" +
             " convert=" + std::to_string(transport.cpu_conversion_usec / 1000u) + " ms" +
             " upload=" + std::to_string(remote_gpu_upload_bytes / 1024u) + " KiB" +
@@ -505,7 +510,8 @@ void NewPipelineClientRenderPath::Start()
     ApplyRenderSettings(true);
     wi::RenderPath3D::Start();
     std::string error;
-    if (!webrtc_transport.RequestStart(false, config, &error))
+    if (!webrtc_transport.RequestStart(
+            false, config, GetWindowsDX12AdapterLuid(), &error))
         wi::backlog::post("Client WebRTC start failed: " + error);
 
     wi::backlog::post("NewPipeline_Wicked Client render path started.");
@@ -999,6 +1005,41 @@ void NewPipelineClientRenderPath::MaintainWebRTC(float dt)
 {
     webrtc_transport.Tick();
     const WebRTCTransportStats stats = webrtc_transport.GetStats();
+    if (stats.state == WebRTCTransportState::Connected &&
+        !remote_consume.accepted_valid && !remote_codec_wait_logged)
+    {
+        remote_codec_wait_seconds += std::max(0.0f, dt);
+        if (remote_codec_wait_seconds >= 5.0f)
+        {
+            wi::backlog::post("Client WebRTC H264 frame wait: " + stats.status);
+            if (!pending_remote_video_frames.empty() &&
+                !downstream_metadata_cache.empty())
+            {
+                const PendingRemoteVideoFrame& pending =
+                    pending_remote_video_frames.front();
+                const RemoteFrameMetadata& metadata =
+                    downstream_metadata_cache.front().metadata;
+                wi::backlog::post(
+                    "Client remote pairing keys: video_rtp=" +
+                    std::to_string(pending.native_rtp_timestamp) +
+                    " metadata_rtp=" + std::to_string(
+                        RemoteVideoRtpTimestamp(metadata.timestamp_usec)) +
+                    " metadata_frame=" + std::to_string(metadata.frame_id) +
+                    " video_time_us=" + std::to_string(
+                        std::max<int64_t>(0,
+                            pending.frame.nv12.timestamp_usec)) +
+                    " metadata_time_us=" +
+                    std::to_string(metadata.timestamp_usec));
+            }
+            remote_codec_wait_logged = true;
+        }
+    }
+    else if (remote_consume.accepted_valid ||
+        stats.state != WebRTCTransportState::Connected)
+    {
+        remote_codec_wait_seconds = 0.0f;
+        remote_codec_wait_logged = false;
+    }
     transport_telemetry_window_seconds += std::max(0.0f, dt);
     if (transport_telemetry_window_seconds >= 1.0f)
     {
@@ -1029,7 +1070,8 @@ void NewPipelineClientRenderPath::MaintainWebRTC(float dt)
 
 void NewPipelineClientRenderPath::PollRemoteFrameMetadata()
 {
-    for (size_t receive_count = 0; receive_count < kMaxPendingRemotePairs * 2u;
+    for (size_t receive_count = 0;
+        receive_count < kMaxMetadataReceivesPerTick;
         ++receive_count)
     {
         RemoteVideoFrameLayout layout;
@@ -1072,7 +1114,7 @@ void NewPipelineClientRenderPath::PollRemoteFrameMetadata()
                 ++iterator;
         }
         downstream_metadata_cache.push_back(std::move(layout));
-        while (downstream_metadata_cache.size() > kMaxPendingRemotePairs)
+        while (downstream_metadata_cache.size() > kMaxPendingRemoteMetadata)
         {
             downstream_metadata_cache.pop_front();
             ++downstream_pair_expirations;
@@ -1084,6 +1126,7 @@ void NewPipelineClientRenderPath::ClearPendingRemoteFrames()
 {
     downstream_metadata_cache.clear();
     pending_remote_video_frames.clear();
+    remote_native_surface_cache.clear();
 }
 
 void NewPipelineClientRenderPath::PrunePendingRemoteFrames(uint64_t now_usec)
@@ -1107,7 +1150,7 @@ void NewPipelineClientRenderPath::PrunePendingRemoteFrames(uint64_t now_usec)
 }
 
 bool NewPipelineClientRenderPath::TryMatchRemoteVideoFrame(
-    RetainedI420Frame& frame,
+    RetainedRemoteVideoFrame& frame,
     RemoteVideoFrameLayout& layout)
 {
     struct Match
@@ -1121,18 +1164,31 @@ bool NewPipelineClientRenderPath::TryMatchRemoteVideoFrame(
     for (size_t video_index = 0; video_index < pending_remote_video_frames.size(); ++video_index)
     {
         const PendingRemoteVideoFrame& pending_video = pending_remote_video_frames[video_index];
-        const RemoteFrameMetadata& pixel_metadata = pending_video.pixel_layout.metadata;
         for (size_t metadata_index = 0; metadata_index < downstream_metadata_cache.size(); ++metadata_index)
         {
             const RemoteFrameMetadata& channel_metadata =
                 downstream_metadata_cache[metadata_index].metadata;
-            // WebRTC transports timestamps through RTP's clock domain, so the
-            // decoded frame timestamp is not an identity-preserving copy of
-            // the producer's microsecond timestamp. The metadata band is part
-            // of the encoded frame and therefore provides the stable key.
-            if (channel_metadata.frame_id != pixel_metadata.frame_id ||
-                channel_metadata.source_generation != pixel_metadata.source_generation)
-                continue;
+            // Native surfaces do not contain the in-band pixel metadata used
+            // by I420. The producer therefore stamps the video frame with an
+            // RTP timestamp deterministically derived from the serialized
+            // capture timestamp. RTP equality is the native frame identity;
+            // a wall-clock tolerance can pair adjacent 30 FPS frames and bind
+            // the wrong source_control_frame_id to the decoded texture.
+            if (pending_video.frame.IsNativeNV12())
+            {
+                if (pending_video.native_rtp_timestamp !=
+                    RemoteVideoRtpTimestamp(channel_metadata.timestamp_usec))
+                    continue;
+            }
+            else
+            {
+                const RemoteFrameMetadata& pixel_metadata =
+                    pending_video.pixel_layout.metadata;
+                if (channel_metadata.frame_id != pixel_metadata.frame_id ||
+                    channel_metadata.source_generation !=
+                        pixel_metadata.source_generation)
+                    continue;
+            }
             if (!match.valid || pending_video.local_receive_timestamp_usec >
                     match.local_receive_timestamp_usec)
             {
@@ -3672,8 +3728,12 @@ void NewPipelineClientRenderPath::PublishControlPacket(float dt)
 }
 
 bool NewPipelineClientRenderPath::UploadRemoteVideoTextures(
-    const RetainedI420Frame& frame, const RemoteVideoFrameLayout& layout)
+    const RetainedRemoteVideoFrame& remote_frame,
+    const RemoteVideoFrameLayout& layout)
 {
+    if (remote_frame.nv12.IsValid())
+        return UploadRemoteNV12Textures(remote_frame.nv12, layout);
+    const RetainedI420Frame& frame = remote_frame.i420;
     if (!frame.IsValid() || !layout.metadata.valid ||
         frame.width != layout.video_width || frame.height != layout.video_height)
         return false;
@@ -3823,6 +3883,151 @@ bool NewPipelineClientRenderPath::UploadRemoteVideoTextures(
     return true;
 }
 
+bool NewPipelineClientRenderPath::UploadRemoteNV12Textures(
+    const RetainedNV12Frame& frame,
+    const RemoteVideoFrameLayout& layout)
+{
+    if (!frame.IsValid() || !layout.metadata.valid ||
+        frame.width != layout.video_width ||
+        frame.height != layout.video_height)
+        return false;
+
+    std::shared_ptr<WindowsClientNV12Surface> native_surface;
+    for (auto iterator = remote_native_surface_cache.begin();
+        iterator != remote_native_surface_cache.end();)
+    {
+        const auto& candidate = *iterator;
+        if (candidate &&
+            candidate->texture_shared_handle == frame.texture_shared_handle &&
+            candidate->fence_shared_handle == frame.fence_shared_handle &&
+            candidate->adapter_luid == frame.adapter_luid &&
+            candidate->width == frame.width && candidate->height == frame.height)
+        {
+            if (frame.producer_fence_value <=
+                candidate->last_producer_fence_value)
+            {
+                // NT HANDLE values can be recycled after a decoder surface is
+                // retired. A reset fence sequence means this cache entry is a
+                // prior resource generation and must not be reused.
+                iterator = remote_native_surface_cache.erase(iterator);
+                continue;
+            }
+            native_surface = candidate;
+            break;
+        }
+        ++iterator;
+    }
+    if (!native_surface)
+    {
+        native_surface = std::make_shared<WindowsClientNV12Surface>();
+        std::string error;
+        if (!OpenWindowsClientNV12Surface(frame, *native_surface, &error))
+        {
+            wi::backlog::post("Client native NV12 open failed: " + error);
+            remote_native_surface_cache.clear();
+            webrtc_transport.ReportNativeNV12Failure();
+            return false;
+        }
+        remote_native_surface_cache.push_back(native_surface);
+        while (remote_native_surface_cache.size() > 16)
+            remote_native_surface_cache.pop_front();
+    }
+
+    wi::graphics::GraphicsDevice* device = wi::graphics::GetDevice();
+    RemoteVideoUploadSlot& slot =
+        remote_video_upload_ring[device->GetBufferIndex()];
+    uint32_t uploaded_mask = 0;
+    for (size_t index = 0; index < layout.tiles.size(); ++index)
+    {
+        const RemoteVideoTileLayout& tile = layout.tiles[index];
+        if (!tile.available)
+            continue;
+        const size_t semantic_index = static_cast<size_t>(tile.semantic);
+        if (semantic_index >= slot.semantic_outputs.size())
+            return false;
+        const bool hdr = tile.encoding == RemoteBufferEncoding::LogHDR16F;
+        const wi::graphics::Format format = hdr
+            ? wi::graphics::Format::R16G16B16A16_FLOAT
+            : wi::graphics::Format::R8G8B8A8_UNORM;
+        wi::graphics::Texture& output = slot.semantic_outputs[semantic_index];
+        if (!output.IsValid() || output.GetDesc().width != tile.width ||
+            output.GetDesc().height != tile.height ||
+            output.GetDesc().format != format)
+        {
+            wi::graphics::TextureDesc desc;
+            desc.width = tile.width;
+            desc.height = tile.height;
+            desc.format = format;
+            desc.bind_flags = wi::graphics::BindFlag::SHADER_RESOURCE |
+                wi::graphics::BindFlag::UNORDERED_ACCESS;
+            desc.layout = wi::graphics::ResourceState::SHADER_RESOURCE_COMPUTE;
+            output = {};
+            if (!device->CreateTexture(&desc, nullptr, &output))
+                return false;
+            const std::string name = std::string{"newpipeline.client."} +
+                ToString(tile.semantic) +
+                (hdr ? ".native.rgba16f" : ".native.rgba8");
+            device->SetName(&output, name.c_str());
+            ++remote_texture_creation_count;
+        }
+        uploaded_mask |= RemoteBufferKindMask(tile.semantic);
+    }
+    if ((uploaded_mask &
+            static_cast<uint32_t>(RemoteBufferKind::IndirectDiffuse)) == 0)
+        return false;
+
+    wi::graphics::CommandList cmd = device->BeginCommandList();
+    std::string fence_error;
+    if (!QueueWindowsClientNV12Wait(
+            *native_surface, frame.producer_fence_value, cmd, &fence_error))
+    {
+        wi::backlog::post("Client native NV12 wait failed: " + fence_error);
+        remote_native_surface_cache.clear();
+        webrtc_transport.ReportNativeNV12Failure();
+        return false;
+    }
+    const wi::graphics::GPUBarrier acquire_native =
+        wi::graphics::GPUBarrier::Image(
+            &native_surface->texture,
+            wi::graphics::ResourceState::COMMON,
+            wi::graphics::ResourceState::SHADER_RESOURCE_COMPUTE);
+    device->Barrier(&acquire_native, 1, cmd);
+    for (size_t index = 0; index < layout.tiles.size(); ++index)
+    {
+        const RemoteVideoTileLayout& tile = layout.tiles[index];
+        if (!tile.available)
+            continue;
+        wi::renderer::YUV_to_RGB_Region_NV12(
+            native_surface->texture,
+            native_surface->luminance_subresource,
+            native_surface->chrominance_subresource,
+            slot.semantic_outputs[static_cast<size_t>(tile.semantic)],
+            XMUINT2(tile.origin_x, tile.origin_y),
+            tile.encoding == RemoteBufferEncoding::ScalarLuma8,
+            tile.encoding == RemoteBufferEncoding::LogHDR16F ? 16.0f : 0.0f,
+            cmd);
+    }
+    const wi::graphics::GPUBarrier release_native =
+        wi::graphics::GPUBarrier::Image(
+            &native_surface->texture,
+            wi::graphics::ResourceState::SHADER_RESOURCE_COMPUTE,
+            wi::graphics::ResourceState::COMMON);
+    device->Barrier(&release_native, 1, cmd);
+    if (!QueueWindowsClientNV12Signal(
+            *native_surface, frame.consumer_fence_value, cmd, &fence_error))
+    {
+        wi::backlog::post("Client native NV12 signal failed: " + fence_error);
+        remote_native_surface_cache.clear();
+        webrtc_transport.ReportNativeNV12Failure();
+        return false;
+    }
+    frame.MarkCompletionScheduled();
+    native_surface->last_producer_fence_value = frame.producer_fence_value;
+    accepted_remote_textures = slot.semantic_outputs;
+    accepted_remote_buffer_mask = uploaded_mask;
+    return true;
+}
+
 bool NewPipelineClientRenderPath::ValidateRemoteVideoLayout(
     const RemoteVideoFrameLayout& layout, std::string& reason) const
 {
@@ -3946,7 +4151,8 @@ void NewPipelineClientRenderPath::InvalidateRemote(const std::string& reason)
 }
 
 void NewPipelineClientRenderPath::AcceptRemoteVideoFrame(
-    const RetainedI420Frame& frame, const RemoteVideoFrameLayout& layout)
+    const RetainedRemoteVideoFrame& frame,
+    const RemoteVideoFrameLayout& layout)
 {
     if (!UploadRemoteVideoTextures(frame, layout))
     {
@@ -3999,11 +4205,11 @@ void NewPipelineClientRenderPath::AcquireRemoteVideoFrame(float dt)
     if (!remote_acquire_logged)
     {
         wi::backlog::post(
-            "Client WebRTC video acquire active: retained I420 plus paired np.frame_meta validation");
+            "Client WebRTC video acquire active: native NV12/RTP pairing with retained I420 fallback");
         remote_acquire_logged = true;
     }
 
-    RetainedI420Frame retained_frame;
+    RetainedRemoteVideoFrame retained_frame;
     RemoteVideoFrameLayout video_layout;
     std::string error;
     std::string last_decode_error;
@@ -4013,12 +4219,13 @@ void NewPipelineClientRenderPath::AcquireRemoteVideoFrame(float dt)
     for (size_t receive_count = 0; receive_count < kMaxPendingRemotePairs;
         ++receive_count)
     {
-        RetainedI420Frame acquired_frame;
-        if (!webrtc_transport.TryAcquireI420Frame(acquired_frame))
+        RetainedRemoteVideoFrame acquired_frame;
+        if (!webrtc_transport.TryAcquireVideoFrame(acquired_frame))
             break;
         RemoteVideoFrameLayout pixel_layout;
-        if (!DecodeRemoteVideoFrameLayout(
-                acquired_frame, pixel_layout, &error))
+        if (!acquired_frame.IsNativeNV12() &&
+            !DecodeRemoteVideoFrameLayout(
+                acquired_frame.i420, pixel_layout, &error))
         {
             had_decode_error = true;
             last_decode_error = error.empty()
@@ -4032,8 +4239,13 @@ void NewPipelineClientRenderPath::AcquireRemoteVideoFrame(float dt)
         error.clear();
         auto duplicate = std::find_if(
             pending_remote_video_frames.begin(), pending_remote_video_frames.end(),
-            [&pixel_layout](const PendingRemoteVideoFrame& pending) {
-                return pending.pixel_layout.metadata.frame_id ==
+            [&acquired_frame, &pixel_layout](const PendingRemoteVideoFrame& pending) {
+                if (acquired_frame.IsNativeNV12())
+                    return pending.frame.IsNativeNV12() &&
+                        pending.native_rtp_timestamp ==
+                            acquired_frame.nv12.rtp_timestamp;
+                return !pending.frame.IsNativeNV12() &&
+                    pending.pixel_layout.metadata.frame_id ==
                         pixel_layout.metadata.frame_id &&
                     pending.pixel_layout.metadata.source_generation ==
                         pixel_layout.metadata.source_generation;
@@ -4043,6 +4255,8 @@ void NewPipelineClientRenderPath::AcquireRemoteVideoFrame(float dt)
         PendingRemoteVideoFrame pending;
         pending.frame = std::move(acquired_frame);
         pending.pixel_layout = std::move(pixel_layout);
+        pending.native_rtp_timestamp = pending.frame.IsNativeNV12()
+            ? pending.frame.nv12.rtp_timestamp : 0;
         pending.local_receive_timestamp_usec = NowUsec();
         pending_remote_video_frames.push_back(std::move(pending));
         queued_video_without_metadata = true;
@@ -4064,7 +4278,7 @@ void NewPipelineClientRenderPath::AcquireRemoteVideoFrame(float dt)
         {
             if (!remote_consume.accepted_valid)
                 remote_consume.invalid_reason =
-                    "waiting for matching pixel-band frame identity";
+                    "waiting for matching video/RTP frame identity";
         }
         else if (!pending_remote_video_frames.empty())
         {
@@ -4103,22 +4317,30 @@ void NewPipelineClientRenderPath::AcquireRemoteVideoFrame(float dt)
     }
 
     RemoteVideoFrameLayout pixel_layout;
-    const bool agrees =
-        DecodeRemoteVideoFrameLayout(retained_frame, pixel_layout, &error) &&
-        video_layout.protocol_version == pixel_layout.protocol_version &&
-        video_layout.video_width == pixel_layout.video_width &&
-        video_layout.video_height == pixel_layout.video_height &&
-        video_layout.metadata.frame_id == pixel_layout.metadata.frame_id &&
-        video_layout.metadata.source_generation ==
-            pixel_layout.metadata.source_generation &&
-        video_layout.descriptor_checksum ==
-            pixel_layout.descriptor_checksum &&
-        video_layout.source_control_frame_id ==
-            pixel_layout.source_control_frame_id;
+    const bool agrees = retained_frame.IsNativeNV12()
+        ? (video_layout.video_width == retained_frame.nv12.width &&
+            video_layout.video_height == retained_frame.nv12.height &&
+            retained_frame.nv12.rtp_timestamp ==
+                RemoteVideoRtpTimestamp(
+                    video_layout.metadata.timestamp_usec))
+        : (DecodeRemoteVideoFrameLayout(
+                retained_frame.i420, pixel_layout, &error) &&
+            video_layout.protocol_version == pixel_layout.protocol_version &&
+            video_layout.video_width == pixel_layout.video_width &&
+            video_layout.video_height == pixel_layout.video_height &&
+            video_layout.metadata.frame_id == pixel_layout.metadata.frame_id &&
+            video_layout.metadata.source_generation ==
+                pixel_layout.metadata.source_generation &&
+            video_layout.descriptor_checksum ==
+                pixel_layout.descriptor_checksum &&
+            video_layout.source_control_frame_id ==
+                pixel_layout.source_control_frame_id);
     if (!agrees)
     {
         ++downstream_metadata_mismatches;
-        InvalidateRemote("pixel-band/frame-metadata mismatch");
+        InvalidateRemote(retained_frame.IsNativeNV12()
+            ? "RTP/frame-metadata mismatch"
+            : "pixel-band/frame-metadata mismatch");
         return;
     }
 
@@ -4172,13 +4394,21 @@ void NewPipelineClientRenderPath::AcquireRemoteVideoFrame(float dt)
     std::string validation_reason;
     if (!remote_payload_read_logged)
     {
-        const uint64_t i420_bytes =
-            static_cast<uint64_t>(retained_frame.width) *
-            retained_frame.height * 3u / 2u;
-        wi::backlog::post(
-            "Client WebRTC retained I420 frame: " +
-            std::to_string(i420_bytes) +
-            " bytes, zero bridge copy, GPU semantic unpack");
+        if (retained_frame.IsNativeNV12())
+        {
+            wi::backlog::post(
+                "Client WebRTC retained native NV12 surface: shared DXGI handle, DX12 fence wait, zero readback");
+        }
+        else
+        {
+            const uint64_t i420_bytes =
+                static_cast<uint64_t>(retained_frame.i420.width) *
+                retained_frame.i420.height * 3u / 2u;
+            wi::backlog::post(
+                "Client WebRTC retained I420 fallback frame: " +
+                std::to_string(i420_bytes) +
+                " bytes, GPU semantic unpack");
+        }
         remote_payload_read_logged = true;
     }
 

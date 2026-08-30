@@ -48,7 +48,8 @@ set_target_properties(NewPipeline_Wicked_WebRTC PROPERTIES
     IMPORTED_LOCATION_RELEASE "${NEWPIPELINE_WEBRTC_RELEASE_LIB}"
     IMPORTED_LOCATION_RELWITHDEBINFO "${NEWPIPELINE_WEBRTC_RELEASE_LIB}"
     IMPORTED_LOCATION_MINSIZEREL "${NEWPIPELINE_WEBRTC_RELEASE_LIB}"
-    INTERFACE_INCLUDE_DIRECTORIES "${NEWPIPELINE_WEBRTC_INCLUDE}"
+    INTERFACE_INCLUDE_DIRECTORIES
+        "${NEWPIPELINE_WEBRTC_INCLUDE};${NEWPIPELINE_WEBRTC_INCLUDE}/third_party/libyuv/include"
 )
 
 set(NEWPIPELINE_SHARED_SOURCE
@@ -56,6 +57,8 @@ set(NEWPIPELINE_SHARED_SOURCE
     NewPipelineProtocol.cpp
     NewPipelineTransport.cpp
     NewPipelineWebRTCBridge.cpp
+    NewPipelineWebRTCWindowsCodecFactory.cpp
+    NewPipelineWindowsGPUInterop.cpp
     NewPipelineScene.cpp
     NewPipelineWindowsHost.cpp
 )
@@ -64,6 +67,8 @@ set(NEWPIPELINE_SHARED_HEADERS
     NewPipelineProtocol.h
     NewPipelineTransport.h
     NewPipelineWebRTCBridge.h
+    NewPipelineWebRTCWindowsCodecFactory.h
+    NewPipelineWindowsGPUInterop.h
     NewPipelineScene.h
     NewPipelineWindowsHost.h
 )
@@ -81,6 +86,8 @@ function(newpipeline_wicked_add_windows_target TARGET_NAME ENTRY APP_SOURCE APP_
     target_compile_features(${TARGET_NAME} PRIVATE cxx_std_20)
     target_compile_definitions(${TARGET_NAME} PRIVATE
         WEBRTC_WIN=1
+        WINVER=0x0A00
+        _WIN32_WINNT=0x0A00
         NOMINMAX=1
         WIN32_LEAN_AND_MEAN=1
         _SILENCE_CXX20_IS_POD_DEPRECATION_WARNING=1
@@ -106,6 +113,7 @@ function(newpipeline_wicked_add_windows_target TARGET_NAME ENTRY APP_SOURCE APP_
         NewPipeline_Wicked_WebRTC
         ws2_32 winhttp iphlpapi winmm secur32 crypt32 advapi32
         msdmo dmoguids wmcodecdspuuid
+        mf mfplat mfuuid d3d11 d3d12 dxgi dxguid oleaut32
     )
     add_dependencies(${TARGET_NAME} Content)
     add_custom_command(TARGET ${TARGET_NAME} POST_BUILD

@@ -171,6 +171,16 @@ struct RuntimeConfig
     std::vector<std::string> parse_warnings;
 };
 
+// WebRTC video RTP uses a 90 kHz clock. Keep the transport identity in that
+// clock domain instead of reusing the application frame counter.
+constexpr uint32_t RemoteVideoRtpTimestamp(uint64_t timestamp_usec)
+{
+    const uint64_t seconds = timestamp_usec / 1'000'000ull;
+    const uint64_t remainder = timestamp_usec % 1'000'000ull;
+    return static_cast<uint32_t>(
+        seconds * 90'000ull + remainder * 9ull / 100ull);
+}
+
 constexpr uint32_t RemoteBufferKindMask(RemoteBufferSemantic semantic)
 {
     return 1u << static_cast<uint32_t>(semantic);

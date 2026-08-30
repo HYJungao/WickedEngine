@@ -172,6 +172,11 @@ namespace wi::graphics
 
 		struct CommandList_DX12
 		{
+			struct ExternalFenceOperation
+			{
+				Microsoft::WRL::ComPtr<ID3D12Fence> fence;
+				uint64_t value = 0;
+			};
 			Microsoft::WRL::ComPtr<ID3D12CommandAllocator> commandAllocators[BUFFERCOUNT][QUEUE_COUNT];
 			Microsoft::WRL::ComPtr<ID3D12CommandList> commandLists[QUEUE_COUNT];
 			using graphics_command_list_version = ID3D12GraphicsCommandList6;
@@ -181,6 +186,8 @@ namespace wi::graphics
 			uint32_t id = 0;
 			wi::vector<Semaphore> waits;
 			wi::vector<Semaphore> signals;
+			wi::vector<ExternalFenceOperation> external_waits;
+			wi::vector<ExternalFenceOperation> external_signals;
 
 			DescriptorBinder binder;
 			GPULinearAllocator frame_allocators[BUFFERCOUNT];
@@ -225,6 +232,8 @@ namespace wi::graphics
 				buffer_index = bufferindex;
 				waits.clear();
 				signals.clear();
+				external_waits.clear();
+				external_signals.clear();
 				binder.reset();
 				frame_allocators[buffer_index].reset();
 				prev_pt = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
@@ -471,6 +480,23 @@ namespace wi::graphics
 
 		ID3D12Resource* GetTextureInternalResource(const Texture* texture);
 		ID3D12CommandQueue* GetGraphicsCommandQueue();
+		ID3D12Device* GetD3D12Device() const { return device.Get(); }
+		LUID GetAdapterLuid() const { return device->GetAdapterLuid(); }
+		bool OpenSharedTexture(
+			HANDLE shared_handle,
+			const TextureDesc* desc,
+			Texture* texture) const;
+		bool CopyBufferToTexturePlane(
+			const GPUBuffer* source,
+			uint64_t source_offset,
+			uint32_t source_row_pitch,
+			const Texture* destination,
+			uint32_t destination_plane,
+			uint32_t width,
+			uint32_t height,
+			CommandList cmd);
+		void WaitExternalFence(ID3D12Fence* fence, uint64_t value, CommandList cmd);
+		void SignalExternalFence(ID3D12Fence* fence, uint64_t value, CommandList cmd);
 
 		struct DescriptorHeapGPU
 		{

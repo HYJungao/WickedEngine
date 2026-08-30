@@ -68,13 +68,20 @@
 
 #if defined(__APPLE__)
 #include "NewPipelineWebRTCAppleCodecFactory.h"
+#elif defined(_WIN32)
+#include "NewPipelineWebRTCWindowsCodecFactory.h"
 #endif
 
 namespace
 {
 constexpr size_t kMaxControlBytes = 64u * 1024u;
 constexpr size_t kMaxDataChannelBufferedBytes = 1u * 1024u * 1024u;
-constexpr size_t kMaxReceiveQueueDepth = 8u;
+// Keep decoded video latest-only and strictly smaller than the Windows native
+// decoder's retained-surface ring (8). If both capacities are 8, a paused
+// render thread lets the receive queue retain every surface, so the decoder
+// cannot produce the ninth frame that would evict/release the first one.
+constexpr size_t kMaxReceiveVideoQueueDepth = 3u;
+constexpr size_t kMaxReceiveMetadataQueueDepth = 8u;
 constexpr uint32_t kMaxVideoDimension = 8192;
 // The V3 video frame is a semantic data atlas rather than a camera image. Let congestion
 // control drop frames, but never silently downscale it because that destroys the
@@ -675,8 +682,9 @@ struct ReceivedVideoFrame
 {
     uint32_t width = 0;
     uint32_t height = 0;
+    uint32_t rtp_timestamp = 0;
     int64_t timestamp_usec = 0;
-    webrtc::scoped_refptr<webrtc::I420BufferInterface> i420;
+    webrtc::scoped_refptr<webrtc::VideoFrameBuffer> buffer;
 };
 
 struct CodecTelemetry
@@ -773,9 +781,11 @@ class WebRTCSession final : public webrtc::PeerConnectionObserver
 {
 public:
     WebRTCSession(bool server, std::string signaling_url, std::string room_id,
-        bool use_internet_ice, NPWebRTCEncoderPreference encoder_preference) :
+        bool use_internet_ice, NPWebRTCEncoderPreference encoder_preference,
+        uint64_t adapter_luid) :
         server_(server), signaling_url_(std::move(signaling_url)), room_id_(std::move(room_id)),
-        use_internet_ice_(use_internet_ice), encoder_preference_(encoder_preference)
+        use_internet_ice_(use_internet_ice), encoder_preference_(encoder_preference),
+        adapter_luid_(adapter_luid)
     {
         if (server_)
         {
@@ -783,8 +793,18 @@ public:
                 ? "software" : "hardware";
             active_encoder_mode_ = encoder_preference_ == NP_WEBRTC_ENCODER_SOFTWARE
                 ? "software" : "fallback-software";
-            fallback_reason_ = encoder_preference_ == NP_WEBRTC_ENCODER_SOFTWARE
-                ? "none" : "hardware-backend-not-built";
+            if (encoder_preference_ == NP_WEBRTC_ENCODER_SOFTWARE)
+            {
+                fallback_reason_ = "none";
+            }
+            else
+            {
+#if defined(__APPLE__) || defined(_WIN32)
+                fallback_reason_ = "hardware-capability-probe-pending";
+#else
+                fallback_reason_ = "hardware-backend-not-built";
+#endif
+            }
         }
         else
         {
@@ -806,6 +826,13 @@ public:
         if (hardware_encoder_failure_ &&
             hardware_encoder_failure_->failed.load(std::memory_order_acquire))
             return NP_WEBRTC_FAILED;
+#elif defined(_WIN32)
+        if (server_ && hardware_encoder_failure_ &&
+            hardware_encoder_failure_->failed.load(std::memory_order_acquire))
+            return NP_WEBRTC_FAILED;
+        if (!server_ && hardware_decoder_failure_ &&
+            hardware_decoder_failure_->failed.load(std::memory_order_acquire))
+            return NP_WEBRTC_FAILED;
 #endif
         if (failed_.load())
             return NP_WEBRTC_FAILED;
@@ -820,9 +847,77 @@ public:
         if (hardware_encoder_failure_ &&
             hardware_encoder_failure_->failed.load(std::memory_order_acquire))
             return "VideoToolbox H264 encoder failed; requesting software fallback";
+#elif defined(_WIN32)
+        if (server_ && hardware_encoder_failure_ &&
+            hardware_encoder_failure_->failed.load(std::memory_order_acquire))
+        {
+            return "Media Foundation H264 encoder failed at stage " +
+                std::to_string(hardware_encoder_failure_->failure_stage.load(
+                    std::memory_order_relaxed)) + " (HRESULT " +
+                std::to_string(hardware_encoder_failure_->failure_hresult.load(
+                    std::memory_order_relaxed)) + ", calls=" +
+                std::to_string(hardware_encoder_failure_->encode_calls.load(
+                    std::memory_order_relaxed)) + ", native=" +
+                std::to_string(hardware_encoder_failure_->native_frames.load(
+                    std::memory_order_relaxed)) + ", submitted=" +
+                std::to_string(hardware_encoder_failure_->submitted_frames.load(
+                    std::memory_order_relaxed)) + ", output=" +
+                std::to_string(hardware_encoder_failure_->output_frames.load(
+                    std::memory_order_relaxed)) + "); requesting VP8 fallback";
+        }
+        if (!server_ && hardware_decoder_failure_ &&
+            hardware_decoder_failure_->failed.load(std::memory_order_acquire))
+            return "Media Foundation H264 decoder failed; reconnecting with VP8 fallback";
 #endif
-        std::lock_guard<std::mutex> lock(status_mutex_);
-        return status_;
+        std::string status;
+        {
+            std::lock_guard<std::mutex> lock(status_mutex_);
+            status = status_;
+        }
+#if defined(_WIN32)
+        if (server_ && hardware_encoder_failure_)
+        {
+            status += " [H264 enc calls=" + std::to_string(
+                hardware_encoder_failure_->encode_calls.load(std::memory_order_relaxed));
+            status += " native=" + std::to_string(
+                hardware_encoder_failure_->native_frames.load(std::memory_order_relaxed));
+            status += " submitted=" + std::to_string(
+                hardware_encoder_failure_->submitted_frames.load(std::memory_order_relaxed));
+            status += " output=" + std::to_string(
+                hardware_encoder_failure_->output_frames.load(std::memory_order_relaxed));
+            status += "]";
+        }
+        if (!server_ && hardware_decoder_failure_)
+        {
+            status += " [H264 dec calls=" + std::to_string(
+                hardware_decoder_failure_->decode_calls.load(std::memory_order_relaxed));
+            status += " key=" + std::to_string(
+                hardware_decoder_failure_->keyframes_received.load(std::memory_order_relaxed));
+            status += " queued=" + std::to_string(
+                hardware_decoder_failure_->queued_frames.load(std::memory_order_relaxed));
+            status += " submitted=" + std::to_string(
+                hardware_decoder_failure_->submitted_frames.load(std::memory_order_relaxed));
+            status += " out=" + std::to_string(
+                hardware_decoder_failure_->decoded_frames.load(std::memory_order_relaxed));
+            status += " nat=" + std::to_string(
+                hardware_decoder_failure_->native_surface_outputs.load(std::memory_order_relaxed)) + "/" +
+                std::to_string(hardware_decoder_failure_->native_surface_attempts.load(std::memory_order_relaxed));
+            const uint64_t native_failures =
+                hardware_decoder_failure_->native_allocation_failures.load(std::memory_order_relaxed) +
+                hardware_decoder_failure_->native_signal_failures.load(std::memory_order_relaxed);
+            const uint64_t ring_drops =
+                hardware_decoder_failure_->native_ring_drops.load(std::memory_order_relaxed);
+            if (native_failures != 0 || ring_drops != 0)
+            {
+                status += " fail=" + std::to_string(native_failures);
+                status += " drop=" + std::to_string(ring_drops);
+                status += " hr=" + std::to_string(
+                    hardware_decoder_failure_->native_failure_hresult.load(std::memory_order_relaxed));
+            }
+            status += "]";
+        }
+#endif
+        return status;
     }
 
     bool SendI420(uint32_t width, uint32_t height, const uint8_t* data, size_t size, int64_t timestamp_usec)
@@ -907,6 +1002,76 @@ public:
         video_source_->Push(frame);
         sent_frames_.fetch_add(1);
         return true;
+    }
+
+#if defined(_WIN32)
+    bool SendNV12Surface(
+        const NPWindowsNativeNV12Surface& surface,
+        uint32_t rtp_timestamp,
+        int64_t timestamp_usec,
+        std::function<void()> release,
+        std::function<void()> completion_scheduled)
+    {
+        if (!server_ || !native_nv12_enabled_ || !IsReady() || !IsConnected() ||
+            !video_source_ || surface.width == 0 || surface.height == 0 ||
+            surface.width > kMaxVideoDimension ||
+            surface.height > kMaxVideoDimension)
+        {
+            if (release)
+                release();
+            return false;
+        }
+        auto buffer = np_create_windows_native_nv12_buffer(
+            surface, std::move(release), std::move(completion_scheduled));
+        if (!buffer)
+            return false;
+        const webrtc::VideoFrame frame = webrtc::VideoFrame::Builder{}
+            .set_video_frame_buffer(buffer)
+            .set_rtp_timestamp(rtp_timestamp)
+            .set_timestamp_us(timestamp_usec)
+            .build();
+        video_source_->Push(frame);
+        sent_frames_.fetch_add(1);
+        return true;
+    }
+#endif
+
+    bool SupportsNativeNV12() const
+    {
+        if (!server_ || !native_nv12_enabled_ || !IsReady())
+            return false;
+#if defined(_WIN32)
+        if (hardware_encoder_failure_ &&
+            (hardware_encoder_failure_->failed.load(std::memory_order_acquire) ||
+                hardware_encoder_failure_->native_surface_failed.load(
+                    std::memory_order_acquire)))
+            return false;
+#endif
+        std::lock_guard lock(codec_telemetry_->text_mutex);
+        std::string negotiated_codec = codec_telemetry_->codec_name;
+        std::transform(negotiated_codec.begin(), negotiated_codec.end(),
+            negotiated_codec.begin(), [](unsigned char value) {
+                return static_cast<char>(std::tolower(value));
+            });
+        // A VP8 encoder cannot consume our native DX12 handle. Keep sending
+        // retained I420 until RTC stats confirm that H264 is the negotiated
+        // codec, and return to I420 immediately after a negotiation fallback.
+        return negotiated_codec.find("h264") != std::string::npos;
+    }
+
+    void ReportNativeNV12Failure()
+    {
+#if defined(_WIN32)
+        if (!server_ && hardware_decoder_failure_)
+        {
+            // Importing or synchronizing the retained decoder surface failed
+            // in the Wicked DX12 render path. Keep the Media Foundation H264
+            // decoder alive, but make subsequent decoded frames use its I420
+            // copy path instead of repeatedly returning unusable surfaces.
+            hardware_decoder_failure_->native_surface_failed.store(
+                true, std::memory_order_release);
+        }
+#endif
     }
 
     bool ReceiveI420(ReceivedVideoFrame& output)
@@ -1016,6 +1181,36 @@ public:
             active_encoder_mode_ = "fallback-software";
             fallback_reason_ = "hardware-runtime-failed";
         }
+#elif defined(_WIN32)
+        if (server_ && hardware_encoder_failure_ &&
+            hardware_encoder_failure_->failed.load(std::memory_order_acquire))
+        {
+            active_encoder_mode_ = "fallback-software";
+            fallback_reason_ = "hardware-runtime-failed";
+            input_surface_ = "i420-readback";
+        }
+        if (server_ && hardware_encoder_failure_ &&
+            hardware_encoder_failure_->native_surface_failed.load(
+                std::memory_order_acquire))
+        {
+            native_nv12_enabled_ = false;
+            input_surface_ = "i420-readback";
+            fallback_reason_ = "native-surface-failed-i420";
+        }
+        if (!server_ && hardware_decoder_failure_ &&
+            hardware_decoder_failure_->failed.load(std::memory_order_acquire))
+        {
+            native_nv12_enabled_ = false;
+            input_surface_ = "i420-decoded";
+        }
+        if (!server_ && hardware_decoder_failure_ &&
+            hardware_decoder_failure_->native_surface_failed.load(
+                std::memory_order_acquire))
+        {
+            native_nv12_enabled_ = false;
+            input_surface_ = "i420-decoded";
+            fallback_reason_ = "native-surface-failed-i420";
+        }
 #endif
         stats.compressed_bytes_sent = codec_telemetry_->compressed_bytes_sent.load(std::memory_order_relaxed);
         stats.compressed_bytes_received = codec_telemetry_->compressed_bytes_received.load(std::memory_order_relaxed);
@@ -1036,17 +1231,48 @@ public:
             {
                 active_encoder_mode_ = encoder_preference_ == NP_WEBRTC_ENCODER_SOFTWARE
                     ? "software" : "fallback-software";
+                input_surface_ = "i420-readback";
                 if (encoder_preference_ == NP_WEBRTC_ENCODER_HARDWARE &&
                     fallback_reason_ == "none")
                     fallback_reason_ = "peer-negotiated-software";
             }
             else if (negotiated_codec.find("h264") != std::string::npos &&
-                encoder_preference_ == NP_WEBRTC_ENCODER_HARDWARE)
+                encoder_preference_ == NP_WEBRTC_ENCODER_HARDWARE
+#if defined(_WIN32)
+                && !(hardware_encoder_failure_ &&
+                    hardware_encoder_failure_->failed.load(
+                        std::memory_order_acquire))
+#endif
+                )
             {
                 active_encoder_mode_ = "hardware";
                 fallback_reason_ = "none";
+                input_surface_ = native_nv12_enabled_
+                    ? "dx12-nv12-retained" : "i420-readback";
             }
         }
+        else if (!server_ && codec_telemetry_->codec_name != "unknown")
+        {
+            std::string negotiated_codec = codec_telemetry_->codec_name;
+            std::transform(negotiated_codec.begin(), negotiated_codec.end(),
+                negotiated_codec.begin(), [](unsigned char value) {
+                    return static_cast<char>(std::tolower(value));
+                });
+            input_surface_ = native_nv12_enabled_ &&
+                negotiated_codec.find("h264") != std::string::npos
+                ? "d3d11-nv12-retained" : "i420-decoded";
+        }
+#if defined(_WIN32)
+        if (server_ && hardware_encoder_failure_ &&
+            hardware_encoder_failure_->native_surface_failed.load(
+                std::memory_order_acquire))
+        {
+            // The H264 MFT remains active; only zero-copy input fell back.
+            active_encoder_mode_ = "hardware";
+            input_surface_ = "i420-readback";
+            fallback_reason_ = "native-surface-failed-i420";
+        }
+#endif
         const size_t codec_count = std::min(codec_telemetry_->codec_name.size(), sizeof(stats.codec_name) - 1u);
         std::memcpy(stats.codec_name, codec_telemetry_->codec_name.data(), codec_count);
         const size_t implementation_count =
@@ -1257,6 +1483,41 @@ private:
                 fallback_reason_ = "hardware-capability-probe-failed";
             }
         }
+#elif defined(_WIN32)
+        NPWindowsVideoCodecFactories windows_factories =
+            np_create_windows_video_codec_factories(
+                server_ && encoder_preference_ == NP_WEBRTC_ENCODER_HARDWARE,
+                adapter_luid_);
+        hardware_encoder_failure_ = windows_factories.hardware_encoder_failure;
+        hardware_decoder_failure_ = windows_factories.hardware_decoder_failure;
+        encoder_factory = std::move(windows_factories.encoder);
+        decoder_factory = std::move(windows_factories.decoder);
+        if (server_ && encoder_preference_ == NP_WEBRTC_ENCODER_HARDWARE)
+        {
+            if (windows_factories.hardware_encoder_available)
+            {
+                // Capability enumeration is not proof that the negotiated
+                // sender has produced hardware output. Promote this to
+                // "hardware" only after RTC stats report active H264.
+                active_encoder_mode_ = "hardware-probed";
+                fallback_reason_ = "none";
+                native_nv12_enabled_ = adapter_luid_ != 0;
+                // The first frames stay on the retained I420 contract until
+                // RTC stats confirm that this connection negotiated H264.
+                input_surface_ = "i420-readback";
+            }
+            else
+            {
+                active_encoder_mode_ = "fallback-software";
+                fallback_reason_ = "hardware-capability-probe-failed";
+            }
+        }
+        else if (!server_ && windows_factories.hardware_decoder_available &&
+            adapter_luid_ != 0)
+        {
+            native_nv12_enabled_ = true;
+            input_surface_ = "i420-decoded";
+        }
 #else
         encoder_factory = std::make_unique<webrtc::VideoEncoderFactoryTemplate<
             webrtc::LibvpxVp8EncoderTemplateAdapter>>();
@@ -1287,6 +1548,8 @@ private:
             CreateControlChannel();
             CreateFrameMetadataChannel();
             CreateLocalVideoTrack();
+            if (failed_.load(std::memory_order_acquire))
+                return;
         }
         SendSignaling("join|" + room_id_ + "|" + Role());
         signaling_receive_thread_ = std::thread([this] { SignalingLoop(); });
@@ -1403,6 +1666,16 @@ private:
                 CreateOffer();
             return;
         }
+        if (tokens[0] == "error")
+        {
+            if (tokens.size() >= 3 && tokens[1] == "duplicate-role")
+            {
+                return Fail("Signaling rejected this " + Role() +
+                    " because another process already owns room '" + room_id_ +
+                    "'; close the older NewPipeline process or use a different room");
+            }
+            return Fail("Signaling rejected the session: " + message);
+        }
         if (tokens[0] != "signal" || tokens.size() < 4)
             return;
         std::string from_role;
@@ -1487,6 +1760,46 @@ private:
         if (!transceiver_or_error.ok())
             return Fail(std::string{"Could not add video transceiver: "} + transceiver_or_error.error().message());
         local_video_transceiver_ = transceiver_or_error.MoveValue();
+#if defined(_WIN32)
+        if (encoder_preference_ == NP_WEBRTC_ENCODER_HARDWARE &&
+            (active_encoder_mode_ == "hardware-probed" ||
+                active_encoder_mode_ == "hardware"))
+        {
+            // Factory order alone does not override WebRTC's default video
+            // codec preference.  Put every advertised H264 profile before
+            // VP8 on this transceiver before the offer is created, otherwise
+            // two endpoints that support both codecs can still select VP8.
+            auto preferences = peer_factory_
+                ->GetRtpSenderCapabilities(webrtc::MediaType::VIDEO).codecs;
+            const auto first_non_h264 = std::stable_partition(
+                preferences.begin(), preferences.end(),
+                [](const webrtc::RtpCodecCapability& codec) {
+                    std::string name = codec.name;
+                    std::transform(name.begin(), name.end(), name.begin(),
+                        [](unsigned char value) {
+                            return static_cast<char>(std::tolower(value));
+                        });
+                    return name == "h264";
+                });
+            if (first_non_h264 == preferences.begin())
+            {
+                if (hardware_encoder_failure_)
+                    hardware_encoder_failure_->failed.store(
+                        true, std::memory_order_release);
+                return Fail("Media Foundation encoder was detected but WebRTC exposed no H264 sender capability");
+            }
+            const webrtc::RTCError result =
+                local_video_transceiver_->SetCodecPreferences(preferences);
+            if (!result.ok())
+            {
+                if (hardware_encoder_failure_)
+                    hardware_encoder_failure_->failed.store(
+                        true, std::memory_order_release);
+                return Fail(std::string{"Could not prefer H264 for the hardware video transceiver: "} +
+                    result.message());
+            }
+        }
+#endif
         local_video_sender_ = local_video_transceiver_->sender();
         if (local_video_sender_)
         {
@@ -1564,7 +1877,8 @@ private:
         if (server_ || !buffer.binary || buffer.size() == 0 || buffer.size() > kMaxControlBytes)
             return;
         std::lock_guard<std::mutex> lock(frame_metadata_mutex_);
-        if (received_frame_metadata_queue_.size() >= kMaxReceiveQueueDepth)
+        if (received_frame_metadata_queue_.size() >=
+            kMaxReceiveMetadataQueueDepth)
             received_frame_metadata_queue_.pop_front();
         received_frame_metadata_queue_.emplace_back(
             buffer.data.data(), buffer.data.data() + buffer.size());
@@ -1593,18 +1907,34 @@ private:
     void OnVideoFrame(const webrtc::VideoFrame& frame)
     {
         const auto buffer = frame.video_frame_buffer();
-        const auto i420 = buffer ? buffer->ToI420() : nullptr;
-        if (!i420 || i420->width() <= 0 || i420->height() <= 0 ||
-            i420->width() > static_cast<int>(kMaxVideoDimension) || i420->height() > static_cast<int>(kMaxVideoDimension))
+        if (!buffer || buffer->width() <= 0 || buffer->height() <= 0 ||
+            buffer->width() > static_cast<int>(kMaxVideoDimension) ||
+            buffer->height() > static_cast<int>(kMaxVideoDimension))
             return;
+        webrtc::scoped_refptr<webrtc::VideoFrameBuffer> retained = buffer;
+#if defined(_WIN32)
+        NPWindowsNativeNV12Surface native_surface;
+        const bool native = np_get_windows_native_nv12_surface(
+            buffer.get(), native_surface);
+#else
+        const bool native = false;
+#endif
+        if (!native)
+        {
+            const auto i420 = buffer->ToI420();
+            if (!i420)
+                return;
+            retained = i420;
+        }
         ReceivedVideoFrame received;
-        received.width = static_cast<uint32_t>(i420->width());
-        received.height = static_cast<uint32_t>(i420->height());
+        received.width = static_cast<uint32_t>(retained->width());
+        received.height = static_cast<uint32_t>(retained->height());
+        received.rtp_timestamp = frame.rtp_timestamp();
         received.timestamp_usec = frame.timestamp_us();
-        received.i420 = i420;
+        received.buffer = std::move(retained);
         {
             std::lock_guard<std::mutex> lock(video_mutex_);
-            if (received_video_queue_.size() >= kMaxReceiveQueueDepth)
+            if (received_video_queue_.size() >= kMaxReceiveVideoQueueDepth)
             {
                 received_video_queue_.pop_front();
                 dropped_frames_.fetch_add(1);
@@ -1724,6 +2054,8 @@ private:
     std::string room_id_;
     bool use_internet_ice_ = false;
     NPWebRTCEncoderPreference encoder_preference_ = NP_WEBRTC_ENCODER_HARDWARE;
+    uint64_t adapter_luid_ = 0;
+    bool native_nv12_enabled_ = false;
     std::string requested_encoder_mode_ = "unknown";
     std::string active_encoder_mode_ = "unknown";
     std::string input_surface_ = "i420-readback";
@@ -1731,6 +2063,9 @@ private:
     std::string fallback_reason_ = "none";
 #if defined(__APPLE__)
     std::shared_ptr<NPHardwareEncoderFailureSignal> hardware_encoder_failure_;
+#elif defined(_WIN32)
+    std::shared_ptr<NPWindowsHardwareEncoderFailureSignal> hardware_encoder_failure_;
+    std::shared_ptr<NPWindowsHardwareDecoderFailureSignal> hardware_decoder_failure_;
 #endif
     std::atomic_bool initialized_{false};
     std::atomic_bool stop_requested_{false};
@@ -1802,7 +2137,7 @@ struct NPWebRTCVideoFrame
 
 extern "C" NPWebRTCBridge* np_webrtc_bridge_create(
     int is_server, const char* signaling_url, const char* room_id,
-    int use_internet_ice, int encoder_preference)
+    int use_internet_ice, int encoder_preference, uint64_t adapter_luid)
 {
     if (!signaling_url || !room_id || signaling_url[0] == '\0' || room_id[0] == '\0')
         return nullptr;
@@ -1811,7 +2146,8 @@ extern "C" NPWebRTCBridge* np_webrtc_bridge_create(
         encoder_preference == NP_WEBRTC_ENCODER_SOFTWARE
         ? NP_WEBRTC_ENCODER_SOFTWARE : NP_WEBRTC_ENCODER_HARDWARE;
     bridge->session = std::make_unique<WebRTCSession>(
-        is_server != 0, signaling_url, room_id, use_internet_ice != 0, preference);
+        is_server != 0, signaling_url, room_id, use_internet_ice != 0,
+        preference, adapter_luid);
     return bridge.release();
 }
 
@@ -1854,6 +2190,59 @@ extern "C" int np_webrtc_bridge_send_i420_planes(
         timestamp_usec, std::move(release)) ? 1 : 0;
 }
 
+extern "C" int np_webrtc_bridge_send_nv12_surface(
+    NPWebRTCBridge* bridge,
+    uint32_t width,
+    uint32_t height,
+    void* texture_shared_handle,
+    void* fence_shared_handle,
+    uint64_t producer_fence_value,
+    uint64_t consumer_fence_value,
+    uint64_t adapter_luid,
+    uint32_t rtp_timestamp,
+    int64_t timestamp_usec,
+    NPWebRTCReleaseCallback release_callback,
+    void* release_context,
+    NPWebRTCReleaseCallback completion_scheduled_callback,
+    void* completion_scheduled_context)
+{
+    auto release = [release_callback, release_context]() {
+        if (release_callback)
+            release_callback(release_context);
+    };
+#if defined(_WIN32)
+    if (!bridge || !bridge->session)
+    {
+        release();
+        return 0;
+    }
+    NPWindowsNativeNV12Surface surface;
+    surface.width = width;
+    surface.height = height;
+    surface.texture_shared_handle = texture_shared_handle;
+    surface.fence_shared_handle = fence_shared_handle;
+    surface.producer_fence_value = producer_fence_value;
+    surface.consumer_fence_value = consumer_fence_value;
+    surface.adapter_luid = adapter_luid;
+    auto completion = [completion_scheduled_callback,
+                          completion_scheduled_context]() {
+        if (completion_scheduled_callback)
+            completion_scheduled_callback(completion_scheduled_context);
+    };
+    return bridge->session->SendNV12Surface(
+        surface, rtp_timestamp, timestamp_usec,
+        std::move(release), std::move(completion)) ? 1 : 0;
+#else
+    (void)bridge; (void)width; (void)height; (void)texture_shared_handle;
+    (void)fence_shared_handle; (void)producer_fence_value;
+    (void)consumer_fence_value; (void)adapter_luid; (void)rtp_timestamp;
+    (void)timestamp_usec; (void)completion_scheduled_callback;
+    (void)completion_scheduled_context;
+    release();
+    return 0;
+#endif
+}
+
 extern "C" int np_webrtc_bridge_receive_i420(
     NPWebRTCBridge* bridge, uint32_t* width, uint32_t* height, uint8_t* destination,
     size_t destination_capacity, size_t* required_size)
@@ -1870,8 +2259,15 @@ extern "C" int np_webrtc_bridge_receive_i420(
     *width = bridge->pending_video->width;
     *height = bridge->pending_video->height;
     const ReceivedVideoFrame& frame = *bridge->pending_video;
-    if (!frame.i420)
+    const auto i420 = frame.buffer ? frame.buffer->ToI420() : nullptr;
+    if (!i420)
+    {
+#if defined(_WIN32)
+        bridge->session->ReportNativeNV12Failure();
+#endif
+        bridge->pending_video.reset();
         return 0;
+    }
     const size_t y_size = static_cast<size_t>(frame.width) * frame.height;
     const size_t uv_size = static_cast<size_t>(frame.width / 2u) * (frame.height / 2u);
     *required_size = y_size + uv_size * 2u;
@@ -1882,13 +2278,13 @@ extern "C" int np_webrtc_bridge_receive_i420(
     uint8_t* destination_v = destination_u + uv_size;
     for (uint32_t row = 0; row < frame.height; ++row)
         std::memcpy(destination_y + static_cast<size_t>(row) * frame.width,
-            frame.i420->DataY() + static_cast<size_t>(row) * frame.i420->StrideY(), frame.width);
+            i420->DataY() + static_cast<size_t>(row) * i420->StrideY(), frame.width);
     for (uint32_t row = 0; row < frame.height / 2u; ++row)
     {
         std::memcpy(destination_u + static_cast<size_t>(row) * (frame.width / 2u),
-            frame.i420->DataU() + static_cast<size_t>(row) * frame.i420->StrideU(), frame.width / 2u);
+            i420->DataU() + static_cast<size_t>(row) * i420->StrideU(), frame.width / 2u);
         std::memcpy(destination_v + static_cast<size_t>(row) * (frame.width / 2u),
-            frame.i420->DataV() + static_cast<size_t>(row) * frame.i420->StrideV(), frame.width / 2u);
+            i420->DataV() + static_cast<size_t>(row) * i420->StrideV(), frame.width / 2u);
     }
     bridge->pending_video.reset();
     return 1;
@@ -1897,13 +2293,33 @@ extern "C" int np_webrtc_bridge_receive_i420(
 extern "C" int np_webrtc_bridge_acquire_i420_frame(
     NPWebRTCBridge* bridge, NPWebRTCVideoFrame** frame)
 {
+    if (np_webrtc_bridge_acquire_video_frame(bridge, frame) != 1 ||
+        frame == nullptr || *frame == nullptr)
+        return 0;
+    if ((*frame)->frame.buffer == nullptr ||
+        (*frame)->frame.buffer->GetI420() == nullptr)
+    {
+#if defined(_WIN32)
+        if (bridge && bridge->session)
+            bridge->session->ReportNativeNV12Failure();
+#endif
+        np_webrtc_video_frame_release(*frame);
+        *frame = nullptr;
+        return 0;
+    }
+    return 1;
+}
+
+extern "C" int np_webrtc_bridge_acquire_video_frame(
+    NPWebRTCBridge* bridge, NPWebRTCVideoFrame** frame)
+{
     if (!frame)
         return 0;
     *frame = nullptr;
     if (!bridge || !bridge->session)
         return 0;
     ReceivedVideoFrame received;
-    if (!bridge->session->ReceiveI420(received) || !received.i420)
+    if (!bridge->session->ReceiveI420(received) || !received.buffer)
         return 0;
     auto retained = std::make_unique<NPWebRTCVideoFrame>();
     retained->frame = std::move(received);
@@ -1923,10 +2339,12 @@ extern "C" int np_webrtc_video_frame_get_i420(
     uint32_t* v_stride,
     int64_t* timestamp_usec)
 {
-    if (!retained || !retained->frame.i420 || !width || !height ||
+    if (!retained || !retained->frame.buffer || !width || !height ||
         !y_plane || !y_stride || !u_plane || !u_stride || !v_plane || !v_stride)
         return 0;
-    const auto& i420 = retained->frame.i420;
+    const auto* i420 = retained->frame.buffer->GetI420();
+    if (i420 == nullptr)
+        return 0;
     if (i420->StrideY() <= 0 || i420->StrideU() <= 0 || i420->StrideV() <= 0)
         return 0;
     *width = retained->frame.width;
@@ -1942,9 +2360,76 @@ extern "C" int np_webrtc_video_frame_get_i420(
     return 1;
 }
 
+extern "C" int np_webrtc_video_frame_get_nv12_surface(
+    NPWebRTCVideoFrame* retained,
+    uint32_t* width,
+    uint32_t* height,
+    void** texture_shared_handle,
+    void** fence_shared_handle,
+    uint64_t* producer_fence_value,
+    uint64_t* consumer_fence_value,
+    uint64_t* adapter_luid,
+    uint32_t* rtp_timestamp,
+    int64_t* timestamp_usec)
+{
+#if defined(_WIN32)
+    if (!retained || !retained->frame.buffer || !width || !height ||
+        !texture_shared_handle || !fence_shared_handle ||
+        !producer_fence_value || !consumer_fence_value || !adapter_luid ||
+        !rtp_timestamp)
+        return 0;
+    NPWindowsNativeNV12Surface surface;
+    if (!np_get_windows_native_nv12_surface(
+            retained->frame.buffer.get(), surface))
+        return 0;
+    *width = surface.width;
+    *height = surface.height;
+    *texture_shared_handle = surface.texture_shared_handle;
+    *fence_shared_handle = surface.fence_shared_handle;
+    *producer_fence_value = surface.producer_fence_value;
+    *consumer_fence_value = surface.consumer_fence_value;
+    *adapter_luid = surface.adapter_luid;
+    *rtp_timestamp = retained->frame.rtp_timestamp;
+    if (timestamp_usec)
+        *timestamp_usec = retained->frame.timestamp_usec;
+    return 1;
+#else
+    (void)retained; (void)width; (void)height; (void)texture_shared_handle;
+    (void)fence_shared_handle; (void)producer_fence_value;
+    (void)consumer_fence_value; (void)adapter_luid; (void)rtp_timestamp;
+    (void)timestamp_usec;
+    return 0;
+#endif
+}
+
+extern "C" void np_webrtc_video_frame_mark_native_completion_scheduled(
+    NPWebRTCVideoFrame* retained)
+{
+#if defined(_WIN32)
+    if (retained && retained->frame.buffer)
+        np_mark_windows_native_nv12_completion_scheduled(
+            retained->frame.buffer.get());
+#else
+    (void)retained;
+#endif
+}
+
 extern "C" void np_webrtc_video_frame_release(NPWebRTCVideoFrame* frame)
 {
     delete frame;
+}
+
+extern "C" int np_webrtc_bridge_supports_native_nv12(NPWebRTCBridge* bridge)
+{
+    return bridge && bridge->session && bridge->session->SupportsNativeNV12()
+        ? 1 : 0;
+}
+
+extern "C" void np_webrtc_bridge_report_native_nv12_failure(
+    NPWebRTCBridge* bridge)
+{
+    if (bridge && bridge->session)
+        bridge->session->ReportNativeNV12Failure();
 }
 
 extern "C" int np_webrtc_bridge_send_control(NPWebRTCBridge* bridge, const uint8_t* data, size_t size)

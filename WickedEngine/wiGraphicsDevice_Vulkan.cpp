@@ -345,6 +345,8 @@ namespace vulkan_internal
 			// we can't assume transfer layout because it's allowed for resource to be used by multiple queues like DX12 (decay to common state), so this is a workaround
 			//	the problem is that image copy commands will require specifying the current layout, but different queues can often use textures in different layouts
 			return VK_IMAGE_LAYOUT_GENERAL;
+		case ResourceState::COMMON:
+			return VK_IMAGE_LAYOUT_GENERAL;
 		case ResourceState::SHADING_RATE_SOURCE:
 			return VK_IMAGE_LAYOUT_FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL_KHR;
 		case ResourceState::VIDEO_DECODE_DPB:

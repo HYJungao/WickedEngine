@@ -19693,6 +19693,92 @@ bool RGB_to_I420_Atlas(
 	return true;
 }
 
+bool RGB_to_NV12_Atlas(
+	const Texture& input_atlas,
+	const GPUBuffer& metadata_luma,
+	const GPUBuffer& output_nv12,
+	const I420AtlasPackDesc& desc,
+	CommandList cmd
+)
+{
+	auto profiler_range = wi::profiler::BeginRangeGPU("Remote Video GPU NV12 Pack", cmd);
+	device->EventBegin("RGB_to_NV12_Atlas", cmd);
+	device->BindComputeShader(&shaders[CSTYPE_RGB_TO_I420_ATLAS], cmd);
+
+	I420AtlasPackPush push = {};
+	push.video_resolution = desc.video_resolution;
+	push.metadata_rows = desc.metadata_rows;
+	push.y_stride = desc.y_stride;
+	push.uv_stride = desc.uv_stride;
+	push.u_offset = desc.u_offset;
+	push.v_offset = desc.u_offset;
+	push.available_mask = desc.available_mask;
+	push.tile_padding = desc.tile_padding;
+	push.abi_version = 2;
+	push.struct_size = sizeof(push);
+	if (!device->PushConstants(&push, sizeof(push), cmd, 0, true))
+	{
+		device->EventEnd(cmd);
+		return false;
+	}
+
+	device->BindResource(&input_atlas, 0, cmd);
+	device->BindResource(&metadata_luma, 1, cmd);
+	device->BindUAV(&output_nv12, 0, cmd);
+	const uint32_t y_store_count = (desc.video_resolution.x + 3u) / 4u;
+	const uint32_t uv_store_count = (desc.video_resolution.x / 2u + 3u) / 4u;
+	device->Dispatch(
+		(std::max(y_store_count, uv_store_count) + 7u) / 8u,
+		(desc.video_resolution.y + 7u) / 8u,
+		2,
+		cmd);
+	device->Barrier(GPUBarrier::Memory(&output_nv12), cmd);
+	device->EventEnd(cmd);
+	return true;
+}
+
+void YUV_to_RGB_Region_NV12(
+	const Texture& input_nv12,
+	int input_subresource_luminance,
+	int input_subresource_chrominance,
+	const Texture& output,
+	const XMUINT2& source_origin,
+	bool scalar_luma,
+	float log_hdr_maximum,
+	CommandList cmd
+)
+{
+	auto profiler_range = wi::profiler::BeginRangeGPU("Remote Video Native NV12 Unpack", cmd);
+	device->EventBegin("YUV_to_RGB_Region_NV12", cmd);
+	device->BindComputeShader(&shaders[CSTYPE_YUV_TO_RGB_REGION], cmd);
+
+	const TextureDesc& output_desc = output.GetDesc();
+	PostProcess postprocess;
+	postprocess.resolution = XMUINT2(output_desc.width, output_desc.height);
+	postprocess.resolution_rcp = XMFLOAT2(1.0f / output_desc.width, 1.0f / output_desc.height);
+	postprocess.params0 = XMFLOAT4(
+		static_cast<float>(source_origin.x),
+		static_cast<float>(source_origin.y),
+		scalar_luma ? 1.0f : 0.0f,
+		log_hdr_maximum > 0.0f ? 1.0f : 0.0f);
+	postprocess.params1.x = std::max(0.0f, log_hdr_maximum);
+	device->PushConstants(&postprocess, sizeof(postprocess), cmd);
+
+	device->BindResource(&input_nv12, 0, cmd, input_subresource_luminance);
+	device->BindResource(&input_nv12, 1, cmd, input_subresource_chrominance);
+	device->BindUAV(&output, 0, cmd);
+	device->Barrier(GPUBarrier::Image(
+		&output, output.desc.layout, ResourceState::UNORDERED_ACCESS), cmd);
+	device->Dispatch(
+		(output_desc.width + POSTPROCESS_BLOCKSIZE - 1) / POSTPROCESS_BLOCKSIZE,
+		(output_desc.height + POSTPROCESS_BLOCKSIZE - 1) / POSTPROCESS_BLOCKSIZE,
+		1,
+		cmd);
+	device->Barrier(GPUBarrier::Image(
+		&output, ResourceState::UNORDERED_ACCESS, output.desc.layout), cmd);
+	device->EventEnd(cmd);
+}
+
 void CopyDepthStencil(
 	const Texture* input_depth,
 	const Texture* input_stencil,

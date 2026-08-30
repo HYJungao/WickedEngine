@@ -40,27 +40,32 @@ High is the production default. Balanced/Low and cadence remain explicit opt-in
 until the production-validation matrix below records acceptable visual, bitrate
 and latency results on both target platforms.
 
-## Priority 1: Windows DX12 native video path
+## Priority 1: Windows DX12 native video path - implemented, production validation open
 
-The macOS bridge now prefers VideoToolbox H.264, but Stage 5A still feeds it through
-the existing I420 readback surface. Windows currently falls back to VP8 because its
-external VS2022 WebRTC hardware factory/library is not present in this checkout. The
-next production performance step is a capability-driven native Windows path that keeps
-uncompressed remote-lighting pixels on the GPU.
+The macOS bridge prefers VideoToolbox H.264 but still feeds it through the existing
+I420 readback surface. Windows now keeps uncompressed remote-lighting pixels on GPU
+when hardware H.264 is negotiated: DX12 packs/copies into shared NV12 surfaces,
+Media Foundation consumes/produces GPU surfaces, and explicit shared fences retain
+each surface until the opposite API has scheduled completion. VP8 remains the
+capability and runtime fallback.
 
-Required work:
+Implemented work:
 
-- define a retained DX12/NV12 surface and fence-token interface for the native
+- defined a retained DX12/NV12 surface and fence-token interface for the native
   backend;
-- integrate a hardware H.264 encoder that accepts the Server surface without a raw
-  GPU-to-CPU readback;
-- integrate a matching decoder that exposes a retained Client GPU surface;
-- negotiate native mode only when both peers and the selected codec support it;
-- keep vendor-specific code behind the codec backend rather than in RenderPath or
-  scene policy;
-- handle resize, keyframe, reconnect, device loss and surface-ring exhaustion without
+- extended the Media Foundation H.264 encoder to accept the retained Server GPU surface
+  without a raw GPU-to-CPU readback;
+- added a retained Client GPU-surface path while preserving NV12-to-I420 conversion as
+  the native-sharing fallback;
+- gated native mode on same-adapter DX12, hardware availability and confirmed H.264;
+- kept Media Foundation/D3D11 ownership in the codec backend rather than scene policy;
+- bounded resize, keyframe, reconnect, device loss and surface-ring exhaustion without
   blocking rendering;
-- report the selected codec mode and the reason when native mode is unavailable.
+- reported the selected codec/surface mode and the reason when native mode is unavailable.
+
+Native-surface failure is an optimization fallback, not a codec failure: hardware H.264
+continues through I420. Only an actual hardware encoder/decoder failure triggers the
+bounded VP8 reconnect.
 
 Acceptance criteria:
 
@@ -75,9 +80,11 @@ Acceptance criteria:
 
 ## Priority 2: profile direct Client consumption
 
-The current Client uploads I420 once and unpacks it into persistent semantic GPU
-textures. A later optimization may let render consumers sample a native decoded
-surface directly, but only if profiling shows a net reduction in GPU work.
+The native Client now samples decoded NV12 planes directly during one unpack into
+persistent semantic GPU textures; the fallback Client uploads I420 once before the
+same semantic unpack. A later optimization may let render consumers repeatedly sample
+the atlas surface without persistent outputs, but only if profiling shows a net
+reduction in GPU work.
 
 Required evidence:
 

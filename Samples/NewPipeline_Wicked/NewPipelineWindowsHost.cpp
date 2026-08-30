@@ -1,6 +1,9 @@
 #include "NewPipelineWindowsHost.h"
 
 #if defined(_WIN32)
+#include <shellapi.h>
+#pragma comment(lib, "Shell32.lib")
+
 namespace wicked_newpipeline
 {
 namespace
@@ -48,6 +51,34 @@ LRESULT CALLBACK NewPipelineWindowProc(HWND window, UINT message, WPARAM wparam,
     }
 }
 } // namespace
+
+WindowsCommandLineArguments GetWindowsCommandLineArguments()
+{
+    WindowsCommandLineArguments result;
+    int argument_count = 0;
+    LPWSTR* arguments = CommandLineToArgvW(GetCommandLineW(), &argument_count);
+    if (arguments == nullptr)
+        return result;
+    if (argument_count <= 0)
+    {
+        LocalFree(arguments);
+        return result;
+    }
+
+    result.values.reserve(static_cast<size_t>(argument_count));
+    for (int index = 0; index < argument_count; ++index)
+    {
+        std::string value;
+        wi::helper::StringConvert(arguments[index], value);
+        result.values.push_back(std::move(value));
+    }
+    LocalFree(arguments);
+
+    result.pointers.reserve(result.values.size());
+    for (std::string& value : result.values)
+        result.pointers.push_back(value.data());
+    return result;
+}
 
 int RunWindowsApplication(
     wi::Application& application,

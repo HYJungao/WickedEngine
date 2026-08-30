@@ -57,7 +57,8 @@ NPWebRTCBridge* np_webrtc_bridge_create(
     const char* signaling_url,
     const char* room_id,
     int use_internet_ice,
-    int encoder_preference);
+    int encoder_preference,
+    uint64_t adapter_luid);
 void np_webrtc_bridge_destroy(NPWebRTCBridge* bridge);
 
 int np_webrtc_bridge_send_i420(
@@ -80,6 +81,21 @@ int np_webrtc_bridge_send_i420_planes(
     int64_t timestamp_usec,
     NPWebRTCReleaseCallback release_callback,
     void* release_context);
+int np_webrtc_bridge_send_nv12_surface(
+    NPWebRTCBridge* bridge,
+    uint32_t width,
+    uint32_t height,
+    void* texture_shared_handle,
+    void* fence_shared_handle,
+    uint64_t producer_fence_value,
+    uint64_t consumer_fence_value,
+    uint64_t adapter_luid,
+    uint32_t rtp_timestamp,
+    int64_t timestamp_usec,
+    NPWebRTCReleaseCallback release_callback,
+    void* release_context,
+    NPWebRTCReleaseCallback completion_scheduled_callback,
+    void* completion_scheduled_context);
 int np_webrtc_bridge_receive_i420(
     NPWebRTCBridge* bridge,
     uint32_t* width,
@@ -89,6 +105,9 @@ int np_webrtc_bridge_receive_i420(
     size_t* required_size);
 
 int np_webrtc_bridge_acquire_i420_frame(
+    NPWebRTCBridge* bridge,
+    NPWebRTCVideoFrame** frame);
+int np_webrtc_bridge_acquire_video_frame(
     NPWebRTCBridge* bridge,
     NPWebRTCVideoFrame** frame);
 int np_webrtc_video_frame_get_i420(
@@ -102,7 +121,22 @@ int np_webrtc_video_frame_get_i420(
     const uint8_t** v_plane,
     uint32_t* v_stride,
     int64_t* timestamp_usec);
+int np_webrtc_video_frame_get_nv12_surface(
+    NPWebRTCVideoFrame* frame,
+    uint32_t* width,
+    uint32_t* height,
+    void** texture_shared_handle,
+    void** fence_shared_handle,
+    uint64_t* producer_fence_value,
+    uint64_t* consumer_fence_value,
+    uint64_t* adapter_luid,
+    uint32_t* rtp_timestamp,
+    int64_t* timestamp_usec);
+void np_webrtc_video_frame_mark_native_completion_scheduled(
+    NPWebRTCVideoFrame* frame);
 void np_webrtc_video_frame_release(NPWebRTCVideoFrame* frame);
+int np_webrtc_bridge_supports_native_nv12(NPWebRTCBridge* bridge);
+void np_webrtc_bridge_report_native_nv12_failure(NPWebRTCBridge* bridge);
 
 int np_webrtc_bridge_send_control(NPWebRTCBridge* bridge, const uint8_t* data, size_t size);
 int np_webrtc_bridge_receive_control(

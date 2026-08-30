@@ -46,6 +46,37 @@ struct RetainedI420Frame
     bool IsValid() const;
 };
 
+// A retained Windows NV12 texture shared between DX12 and D3D11/Media
+// Foundation. The handles remain valid for frame_lifetime. The producer and
+// consumer values belong to one monotonic shared-fence timeline.
+struct RetainedNV12Frame
+{
+    uint32_t width = 0;
+    uint32_t height = 0;
+    void* texture_shared_handle = nullptr;
+    void* fence_shared_handle = nullptr;
+    uint64_t producer_fence_value = 0;
+    uint64_t consumer_fence_value = 0;
+    uint64_t adapter_luid = 0;
+    uint32_t rtp_timestamp = 0;
+    int64_t timestamp_usec = 0;
+    std::shared_ptr<void> frame_lifetime;
+    void (*mark_completion_scheduled)(void*) = nullptr;
+    void* completion_context = nullptr;
+
+    bool IsValid() const;
+    void MarkCompletionScheduled() const;
+};
+
+struct RetainedRemoteVideoFrame
+{
+    RetainedI420Frame i420;
+    RetainedNV12Frame nv12;
+
+    bool IsValid() const { return i420.IsValid() || nv12.IsValid(); }
+    bool IsNativeNV12() const { return nv12.IsValid(); }
+};
+
 struct RemoteVideoTileLayout
 {
     RemoteBufferSemantic semantic = RemoteBufferSemantic::RemoteIndirectDiffuse;
@@ -154,13 +185,18 @@ public:
     WebRTCVideoTransport(const WebRTCVideoTransport&) = delete;
     WebRTCVideoTransport& operator=(const WebRTCVideoTransport&) = delete;
 
-    bool RequestStart(bool server, const RuntimeConfig& config, std::string* error = nullptr);
+    bool RequestStart(
+        bool server,
+        const RuntimeConfig& config,
+        uint64_t adapter_luid = 0,
+        std::string* error = nullptr);
     void RequestStop();
     void Stop();
     void Tick();
     bool SendControl(const ClientControlPacket& packet);
     bool TryReceiveControl(ClientControlPacket& packet);
     bool SendI420Frame(const RetainedI420Frame& frame);
+    bool SendNV12Frame(const RetainedNV12Frame& frame);
     bool SendFrameMetadata(const RemoteVideoFrameLayout& layout);
     bool SendStreamStatus(const RemoteStreamStatus& status);
     bool RequestKeyframe();
@@ -168,6 +204,9 @@ public:
         RemoteVideoFrameLayout& layout,
         RemoteStreamStatus* stream_status = nullptr);
     bool TryAcquireI420Frame(RetainedI420Frame& frame);
+    bool TryAcquireVideoFrame(RetainedRemoteVideoFrame& frame);
+    bool SupportsNativeNV12() const;
+    void ReportNativeNV12Failure();
     WebRTCTransportStats GetStats() const;
 
 private:

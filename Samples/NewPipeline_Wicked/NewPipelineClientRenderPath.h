@@ -3,6 +3,7 @@
 #include "NewPipelineClientStaticLighting.h"
 #include "NewPipelineScene.h"
 #include "NewPipelineTransport.h"
+#include "NewPipelineWindowsGPUInterop.h"
 
 #include <string>
 #include <deque>
@@ -93,16 +94,17 @@ private:
     void PublishControlPacket(float dt);
     void AcquireRemoteVideoFrame(float dt);
     void PollRemoteFrameMetadata();
-    bool TryMatchRemoteVideoFrame(RetainedI420Frame& frame, RemoteVideoFrameLayout& layout);
+    bool TryMatchRemoteVideoFrame(RetainedRemoteVideoFrame& frame, RemoteVideoFrameLayout& layout);
     void PrunePendingRemoteFrames(uint64_t now_usec);
     void ClearPendingRemoteFrames();
     void MaintainWebRTC(float dt);
     bool ValidateRemoteVideoLayout(const RemoteVideoFrameLayout& layout, std::string& reason) const;
     bool IsControlPacketChanged(const ClientControlPacket& packet) const;
-    void AcceptRemoteVideoFrame(const RetainedI420Frame& frame, const RemoteVideoFrameLayout& layout);
+    void AcceptRemoteVideoFrame(const RetainedRemoteVideoFrame& frame, const RemoteVideoFrameLayout& layout);
     void CommitAcceptedRemoteMetadata(const RemoteFrameMetadata& metadata);
     void InvalidateRemote(const std::string& reason);
-    bool UploadRemoteVideoTextures(const RetainedI420Frame& frame, const RemoteVideoFrameLayout& layout);
+    bool UploadRemoteVideoTextures(const RetainedRemoteVideoFrame& frame, const RemoteVideoFrameLayout& layout);
+    bool UploadRemoteNV12Textures(const RetainedNV12Frame& frame, const RemoteVideoFrameLayout& layout);
     const wi::graphics::Texture* GetDebugPreviewTexture() const;
     void DrawUnavailablePreview(wi::graphics::CommandList cmd) const;
     void ApplyRenderSettings(bool log_changes);
@@ -252,11 +254,13 @@ private:
     std::array<RemoteVideoUploadSlot, wi::graphics::GraphicsDevice::GetBufferCount()> remote_video_upload_ring;
     struct PendingRemoteVideoFrame
     {
-        RetainedI420Frame frame;
+        RetainedRemoteVideoFrame frame;
         RemoteVideoFrameLayout pixel_layout;
+        uint32_t native_rtp_timestamp = 0;
         uint64_t local_receive_timestamp_usec = 0;
     };
     std::deque<PendingRemoteVideoFrame> pending_remote_video_frames;
+    std::deque<std::shared_ptr<WindowsClientNV12Surface>> remote_native_surface_cache;
     std::array<wi::graphics::Texture, static_cast<size_t>(RemoteBufferSemantic::Count)> accepted_remote_textures;
     uint32_t accepted_remote_buffer_mask = 0;
     uint64_t remote_texture_creation_count = 0;
@@ -264,6 +268,8 @@ private:
     float transport_telemetry_window_seconds = 0.0f;
     uint64_t transport_telemetry_previous_bytes = 0;
     uint64_t transport_bitrate_bps = 0;
+    float remote_codec_wait_seconds = 0.0f;
+    bool remote_codec_wait_logged = false;
     WebRTCTransportState previous_webrtc_state = WebRTCTransportState::Disabled;
     std::deque<RemoteVideoFrameLayout> downstream_metadata_cache;
     uint64_t downstream_metadata_matches = 0;

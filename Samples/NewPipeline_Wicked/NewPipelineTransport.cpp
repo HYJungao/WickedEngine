@@ -2,6 +2,9 @@
 #if defined(__APPLE__)
 extern "C" int np_validate_apple_video_codec_factories(
     char* error, size_t error_capacity);
+#elif defined(_WIN32)
+extern "C" int np_validate_windows_video_codec_factories(
+    char* error, size_t error_capacity);
 #endif
 #include "NewPipelineWebRTCBridge.h"
 
@@ -693,6 +696,21 @@ bool RetainedI420Frame::IsValid() const
         y_stride >= width && u_stride >= width / 2u && v_stride >= width / 2u;
 }
 
+bool RetainedNV12Frame::IsValid() const
+{
+    return width > 0 && height > 0 && (width & 1u) == 0 &&
+        (height & 1u) == 0 && texture_shared_handle != nullptr &&
+        fence_shared_handle != nullptr && producer_fence_value != 0 &&
+        consumer_fence_value > producer_fence_value && adapter_luid != 0 &&
+        frame_lifetime != nullptr;
+}
+
+void RetainedNV12Frame::MarkCompletionScheduled() const
+{
+    if (mark_completion_scheduled != nullptr && completion_context != nullptr)
+        mark_completion_scheduled(completion_context);
+}
+
 bool DecodeRemoteVideoFrameLayout(
     const RetainedI420Frame& video, RemoteVideoFrameLayout& layout, std::string* error)
 {
@@ -768,6 +786,14 @@ bool ValidateRemoteTransportSelfTest(std::string* error)
         SetError(error, "remote encoder command-line selection self-test failed");
         return false;
     }
+    if (RemoteVideoRtpTimestamp(1'000'000ull) != 90'000u ||
+        RemoteVideoRtpTimestamp(1'033'333ull) != 92'999u ||
+        RemoteVideoRtpTimestamp(1'000'000ull) ==
+            RemoteVideoRtpTimestamp(1'033'333ull))
+    {
+        SetError(error, "native video RTP identity self-test failed");
+        return false;
+    }
 #if defined(__APPLE__)
     char apple_codec_error[256] = {};
     if (np_validate_apple_video_codec_factories(
@@ -775,6 +801,15 @@ bool ValidateRemoteTransportSelfTest(std::string* error)
     {
         SetError(error, apple_codec_error[0] != '\0'
             ? apple_codec_error : "Apple codec factory self-test failed");
+        return false;
+    }
+#elif defined(_WIN32)
+    char windows_codec_error[256] = {};
+    if (np_validate_windows_video_codec_factories(
+            windows_codec_error, sizeof(windows_codec_error)) != 1)
+    {
+        SetError(error, windows_codec_error[0] != '\0'
+            ? windows_codec_error : "Windows codec factory self-test failed");
         return false;
     }
 #endif
@@ -1276,6 +1311,7 @@ struct WebRTCVideoTransport::Impl
     std::mutex lifecycle_mutex;
     std::condition_variable lifecycle_cv;
     RuntimeConfig requested_config;
+    uint64_t requested_adapter_luid = 0;
     uint64_t request_revision = 0;
     bool requested_server = false;
     bool desired_running = false;
@@ -1337,6 +1373,8 @@ struct WebRTCVideoTransport::Impl
         result.requested_encoder_mode = native.requested_encoder_mode;
         result.active_encoder_mode = native.active_encoder_mode;
         result.input_surface = native.input_surface;
+        result.native_codec = result.input_surface.find("retained") !=
+            std::string::npos;
         result.codec_profile = native.codec_profile;
         result.fallback_reason = native.fallback_reason;
         result.status = native.status;
@@ -1414,6 +1452,7 @@ struct WebRTCVideoTransport::Impl
             uint64_t revision = 0;
             bool run = false;
             bool role_server = false;
+            uint64_t adapter_luid = 0;
             {
                 std::unique_lock lock(lifecycle_mutex);
                 const auto wake_time = bridge_attached.load(std::memory_order_acquire)
@@ -1428,6 +1467,7 @@ struct WebRTCVideoTransport::Impl
                 revision = request_revision;
                 run = desired_running;
                 role_server = requested_server;
+                adapter_luid = requested_adapter_luid;
                 config = requested_config;
             }
 
@@ -1533,7 +1573,8 @@ struct WebRTCVideoTransport::Impl
                 config.remote_encoder == RemoteEncoderPreference::Software ||
                     force_software_fallback
                     ? NP_WEBRTC_ENCODER_SOFTWARE
-                    : NP_WEBRTC_ENCODER_HARDWARE);
+                    : NP_WEBRTC_ENCODER_HARDWARE,
+                adapter_luid);
             lifecycle_last_duration_usec.store(NowUsec() - begin, std::memory_order_relaxed);
 
             bool discard_candidate = false;
@@ -1598,7 +1639,11 @@ WebRTCVideoTransport::~WebRTCVideoTransport()
     Stop();
 }
 
-bool WebRTCVideoTransport::RequestStart(bool server, const RuntimeConfig& config, std::string* error)
+bool WebRTCVideoTransport::RequestStart(
+    bool server,
+    const RuntimeConfig& config,
+    uint64_t adapter_luid,
+    std::string* error)
 {
     if (!impl || config.signaling_url.empty() || config.room_id.empty())
     {
@@ -1609,6 +1654,7 @@ bool WebRTCVideoTransport::RequestStart(bool server, const RuntimeConfig& config
         std::lock_guard lock(impl->lifecycle_mutex);
         impl->requested_server = server;
         impl->requested_config = config;
+        impl->requested_adapter_luid = adapter_luid;
         impl->desired_running = true;
         ++impl->request_revision;
     }
@@ -1727,6 +1773,53 @@ bool WebRTCVideoTransport::SendI420Frame(const RetainedI420Frame& frame)
         lifetime) == 1;
 }
 
+bool WebRTCVideoTransport::SendNV12Frame(const RetainedNV12Frame& frame)
+{
+    if (!impl || !frame.IsValid() ||
+        GetStats().state != WebRTCTransportState::Connected)
+    {
+        if (impl)
+            impl->disconnected_frame_drops.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    std::unique_lock lock(impl->bridge_mutex, std::try_to_lock);
+    if (!lock.owns_lock() || impl->bridge == nullptr || !impl->server ||
+        np_webrtc_bridge_supports_native_nv12(impl->bridge) != 1)
+    {
+        impl->busy_frame_drops.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    struct Lifetime
+    {
+        std::shared_ptr<void> owner;
+        void (*completion_callback)(void*) = nullptr;
+        void* completion_context = nullptr;
+    };
+    auto* lifetime = new Lifetime{
+        frame.frame_lifetime,
+        frame.mark_completion_scheduled,
+        frame.completion_context};
+    return np_webrtc_bridge_send_nv12_surface(
+        impl->bridge,
+        frame.width,
+        frame.height,
+        frame.texture_shared_handle,
+        frame.fence_shared_handle,
+        frame.producer_fence_value,
+        frame.consumer_fence_value,
+        frame.adapter_luid,
+        frame.rtp_timestamp,
+        frame.timestamp_usec,
+        [](void* context) { delete static_cast<Lifetime*>(context); },
+        lifetime,
+        [](void* context) {
+            auto* value = static_cast<Lifetime*>(context);
+            if (value != nullptr && value->completion_callback != nullptr)
+                value->completion_callback(value->completion_context);
+        },
+        lifetime) == 1;
+}
+
 bool WebRTCVideoTransport::SendFrameMetadata(const RemoteVideoFrameLayout& layout)
 {
     if (!impl || GetStats().state != WebRTCTransportState::Connected)
@@ -1802,6 +1895,18 @@ bool WebRTCVideoTransport::TryReceiveFrameMetadata(
 
 bool WebRTCVideoTransport::TryAcquireI420Frame(RetainedI420Frame& frame)
 {
+    RetainedRemoteVideoFrame remote;
+    if (!TryAcquireVideoFrame(remote) || !remote.i420.IsValid())
+    {
+        frame = {};
+        return false;
+    }
+    frame = std::move(remote.i420);
+    return true;
+}
+
+bool WebRTCVideoTransport::TryAcquireVideoFrame(RetainedRemoteVideoFrame& frame)
+{
     frame = {};
     if (!impl || GetStats().state != WebRTCTransportState::Connected)
         return false;
@@ -1809,32 +1914,80 @@ bool WebRTCVideoTransport::TryAcquireI420Frame(RetainedI420Frame& frame)
     if (!lock.owns_lock() || impl->bridge == nullptr || impl->server)
         return false;
     NPWebRTCVideoFrame* retained = nullptr;
-    if (np_webrtc_bridge_acquire_i420_frame(impl->bridge, &retained) != 1 || retained == nullptr)
+    if (np_webrtc_bridge_acquire_video_frame(impl->bridge, &retained) != 1 || retained == nullptr)
         return false;
-    frame.frame_lifetime = std::shared_ptr<void>(retained, [](void* value) {
+    std::shared_ptr<void> lifetime(retained, [](void* value) {
         np_webrtc_video_frame_release(static_cast<NPWebRTCVideoFrame*>(value));
     });
+    RetainedNV12Frame nv12;
+    nv12.frame_lifetime = lifetime;
+    if (np_webrtc_video_frame_get_nv12_surface(
+            retained,
+            &nv12.width,
+            &nv12.height,
+            &nv12.texture_shared_handle,
+            &nv12.fence_shared_handle,
+            &nv12.producer_fence_value,
+            &nv12.consumer_fence_value,
+            &nv12.adapter_luid,
+            &nv12.rtp_timestamp,
+            &nv12.timestamp_usec) == 1 &&
+        nv12.IsValid())
+    {
+        nv12.mark_completion_scheduled = [](void* context) {
+            np_webrtc_video_frame_mark_native_completion_scheduled(
+                static_cast<NPWebRTCVideoFrame*>(context));
+        };
+        nv12.completion_context = retained;
+        frame.nv12 = std::move(nv12);
+        impl->retained_frame_acquires.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+
+    RetainedI420Frame i420;
+    i420.frame_lifetime = std::move(lifetime);
     if (np_webrtc_video_frame_get_i420(
             retained,
-            &frame.width,
-            &frame.height,
-            &frame.y_plane,
-            &frame.y_stride,
-            &frame.u_plane,
-            &frame.u_stride,
-            &frame.v_plane,
-            &frame.v_stride,
-            &frame.timestamp_usec) != 1 ||
-        !frame.IsValid())
+            &i420.width,
+            &i420.height,
+            &i420.y_plane,
+            &i420.y_stride,
+            &i420.u_plane,
+            &i420.u_stride,
+            &i420.v_plane,
+            &i420.v_stride,
+            &i420.timestamp_usec) != 1 ||
+        !i420.IsValid())
     {
         frame = {};
         return false;
     }
-    const uint64_t y_bytes = static_cast<uint64_t>(frame.width) * frame.height;
-    const uint64_t uv_bytes = static_cast<uint64_t>(frame.width / 2u) * (frame.height / 2u);
+    const uint64_t y_bytes = static_cast<uint64_t>(i420.width) * i420.height;
+    const uint64_t uv_bytes = static_cast<uint64_t>(i420.width / 2u) * (i420.height / 2u);
     impl->retained_frame_acquires.fetch_add(1, std::memory_order_relaxed);
     impl->retained_i420_bytes.fetch_add(y_bytes + uv_bytes * 2u, std::memory_order_relaxed);
+    frame.i420 = std::move(i420);
     return true;
+}
+
+bool WebRTCVideoTransport::SupportsNativeNV12() const
+{
+    if (!impl)
+        return false;
+    std::unique_lock lock(impl->bridge_mutex, std::try_to_lock);
+    return lock.owns_lock() && impl->bridge != nullptr && impl->server &&
+        np_webrtc_bridge_supports_native_nv12(impl->bridge) == 1;
+}
+
+void WebRTCVideoTransport::ReportNativeNV12Failure()
+{
+    if (!impl)
+        return;
+    // This is a one-shot error path. Use a blocking lock so the notification
+    // cannot be silently lost to an ordinary signaling/stats lock collision.
+    std::lock_guard lock(impl->bridge_mutex);
+    if (impl->bridge != nullptr && !impl->server)
+        np_webrtc_bridge_report_native_nv12_failure(impl->bridge);
 }
 
 WebRTCTransportStats WebRTCVideoTransport::GetStats() const

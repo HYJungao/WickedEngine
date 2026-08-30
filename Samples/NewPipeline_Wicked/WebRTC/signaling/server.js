@@ -2,9 +2,9 @@
 
 const WebSocket = require('ws');
 
-const port = Number(process.env.PORT || 39876);
+const port = Number(process.argv[2] || process.env.PORT || 39876);
 if (!Number.isInteger(port) || port < 1 || port > 65535) {
-  console.error(`[NewPipeline WebRTC signaling] invalid PORT: ${process.env.PORT || ''}`);
+  console.error(`[NewPipeline WebRTC signaling] invalid port: ${process.argv[2] || process.env.PORT || ''}`);
   process.exit(2);
 }
 const wss = new WebSocket.Server({ port });
@@ -30,6 +30,34 @@ function tryDecodeBase64Utf8(payload) {
   } catch (_) {
     return payload;
   }
+}
+
+function summarizeVideoCodecs(signalType, payload) {
+  if (signalType !== 'offer' && signalType !== 'answer') {
+    return '';
+  }
+  const sdp = tryDecodeBase64Utf8(payload);
+  const lines = sdp.split(/\r?\n/);
+  const videoLine = lines.find((line) => line.startsWith('m=video '));
+  if (!videoLine) {
+    return ' videoCodecs=none';
+  }
+  const payloadTypes = videoLine.trim().split(/\s+/).slice(3);
+  const codecByPayload = new Map();
+  for (const line of lines) {
+    const match = /^a=rtpmap:(\d+)\s+([^/\s]+)/i.exec(line);
+    if (match) {
+      codecByPayload.set(match[1], match[2].toUpperCase());
+    }
+  }
+  const codecs = [];
+  for (const payloadType of payloadTypes) {
+    const codec = codecByPayload.get(payloadType);
+    if (codec && !codecs.includes(codec)) {
+      codecs.push(codec);
+    }
+  }
+  return ` videoCodecs=${codecs.join(',') || 'unknown'}`;
 }
 
 function getOrCreateRoom(roomId) {
@@ -153,7 +181,8 @@ wss.on('connection', (ws) => {
       }
       const recipients = Math.max(0, room.peers.size - 1);
       broadcastRoom(room, peer, `signal|${fromRole}|${signalType}|${payload}`);
-      logInfo(`peer#${peer.id} forwarded signal room="${roomId}" role="${fromRole}" type="${signalType}" recipients=${recipients} payloadBytes=${Buffer.byteLength(payload, 'utf8')}`);
+      const codecSummary = summarizeVideoCodecs(signalType, payload);
+      logInfo(`peer#${peer.id} forwarded signal room="${roomId}" role="${fromRole}" type="${signalType}" recipients=${recipients} payloadBytes=${Buffer.byteLength(payload, 'utf8')}${codecSummary}`);
       return;
     }
 

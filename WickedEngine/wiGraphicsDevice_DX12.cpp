@@ -86,6 +86,7 @@ namespace dx12_internal
 
 		// MISSING STATE: UNDEFINED
 		//	UNDEFINED state will be handled by DiscardResource() operation
+		// COMMON intentionally leaves the D3D12 state mask at zero.
 
 		if (has_flag(value, ResourceState::SHADER_RESOURCE))
 			ret |= D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
@@ -5372,7 +5373,8 @@ std::mutex queue_locker;
 				}
 
 				CommandQueue& queue = queues[commandlist.queue];
-				const bool dependency = !commandlist.signals.empty() || !commandlist.waits.empty();
+				const bool dependency = !commandlist.signals.empty() || !commandlist.waits.empty() ||
+					!commandlist.external_waits.empty() || !commandlist.external_signals.empty();
 
 				if (dependency)
 				{
@@ -5394,6 +5396,11 @@ std::mutex queue_locker;
 						// semaphore is not recycled here, only the signals recycle themselves vecause wait will use the same
 					}
 					commandlist.waits.clear();
+					for (auto& operation : commandlist.external_waits)
+					{
+						dx12_check(queue.queue->Wait(operation.fence.Get(), operation.value));
+					}
+					commandlist.external_waits.clear();
 
 					queue.submit();
 
@@ -5406,6 +5413,11 @@ std::mutex queue_locker;
 						free_semaphore(semaphore);
 					}
 					commandlist.signals.clear();
+					for (auto& operation : commandlist.external_signals)
+					{
+						dx12_check(queue.queue->Signal(operation.fence.Get(), operation.value));
+					}
+					commandlist.external_signals.clear();
 				}
 
 				for (auto& x : commandlist.pipelines_worker)
@@ -7831,6 +7843,136 @@ std::mutex queue_locker;
 	ID3D12CommandQueue* GraphicsDevice_DX12::GetGraphicsCommandQueue()
 	{
 		return queues[QUEUE_GRAPHICS].queue.Get();
+	}
+	bool GraphicsDevice_DX12::OpenSharedTexture(
+		HANDLE shared_handle,
+		const TextureDesc* desc,
+		Texture* texture) const
+	{
+		if (shared_handle == nullptr || desc == nullptr || texture == nullptr)
+			return false;
+		auto internal_state = wi::allocator::make_shared<Resource_DX12>();
+		internal_state->allocationhandler = allocationhandler;
+		HRESULT hr = dx12_check(device->OpenSharedHandle(
+			shared_handle, PPV_ARGS(internal_state->resource)));
+		if (FAILED(hr) || !internal_state->resource)
+			return false;
+
+		const D3D12_RESOURCE_DESC native_desc = internal_state->resource->GetDesc();
+		if (native_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+			native_desc.Width != desc->width ||
+			native_desc.Height != desc->height ||
+			native_desc.DepthOrArraySize != desc->array_size ||
+			native_desc.MipLevels != GetMipCount(*desc) ||
+			native_desc.Format != _ConvertFormat(desc->format) ||
+			native_desc.SampleDesc.Count != desc->sample_count)
+		{
+			return false;
+		}
+
+		texture->internal_state = internal_state;
+		texture->type = GPUResource::Type::TEXTURE;
+		texture->mapped_data = nullptr;
+		texture->mapped_size = 0;
+		texture->mapped_subresources = nullptr;
+		texture->mapped_subresource_count = 0;
+		texture->sparse_properties = nullptr;
+		texture->shared_handle = nullptr;
+		texture->desc = *desc;
+		texture->desc.mip_levels = GetMipCount(texture->desc);
+
+		internal_state->footprints.resize(GetTextureSubresourceCount(texture->desc));
+		internal_state->rowSizesInBytes.resize(internal_state->footprints.size());
+		internal_state->numRows.resize(internal_state->footprints.size());
+		device->GetCopyableFootprints(
+			&native_desc,
+			0,
+			static_cast<UINT>(internal_state->footprints.size()),
+			0,
+			internal_state->footprints.data(),
+			internal_state->numRows.data(),
+			internal_state->rowSizesInBytes.data(),
+			&internal_state->total_size);
+		// Multi-plane video resources require explicit per-plane SRVs. Creating a
+		// default SRV with DXGI_FORMAT_NV12 is invalid on D3D12; the interop caller
+		// creates R8 (Y) and R8G8 (UV) views below the generic import boundary.
+		if (has_flag(texture->desc.bind_flags, BindFlag::SHADER_RESOURCE) &&
+			texture->desc.format != Format::NV12)
+			CreateSubresource(texture, SubresourceType::SRV, 0, -1, 0, -1);
+		return true;
+	}
+	bool GraphicsDevice_DX12::CopyBufferToTexturePlane(
+		const GPUBuffer* source,
+		uint64_t source_offset,
+		uint32_t source_row_pitch,
+		const Texture* destination,
+		uint32_t destination_plane,
+		uint32_t width,
+		uint32_t height,
+		CommandList cmd)
+	{
+		if (source == nullptr || destination == nullptr ||
+			!source->IsValid() || !destination->IsValid() ||
+			source_row_pitch == 0 || width == 0 || height == 0 ||
+			destination->desc.format != Format::NV12 || destination_plane > 1 ||
+			destination->desc.mip_levels != 1 || destination->desc.array_size != 1 ||
+			destination->desc.sample_count != 1 ||
+			source_offset % D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT != 0 ||
+			source_row_pitch % D3D12_TEXTURE_DATA_PITCH_ALIGNMENT != 0)
+			return false;
+		const uint32_t expected_width = destination_plane == 0
+			? destination->desc.width : destination->desc.width / 2u;
+		const uint32_t expected_height = destination_plane == 0
+			? destination->desc.height : destination->desc.height / 2u;
+		const uint64_t row_size = static_cast<uint64_t>(width) *
+			(destination_plane == 0 ? 1u : 2u);
+		const uint64_t required_size = static_cast<uint64_t>(source_row_pitch) * height;
+		if (width != expected_width || height != expected_height ||
+			row_size > source_row_pitch || source_offset > source->desc.size ||
+			required_size > source->desc.size - source_offset)
+			return false;
+		CommandList_DX12& commandlist = GetCommandList(cmd);
+		auto source_internal = to_internal(source);
+		auto destination_internal = to_internal(destination);
+		const UINT subresource = D3D12CalcSubresource(
+			0, 0, destination_plane,
+			destination->desc.mip_levels,
+			destination->desc.array_size);
+		D3D12_TEXTURE_COPY_LOCATION source_location = {};
+		source_location.pResource = source_internal->resource.Get();
+		source_location.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+		source_location.PlacedFootprint.Offset = source_offset;
+		source_location.PlacedFootprint.Footprint.Format = destination_plane == 0
+			? DXGI_FORMAT_R8_UNORM : DXGI_FORMAT_R8G8_UNORM;
+		source_location.PlacedFootprint.Footprint.Width = width;
+		source_location.PlacedFootprint.Footprint.Height = height;
+		source_location.PlacedFootprint.Footprint.Depth = 1;
+		source_location.PlacedFootprint.Footprint.RowPitch = source_row_pitch;
+		CD3DX12_TEXTURE_COPY_LOCATION destination_location(
+			destination_internal->resource.Get(), subresource);
+		commandlist.GetGraphicsCommandList()->CopyTextureRegion(
+			&destination_location, 0, 0, 0, &source_location, nullptr);
+		return true;
+	}
+	void GraphicsDevice_DX12::WaitExternalFence(
+		ID3D12Fence* fence, uint64_t value, CommandList cmd)
+	{
+		if (fence == nullptr)
+			return;
+		CommandList_DX12::ExternalFenceOperation operation;
+		operation.fence = fence;
+		operation.value = value;
+		GetCommandList(cmd).external_waits.push_back(std::move(operation));
+	}
+	void GraphicsDevice_DX12::SignalExternalFence(
+		ID3D12Fence* fence, uint64_t value, CommandList cmd)
+	{
+		if (fence == nullptr)
+			return;
+		CommandList_DX12::ExternalFenceOperation operation;
+		operation.fence = fence;
+		operation.value = value;
+		GetCommandList(cmd).external_signals.push_back(std::move(operation));
 	}
 }
 

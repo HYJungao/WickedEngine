@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <memory>
 
 namespace wicked_newpipeline
 {
@@ -66,6 +67,11 @@ std::string NewPipelineServerRenderPath::GetDebugStatusSummary() const
         ? std::to_string(authoritative_shadow_index)
         : std::string{"unavailable"};
     const WebRTCTransportStats transport = webrtc_transport.GetStats();
+    const bool native_capture_active =
+        transport.native_codec && !native_nv12_runtime_disabled;
+    const std::string capture_surface = native_nv12_runtime_disabled
+        ? "i420-readback (native disabled: " + native_nv12_runtime_failure + ")"
+        : transport.input_surface;
     std::string semantic_status;
     if (packed_layout_contract_valid &&
         packed_layout_contract.protocol_version ==
@@ -98,7 +104,8 @@ std::string NewPipelineServerRenderPath::GetDebugStatusSummary() const
             " codec=" + transport.codec_name +
             " profile=" + transport.codec_profile +
             " impl=" + transport.codec_implementation +
-            "\nSurface: " + transport.input_surface +
+            "\nSurface: " + capture_surface +
+            " zero-raw-readback=" + (native_capture_active ? "yes" : "no") +
             " power-efficient=" + (transport.power_efficient_codec ? "yes" : "no") +
             " fallback=" + transport.fallback_reason +
             " encode-avg=" + std::to_string(
@@ -123,7 +130,11 @@ std::string NewPipelineServerRenderPath::GetDebugStatusSummary() const
         " quality=" + std::to_string(static_cast<uint32_t>(remote_stream_selection.quality_tier)) +
         " atlas=" + std::to_string(packed_layout_width) + "x" +
         std::to_string(packed_layout_height) +
-        "\nReadback: async ring 3, pending " + std::to_string(pending_count) +
+        "\nCapture transfer: " +
+            (native_capture_active
+                ? "DX12 retained NV12 ring + shared fence, raw readback disabled"
+                : "retained I420 async readback ring 3") +
+            ", pending " + std::to_string(pending_count) +
         semantic_status +
         transport_status +
         "\nDDGI: frame " + std::to_string(local_scene.ddgi.frame_index) +
@@ -133,6 +144,8 @@ std::string NewPipelineServerRenderPath::GetDebugStatusSummary() const
 
 void NewPipelineServerRenderPath::Start()
 {
+    native_nv12_runtime_disabled = false;
+    native_nv12_runtime_failure.clear();
     InitializeSceneIfNeeded();
     ConfigureDDGI();
     // SpecularIndirectPreAO is emitted by Visibility_Shade. Keep Server and
@@ -141,7 +154,8 @@ void NewPipelineServerRenderPath::Start()
     wi::RenderPath3D::Start();
     StartPublishWorker();
     std::string error;
-    if (!webrtc_transport.RequestStart(true, config, &error))
+    if (!webrtc_transport.RequestStart(
+            true, config, GetWindowsDX12AdapterLuid(), &error))
         wi::backlog::post("Server WebRTC start failed: " + error);
 
     wi::backlog::post("NewPipeline_Wicked Server render path started.");
@@ -432,12 +446,28 @@ void NewPipelineServerRenderPath::MaintainWebRTC(float dt)
         stats.state != WebRTCTransportState::Connected)
     {
         for (PackedReadbackSlot& slot : packed_readback_ring)
+        {
             slot.pending = false;
+            // Drop the render path's ownership immediately at a connection or
+            // codec-generation boundary. Any frame still owned by the encoder
+            // retains its own shared_ptr and closes the handles only after the
+            // MFT has released it.
+            slot.native_surface.reset();
+            slot.native_completion_scheduled.reset();
+            slot.native_consumer_fence_value = 0;
+            slot.native_footprint = {};
+        }
         packed_readback_write_index = 0;
         transport_preview_available_mask = 0;
         packed_layout_contract_valid = false;
         std::lock_guard lock(publish_mutex);
-        pending_i420_frame.reset();
+        pending_video_frame.reset();
+    }
+    if (stats.state == WebRTCTransportState::Connected &&
+        previous_webrtc_state != WebRTCTransportState::Connected)
+    {
+        native_nv12_runtime_disabled = false;
+        native_nv12_runtime_failure.clear();
     }
     previous_webrtc_state = stats.state;
 }
@@ -677,6 +707,19 @@ void NewPipelineServerRenderPath::CapturePackedRemoteFrame(
         }
         return;
     }
+    const bool use_native_nv12 = !native_nv12_runtime_disabled &&
+        webrtc_transport.SupportsNativeNV12() &&
+        GetWindowsDX12AdapterLuid() != 0;
+    if (!use_native_nv12)
+    {
+        for (PackedReadbackSlot& candidate : packed_readback_ring)
+        {
+            candidate.native_surface.reset();
+            candidate.native_completion_scheduled.reset();
+            candidate.native_consumer_fence_value = 0;
+            candidate.native_footprint = {};
+        }
+    }
     PackedReadbackSlot* selected_slot = nullptr;
     size_t selected_slot_index = packed_readback_write_index;
     for (size_t offset = 0; offset < packed_readback_ring.size(); ++offset)
@@ -684,8 +727,10 @@ void NewPipelineServerRenderPath::CapturePackedRemoteFrame(
         const size_t index =
             (packed_readback_write_index + offset) % packed_readback_ring.size();
         PackedReadbackSlot& candidate = packed_readback_ring[index];
-        if (!candidate.pending &&
-            (!candidate.readback || candidate.readback.use_count() == 1))
+        const bool retained_surface_available = use_native_nv12
+            ? (!candidate.native_surface || candidate.native_surface.use_count() == 1)
+            : (!candidate.readback || candidate.readback.use_count() == 1);
+        if (!candidate.pending && retained_surface_available)
         {
             selected_slot = &candidate;
             selected_slot_index = index;
@@ -887,12 +932,39 @@ void NewPipelineServerRenderPath::CapturePackedRemoteFrame(
     if (!EnsureTransportAtlasTexture(layout.video_width, layout.video_height))
         return;
 
-    const uint32_t y_stride = (layout.video_width + 3u) & ~3u;
-    const uint32_t uv_stride = (layout.video_width / 2u + 3u) & ~3u;
-    const uint32_t u_offset = y_stride * layout.video_height;
-    const uint32_t v_offset = u_offset + uv_stride * (layout.video_height / 2u);
-    const uint64_t packed_size = static_cast<uint64_t>(v_offset) +
+    uint32_t y_stride = (layout.video_width + 3u) & ~3u;
+    uint32_t uv_stride = (layout.video_width / 2u + 3u) & ~3u;
+    uint32_t u_offset = y_stride * layout.video_height;
+    uint32_t v_offset = u_offset + uv_stride * (layout.video_height / 2u);
+    uint64_t packed_size = static_cast<uint64_t>(v_offset) +
         static_cast<uint64_t>(uv_stride) * (layout.video_height / 2u);
+    if (use_native_nv12)
+    {
+        if (!slot.native_surface)
+            slot.native_surface = std::make_shared<WindowsServerNV12Surface>();
+        std::string native_error;
+        if (!EnsureWindowsServerNV12Surface(
+                layout.video_width,
+                layout.video_height,
+                *slot.native_surface,
+                slot.native_footprint,
+                &native_error) ||
+            slot.native_footprint.uv_offset >
+                std::numeric_limits<uint32_t>::max())
+        {
+            ++remote_capture_drops;
+            native_nv12_runtime_disabled = true;
+            native_nv12_runtime_failure = native_error.empty()
+                ? "surface allocation failed" : native_error;
+            wi::backlog::post("Server native NV12 surface failed: " + native_error);
+            return;
+        }
+        y_stride = slot.native_footprint.y_stride;
+        uv_stride = slot.native_footprint.uv_stride;
+        u_offset = static_cast<uint32_t>(slot.native_footprint.uv_offset);
+        v_offset = u_offset;
+        packed_size = slot.native_footprint.total_size;
+    }
     if (packed_size == 0 || packed_size > std::numeric_limits<uint32_t>::max())
     {
         wi::backlog::post("Server GPU I420 packed buffer size is invalid.");
@@ -922,9 +994,12 @@ void NewPipelineServerRenderPath::CapturePackedRemoteFrame(
         slot.packed_gpu = {};
         if (!device->CreateBuffer(&desc, nullptr, &slot.packed_gpu))
             return;
+        slot.packed_gpu_state = wi::graphics::ResourceState::UNORDERED_ACCESS;
         device->SetName(&slot.packed_gpu, "newpipeline.server.i420.packed_gpu");
     }
-    if (!slot.readback || !slot.readback->buffer.IsValid() || slot.readback->buffer.GetDesc().size != packed_size)
+    if (!use_native_nv12 &&
+        (!slot.readback || !slot.readback->buffer.IsValid() ||
+            slot.readback->buffer.GetDesc().size != packed_size))
     {
         slot.readback = std::make_shared<PackedReadbackStorage>();
         wi::graphics::GPUBufferDesc desc;
@@ -937,7 +1012,9 @@ void NewPipelineServerRenderPath::CapturePackedRemoteFrame(
         }
         device->SetName(&slot.readback->buffer, "newpipeline.server.i420.readback");
     }
-    if (slot.metadata_upload.mapped_data == nullptr || slot.readback->buffer.mapped_data == nullptr)
+    if (slot.metadata_upload.mapped_data == nullptr ||
+        (!use_native_nv12 &&
+            (!slot.readback || slot.readback->buffer.mapped_data == nullptr)))
         return;
     std::memcpy(slot.metadata_upload.mapped_data, metadata_luma.data(), metadata_luma.size());
 
@@ -1096,18 +1173,98 @@ void NewPipelineServerRenderPath::CapturePackedRemoteFrame(
             cmd);
     }
 
-    if (!wi::renderer::RGB_to_I420_Atlas(
-            transport_atlas_texture, slot.metadata_upload, slot.packed_gpu, pack_desc, cmd))
+    if (slot.packed_gpu_state != wi::graphics::ResourceState::UNORDERED_ACCESS)
+    {
+        device->Barrier(wi::graphics::GPUBarrier::Buffer(
+            &slot.packed_gpu,
+            slot.packed_gpu_state,
+            wi::graphics::ResourceState::UNORDERED_ACCESS), cmd);
+        slot.packed_gpu_state = wi::graphics::ResourceState::UNORDERED_ACCESS;
+    }
+    const bool packed = use_native_nv12
+        ? wi::renderer::RGB_to_NV12_Atlas(
+            transport_atlas_texture, slot.metadata_upload,
+            slot.packed_gpu, pack_desc, cmd)
+        : wi::renderer::RGB_to_I420_Atlas(
+            transport_atlas_texture, slot.metadata_upload,
+            slot.packed_gpu, pack_desc, cmd);
+    if (!packed)
     {
         ++remote_capture_drops;
         wi::backlog::post(
-            "Server remote capture rejected: GPU I420 pack contract is incompatible",
+            use_native_nv12
+                ? "Server remote capture rejected: GPU NV12 pack contract is incompatible"
+                : "Server remote capture rejected: GPU I420 pack contract is incompatible",
             wi::backlog::LogLevel::Error);
         return;
     }
     device->Barrier(wi::graphics::GPUBarrier::Buffer(
         &slot.packed_gpu, wi::graphics::ResourceState::UNORDERED_ACCESS, wi::graphics::ResourceState::COPY_SRC), cmd);
-    device->CopyResource(&slot.readback->buffer, &slot.packed_gpu, cmd);
+    slot.packed_gpu_state = wi::graphics::ResourceState::COPY_SRC;
+    RetainedNV12Frame native_frame;
+    if (use_native_nv12)
+    {
+        const uint64_t wait_value =
+            slot.native_completion_scheduled &&
+                slot.native_completion_scheduled->load(std::memory_order_acquire)
+            ? slot.native_consumer_fence_value : 0;
+        const uint64_t producer_value =
+            slot.native_surface->next_fence_value + 1u;
+        const uint64_t consumer_value = producer_value + 1u;
+        std::string native_error;
+        if (!QueueWindowsServerNV12Copy(
+                *slot.native_surface,
+                slot.native_footprint,
+                slot.packed_gpu,
+                wait_value,
+                producer_value,
+                cmd,
+                &native_error))
+        {
+            ++remote_capture_drops;
+            native_nv12_runtime_disabled = true;
+            native_nv12_runtime_failure = native_error.empty()
+                ? "GPU copy/fence setup failed" : native_error;
+            wi::backlog::post("Server native NV12 GPU copy failed: " + native_error);
+            return;
+        }
+        slot.native_surface->next_fence_value = consumer_value;
+        slot.native_completion_scheduled =
+            std::make_shared<std::atomic_bool>(false);
+        slot.native_consumer_fence_value = consumer_value;
+        struct NativeLifetime
+        {
+            std::shared_ptr<WindowsServerNV12Surface> surface;
+            std::shared_ptr<std::atomic_bool> completion_scheduled;
+        };
+        auto lifetime = std::make_shared<NativeLifetime>();
+        lifetime->surface = slot.native_surface;
+        lifetime->completion_scheduled = slot.native_completion_scheduled;
+        native_frame.width = layout.video_width;
+        native_frame.height = layout.video_height;
+        native_frame.texture_shared_handle =
+            slot.native_surface->texture_shared_handle;
+        native_frame.fence_shared_handle =
+            slot.native_surface->fence_shared_handle;
+        native_frame.producer_fence_value = producer_value;
+        native_frame.consumer_fence_value = consumer_value;
+        native_frame.adapter_luid = slot.native_surface->adapter_luid;
+        native_frame.rtp_timestamp =
+            RemoteVideoRtpTimestamp(layout.metadata.timestamp_usec);
+        native_frame.timestamp_usec =
+            static_cast<int64_t>(layout.metadata.timestamp_usec);
+        native_frame.frame_lifetime = std::move(lifetime);
+        native_frame.mark_completion_scheduled = [](void* context) {
+            static_cast<std::atomic_bool*>(context)->store(
+                true, std::memory_order_release);
+        };
+        native_frame.completion_context =
+            slot.native_completion_scheduled.get();
+    }
+    else
+    {
+        device->CopyResource(&slot.readback->buffer, &slot.packed_gpu, cmd);
+    }
     device->Barrier(wi::graphics::GPUBarrier::Buffer(
         &slot.packed_gpu, wi::graphics::ResourceState::COPY_SRC, wi::graphics::ResourceState::UNORDERED_ACCESS), cmd);
 
@@ -1116,7 +1273,7 @@ void NewPipelineServerRenderPath::CapturePackedRemoteFrame(
     slot.uv_stride = uv_stride;
     slot.u_offset = u_offset;
     slot.v_offset = v_offset;
-    slot.pending = true;
+    slot.pending = !use_native_nv12;
     // Record the frame whose graphics-queue fence will cover this copy. The
     // consumer polls that fence and never waits on the render thread.
     slot.gpu_submit_frame = device->GetFrameCount();
@@ -1139,7 +1296,10 @@ void NewPipelineServerRenderPath::CapturePackedRemoteFrame(
         ddgi_announced_reset_serial = ddgi_reset_serial;
     camera_cut_pending = false;
     ++remote_capture_count;
-    gpu_readback_bytes += packed_size;
+    if (use_native_nv12)
+        QueueNV12FrameForPublish(std::move(native_frame), slot.layout);
+    else
+        gpu_readback_bytes += packed_size;
     packed_readback_write_index = (selected_slot_index + 1u) % kReadbackRingSize;
 }
 
@@ -1209,17 +1369,19 @@ void NewPipelineServerRenderPath::StartPublishWorker()
         for (;;)
         {
             RetainedI420Frame i420_frame;
+            RetainedNV12Frame nv12_frame;
             RemoteVideoFrameLayout i420_layout;
             {
                 std::unique_lock lock(publish_mutex);
                 publish_cv.wait(lock, [this]() {
-                    return publish_worker_stop || pending_i420_frame.has_value();
+                    return publish_worker_stop || pending_video_frame.has_value();
                 });
-                if (publish_worker_stop && !pending_i420_frame.has_value())
+                if (publish_worker_stop && !pending_video_frame.has_value())
                     return;
-                i420_frame = std::move(pending_i420_frame->frame);
-                i420_layout = std::move(pending_i420_frame->layout);
-                pending_i420_frame.reset();
+                i420_frame = std::move(pending_video_frame->i420);
+                nv12_frame = std::move(pending_video_frame->nv12);
+                i420_layout = std::move(pending_video_frame->layout);
+                pending_video_frame.reset();
             }
 
             std::string error;
@@ -1228,10 +1390,15 @@ void NewPipelineServerRenderPath::StartPublishWorker()
                 i420_layout.metadata.source_generation != published_generation;
             const bool keyframe_ready =
                 !generation_boundary || webrtc_transport.RequestKeyframe();
-            const bool metadata_sent =
-                keyframe_ready && webrtc_transport.SendFrameMetadata(i420_layout);
-            const bool published = metadata_sent &&
-                webrtc_transport.SendI420Frame(i420_frame);
+            // Queue the video first. If transport backpressure rejects it, do
+            // not leave an orphan metadata record that can wait for a frame
+            // which was never submitted. Exact RTP/pixel-band matching still
+            // protects the inverse case where metadata submission fails.
+            const bool video_sent = keyframe_ready && (nv12_frame.IsValid()
+                ? webrtc_transport.SendNV12Frame(nv12_frame)
+                : webrtc_transport.SendI420Frame(i420_frame));
+            const bool published = video_sent &&
+                webrtc_transport.SendFrameMetadata(i420_layout);
             if (published)
                 published_generation = i420_layout.metadata.source_generation;
             else
@@ -1244,8 +1411,9 @@ void NewPipelineServerRenderPath::StartPublishWorker()
             else if (!first_packed_frame_published)
             {
                 wi::backlog::post("Server remote published first asynchronous frame: " +
-                    std::to_string(i420_frame.width) + "x" +
-                    std::to_string(i420_frame.height));
+                    std::to_string(nv12_frame.IsValid() ? nv12_frame.width : i420_frame.width) + "x" +
+                    std::to_string(nv12_frame.IsValid() ? nv12_frame.height : i420_frame.height) +
+                    (nv12_frame.IsValid() ? " native NV12" : " retained I420"));
                 first_packed_frame_published = true;
             }
         }
@@ -1268,9 +1436,27 @@ void NewPipelineServerRenderPath::QueueI420FrameForPublish(
 {
     {
         std::lock_guard lock(publish_mutex);
-        if (pending_i420_frame.has_value())
+        if (pending_video_frame.has_value())
             publish_queue_drops.fetch_add(1, std::memory_order_relaxed);
-        pending_i420_frame = PendingI420Publish{std::move(frame), layout};
+        PendingVideoPublish pending;
+        pending.i420 = std::move(frame);
+        pending.layout = layout;
+        pending_video_frame = std::move(pending);
+    }
+    publish_cv.notify_one();
+}
+
+void NewPipelineServerRenderPath::QueueNV12FrameForPublish(
+    RetainedNV12Frame&& frame, const RemoteVideoFrameLayout& layout)
+{
+    {
+        std::lock_guard lock(publish_mutex);
+        if (pending_video_frame.has_value())
+            publish_queue_drops.fetch_add(1, std::memory_order_relaxed);
+        PendingVideoPublish pending;
+        pending.nv12 = std::move(frame);
+        pending.layout = layout;
+        pending_video_frame = std::move(pending);
     }
     publish_cv.notify_one();
 }
@@ -1400,7 +1586,7 @@ void NewPipelineServerRenderPath::ApplyLatestControlPacket()
             slot.pending = false;
         {
             std::lock_guard lock(publish_mutex);
-            pending_i420_frame.reset();
+            pending_video_frame.reset();
         }
         wi::backlog::post("Server remote negotiation selected protocol=" +
             std::to_string(remote_stream_selection.protocol_version) +
@@ -1481,7 +1667,7 @@ void NewPipelineServerRenderPath::ApplyLatestControlPacket()
         for (PackedReadbackSlot& slot : packed_readback_ring)
             slot.pending = false;
         std::lock_guard lock(publish_mutex);
-        pending_i420_frame.reset();
+        pending_video_frame.reset();
     }
     last_applied_frame_id = packet.frame_id;
     last_applied_control = packet;

@@ -1188,6 +1188,23 @@ namespace wi::renderer
 		const I420AtlasPackDesc& desc,
 		wi::graphics::CommandList cmd
 	);
+	bool RGB_to_NV12_Atlas(
+		const wi::graphics::Texture& input_atlas,
+		const wi::graphics::GPUBuffer& metadata_luma,
+		const wi::graphics::GPUBuffer& output_nv12,
+		const I420AtlasPackDesc& desc,
+		wi::graphics::CommandList cmd
+	);
+	void YUV_to_RGB_Region_NV12(
+		const wi::graphics::Texture& input_nv12,
+		int input_subresource_luminance,
+		int input_subresource_chrominance,
+		const wi::graphics::Texture& output,
+		const XMUINT2& source_origin,
+		bool scalar_luma,
+		float log_hdr_maximum,
+		wi::graphics::CommandList cmd
+	);
 
 	// This performs copies from separate depth and stencil shader resource textures
 	//	into hardware depthStencil buffer that supports depth/stencil testing

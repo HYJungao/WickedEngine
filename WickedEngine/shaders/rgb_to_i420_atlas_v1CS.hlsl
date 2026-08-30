@@ -43,7 +43,7 @@ uint LoadMetadataByte(uint index)
 [numthreads(8, 8, 1)]
 void main(uint3 DTid : SV_DispatchThreadID)
 {
-    if (i420.abi_version != 1u || i420.struct_size != 48u)
+    if ((i420.abi_version != 1u && i420.abi_version != 2u) || i420.struct_size != 48u)
         return;
 
     const uint x_base = DTid.x * 4u;
@@ -68,7 +68,7 @@ void main(uint3 DTid : SV_DispatchThreadID)
 
     const uint chroma_width = i420.video_resolution.x / 2u;
     const uint chroma_height = i420.video_resolution.y / 2u;
-    if (DTid.y >= chroma_height || x_base >= i420.uv_stride)
+    if (DTid.y >= chroma_height || x_base >= chroma_width)
         return;
     uint4 u_values = 128u;
     uint4 v_values = 128u;
@@ -85,6 +85,20 @@ void main(uint3 DTid : SV_DispatchThreadID)
         u_values[lane] = uv.x;
         v_values[lane] = uv.y;
     }
-    output_i420.Store(i420.u_offset + DTid.y * i420.uv_stride + x_base, PackByte4(u_values));
-    output_i420.Store(i420.v_offset + DTid.y * i420.uv_stride + x_base, PackByte4(v_values));
+    if (i420.abi_version == 1u)
+    {
+        output_i420.Store(i420.u_offset + DTid.y * i420.uv_stride + x_base, PackByte4(u_values));
+        output_i420.Store(i420.v_offset + DTid.y * i420.uv_stride + x_base, PackByte4(v_values));
+    }
+    else
+    {
+        // NV12 stores four chroma samples as U0,V0,U1,V1,U2,V2,U3,V3.
+        const uint first = u_values.x | (v_values.x << 8u) |
+            (u_values.y << 16u) | (v_values.y << 24u);
+        const uint second = u_values.z | (v_values.z << 8u) |
+            (u_values.w << 16u) | (v_values.w << 24u);
+        const uint destination = i420.u_offset + DTid.y * i420.uv_stride + x_base * 2u;
+        output_i420.Store(destination, first);
+        output_i420.Store(destination + 4u, second);
+    }
 }

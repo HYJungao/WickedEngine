@@ -25,7 +25,7 @@ Install Node.js, then start the standalone relay before either application:
 WebRTC/signaling/start_signaling.sh
 ```
 
-On Windows use:
+On Windows 10 or newer use:
 
 ```bat
 WebRTC\signaling\start_signaling.cmd
@@ -36,11 +36,28 @@ The default endpoint and room are `ws://127.0.0.1:39876` and
 real-WebRTC path. `--webrtc_signal`, `--webrtc_room`, `--webrtc_internet`,
 `--remote_fps`, and `--remote_encoder=hardware|software` override connection,
 publication-rate, or codec defaults. `hardware` is the default. On macOS it
-prefers VideoToolbox H.264; an unavailable or failed hardware encoder restarts
-the session once with libvpx VP8. `software` forces VP8 without probing hardware.
-Windows currently reports `hardware-backend-not-built` and uses the same VP8
-fallback until the external VS2022 WebRTC package/backend is available. Protocol
-selection is not a command-line switch: peers must negotiate V3. The production
+prefers VideoToolbox H.264. On Windows the Server uses a project-owned Media
+Foundation H.264 hardware encoder when a hardware MFT is available, and the
+Client registers the matching Media Foundation hardware decoder when the GPU
+exposes an H.264 D3D11 video-decode profile. Media Foundation transforms are
+enumerated for Wicked's actual DX12 adapter LUID rather than a process-global
+default adapter. If the hardware capability probe fails, the session starts
+with libvpx VP8; a runtime H.264 codec failure reconnects once with VP8.
+`software` forces VP8 without probing a hardware encoder.
+When H.264 is negotiated on Windows/DX12, the Server publishes retained shared
+NV12 textures directly to Media Foundation and the Client consumes retained
+decoded NV12 surfaces directly from DX12. Shared GPU fences protect both surface
+rings; the path performs no raw-frame CPU readback or upload. If native sharing
+is unsupported at runtime, H.264 remains active through the retained I420
+readback/upload path. Codec failure and forced-software mode use VP8 over that
+same I420 fallback.
+The signaling room accepts one process per role. A second Client or Server now
+reports the duplicate process instead of silently appearing to join while the
+older process keeps streaming. Restart both applications after rebuilding. The
+signaling log prints the video codec order from each offer and answer (for
+example, `videoCodecs=H264,RTX,VP8`), which makes stale VP8-only processes easy
+to identify.
+Protocol selection is not a command-line switch: peers must negotiate V3. The production
 policy requests High; reduced tiers remain self-test-only until exposed through
 a persistent application setting and accepted by visual/bitrate soak.
 
@@ -256,39 +273,44 @@ reason before publishing frames. V3 is required; there is no V2 encoder,
 decoder, parser or runtime fallback.
 DDGI and reflection are GPU-packed with a Log2 mapping for linear HDR values in
 the `[0,16]` range, then restored to `RGBA16F` by the Client. AO and Shadow use
-I420 Y only with neutral chroma. A deterministic compact atlas gives every rect
+the Y/luma plane only with neutral chroma. A deterministic compact atlas gives every rect
 four texels of true edge-dilated padding to isolate linear and 4:2:0 filtering.
 
-The live I420 input path first produces four canonical RGBA8 transport
+The live transport path first produces four canonical RGBA8 transport
 surfaces (Log2 HDR for indirect buffers, replicated scalar for AO/shadow). These
 same resources drive the Server `Transport` previews and are copied into their
 authoritative rectangles in one canonical RGBA8 atlas; there is no separate
-preview-only conversion. The I420 pack consumes that atlas through one SRV, so
+preview-only conversion. The YUV pack consumes that atlas through one SRV, so
 semantic identity is expressed by atlas layout metadata rather than parallel SRV
-binding positions. The metadata semantic and encoding contract is validated before
-the Client publishes any unpacked texture. The path then performs one GPU
-atlas-to-I420 pass and one packed readback through a three-slot ring. WebRTC wraps
-the mapped planes and returns the
-slot through its release callback, so there is no second full-frame CPU copy or CPU
-RGB-to-YUV conversion. The Client retains the decoded WebRTC frame, uploads Y/U/V
-once through a buffered ring, and extracts all semantic textures with a GPU compute
-pass. Semantic output textures are persistent at a stable generation/resolution.
+binding positions. The metadata semantic and encoding contract is validated
+before the Client publishes any unpacked texture.
+
+On Windows hardware H.264, a GPU pass packs the atlas into the exact D3D12 NV12
+copy footprints, copies both planes into a retained shared NV12 texture, and
+signals a shared fence. The Media Foundation encoder opens that texture on the
+same adapter and waits on the producer value. On Client, Media Foundation output
+is GPU-copied into a retained shared NV12 ring; DX12 waits on its producer value,
+unpacks the two NV12 planes directly into persistent semantic textures, then
+signals the consumer value. These copies stay on GPU and add zero raw-frame
+readback/upload bytes. If H.264 native mode is unavailable or VP8 is negotiated,
+the existing atlas-to-I420 readback ring and retained I420 upload ring are used.
 High keeps all four semantics full resolution and same cadence. Balanced and
 Low use depth/normal-aware GPU downsample; on an unchanged control frame they
 can retain lower-frequency diffuse/AO regions in the persistent atlas so the
 inter-frame codec sees unchanged content. Descriptors carry each semantic's
 actual content frame, generation and confidence.
 
-The video luma band carries only the V3 frame identity and descriptor checksum
+The fallback video luma band carries the V3 frame identity and descriptor checksum
 needed to pair decoded pixels. The unordered, partially reliable `np.frame_meta`
 (`maxRetransmits=1`)
 DataChannel carries an explicit endian-safe V3 metadata record and descriptor
 contract. The Client retains video frames and metadata in separate bounded queues and accepts
-the newest pair whose pixel-band `frame_id` and `source_generation` match the
-DataChannel packet, regardless of which side arrived first. The decoded WebRTC/RTP
-timestamp is deliberately not used as a frame identity. Unmatched entries expire
-after one second and each queue is capped at eight
-entries; a transient unmatched frame does not discard the last accepted remote
+the newest matching pair regardless of which side arrived first. I420 frames use
+the pixel-band identity; retained native NV12 frames use the exact producer-assigned
+90 kHz RTP timestamp derived from the serialized `timestamp_usec`, avoiding a CPU
+surface map without reverting to a fuzzy clock comparison. Unmatched entries expire
+after one second; the low-latency video queue is capped at three frames and the
+metadata queue at eight entries. A transient unmatched frame does not discard the last accepted remote
 input. A matched pair is still rejected if its protocol, dimensions, layout
 checksum, descriptor checksum, generation or control-frame identity disagrees.
 
@@ -300,11 +322,13 @@ GPU profiler ranges separately expose joint downsample, I420 pack and I420 unpac
 Server Transport previews use only canonical semantic surfaces committed for the
 current transport generation; resize, reconnect, camera cut and negotiation
 boundaries invalidate stale preview availability.
-`power-efficient` and `native-surface` are separate facts. The macOS VideoToolbox
-H.264 backend is hardware accelerated but still consumes the packed frame through
-the existing CPU-addressable I420/readback path. Native NV12/Metal or DX12 surfaces
-remain follow-up work; the panel therefore continues to report
-`surface=i420-readback` even when `active=hardware`.
+`power-efficient` and `native-surface` are separate facts. Windows reports
+`surface=dx12-nv12-retained` / `d3d11-nv12-retained` only after RTC confirms H.264;
+the Server then reports `zero-raw-readback=yes` and the Client reports
+`zero-raw-upload=yes`. A native-sharing failure reports the I420 fallback while
+retaining H.264; VP8 reports the same surface fallback after codec fallback.
+The macOS VideoToolbox backend remains hardware accelerated through its existing
+CPU-addressable I420/readback path; a native Metal/CVPixelBuffer path is still open.
 
 The Server panel and Client remote status report DDGI frame/convergence state.
 Scene-generation and significant authoritative-sun changes clear Server DDGI

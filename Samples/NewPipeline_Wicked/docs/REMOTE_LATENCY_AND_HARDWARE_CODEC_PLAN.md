@@ -1,16 +1,16 @@
 # NewPipeline remote latency and hardware codec implementation plan
 
-Status: implementation landed for shared latency mechanisms and macOS Stage 5A.
-Windows hardware encoding and native GPU surfaces remain pending. The validation
-matrix below is still required before production sign-off.
+Status: implementation landed for shared latency mechanisms and Stage 5A H.264 hardware
+encoding/decoding on macOS and Windows. The Windows Stage 5B retained DX12/NV12 path is
+implemented; native Metal/CVPixelBuffer surfaces remain pending. The validation matrix
+below is still required before production sign-off.
 
-Current checkout validation:
-
-- macOS Debug and Release Server/Client builds pass;
-- Debug and Release `--transport_selftest` pass, including a real 640x360
-  VideoToolbox H.264 hardware compression-session initialization;
-- a live paired Server/Client visual run, forced runtime-failure fallback, and the
-  Windows rows remain open production-acceptance checks.
+Current checkout validation is recorded only for commands run after the final merge.
+The macOS Release Server and Client builds pass. Release `--transport_selftest` passes,
+including real 640x360 VideoToolbox H.264 initialization, V3 transport checks, and the
+native RTP identity rule. A Windows compiler and GPU are not available on this host, so
+current VS2022 builds, RTX 4060 hardware selection, live paired visuals, and forced
+runtime fallback remain explicit acceptance checks rather than inferred results.
 
 ## Approved decisions
 
@@ -91,9 +91,9 @@ reordered incremental actions.
 - The bundled macOS WebRTC archive does not contain the Objective-C H.264 factory adapter
   symbols advertised by its generated framework headers. Stage 5A therefore uses a
   direct Objective-C++ VideoToolbox implementation against WebRTC's native codec API.
-- Windows uses a separately supplied VS2022 x64 `webrtc.lib`. Its hardware-H.264 factory
-  symbols and Media Foundation surface support must be audited on Windows before choosing
-  between an existing adapter and a small platform backend.
+- Windows uses a separately supplied VS2022 x64 `webrtc.lib`. The project supplies the
+  missing Media Foundation H.264 hardware encoder and decoder adapters; the native
+  retained-surface path remains outside the supplied WebRTC archive.
 
 ## Target runtime contract
 
@@ -147,7 +147,7 @@ At minimum expose:
 - active encoder mode: `hardware`, `software`, `fallback-software`, or `unavailable`;
 - negotiated codec MIME/name and profile;
 - encoder implementation and `power_efficient` result from RTC stats;
-- input surface path: initially `i420-readback`, later `native-nv12` or platform equivalent;
+- input surface path: `i420-readback`, `dx12-nv12-retained`, or platform equivalent;
 - fallback reason, or `none`;
 - encode average, encoded frames, busy drops and publication queue drops;
 - on Client, decoder codec/implementation/power efficiency and decoded queue depth.
@@ -195,11 +195,10 @@ Touchpoints:
 - `NewPipelineWebRTCBridge.h/.cpp`: C ABI selection input and explicit codec-state stats;
 - Server and Client status panels: separate encoder, decoder and surface lines.
 
-Keep the implementation on software VP8 during this stage even when `hardware` is
-requested; report `active=fallback-software codec=VP8` with
-`fallback=hardware-backend-not-built` until a hardware backend is integrated. This
-allows parser, lifecycle propagation and panel behavior to be tested without changing
-pixels or SDP.
+This stage originally kept the implementation on software VP8 even when `hardware` was
+requested and reported `fallback=hardware-backend-not-built`. Stage 5A replaces that
+temporary state on supported macOS and Windows machines while preserving the same
+configuration and telemetry contract.
 
 Acceptance:
 
@@ -259,7 +258,10 @@ Acceptance:
   `maxRetransmits=0`.
 
 Do not accept metadata without the existing pixel-band frame ID, generation and checksum
-agreement. Do not replace matching with RTP timestamps.
+agreement on the I420 path. Native NV12 cannot map the pixel identity band, so it uses
+the exact producer-assigned RTP timestamp derived from the same serialized
+`timestamp_usec`; never replace either identity path with a fuzzy arrival-time or
+decoded-clock tolerance match.
 
 Acceptance:
 
@@ -267,7 +269,7 @@ Acceptance:
 - pair expiration and visible stale-frame duration improve relative to baseline;
 - recovery does not create a growing metadata queue under sustained loss.
 
-### Stage 5A: hardware H.264 over the existing I420 surface — macOS implemented, Windows pending
+### Stage 5A: hardware H.264 over the existing I420 surface — macOS and Windows implemented
 
 Create a platform codec-factory boundary owned by the WebRTC bridge, not RenderPath or
 scene code.
@@ -282,16 +284,22 @@ macOS implementation:
 4. Keep the already-linked VideoToolbox, CoreMedia and CoreVideo frameworks.
 5. Register VP8 decoder support on Client alongside H.264.
 
-Windows implementation:
+Windows implementation status:
 
-1. Audit the actual VS2022 `webrtc.lib` for a supported hardware H.264 factory and its
-   required Media Foundation dependencies.
-2. Prefer the packaged factory when present. Otherwise add a platform-owned Media
-   Foundation H.264 `VideoEncoderFactory`/`VideoEncoder` adapter or rebuild the pinned
-   WebRTC package with that backend enabled.
-3. Keep vendor/GPU selection capability-driven; do not add NVIDIA/AMD/Intel branches to
-   RenderPath or scene policy.
-4. Register both the H.264 decoder required by hardware mode and the existing VP8 decoder.
+1. The Server uses a project-owned Media Foundation `VideoEncoderFactory` and enumerates
+   only registered hardware H.264 encoder MFTs. It converts the existing I420 input to
+   NV12, handles asynchronous or synchronous transforms, applies low-latency CBR/keyframe
+   controls, and normalizes output to Annex-B with SPS/PPS on keyframes.
+2. The Client uses a project-owned Media Foundation `VideoDecoderFactory` and H.264
+   decoder. Capability probing requires a D3D11 H.264 video-decode profile and either a
+   registered hardware MFT or the D3D11-aware system H.264 decoder MFT.
+3. The decoder uses a D3D11 device manager, accepts asynchronous or synchronous MFTs,
+   and exposes a retained shared NV12 surface on the native path. If native sharing is
+   unavailable, it converts decoded NV12 to I420 without disabling hardware H.264.
+4. H.264 is registered ahead of the existing VP8 encoder/decoder factories. Runtime
+   hardware failure is bounded to one process-lifetime attempt before reconnecting with
+   VP8 only. Vendor/GPU selection remains capability-driven outside RenderPath and scene
+   policy.
 
 For both platforms, constrain H.264 SDP formats to a tested common profile and
 packetization mode. Hardware selection must not silently choose OpenH264 or another
@@ -311,25 +319,24 @@ Acceptance:
   keyframe;
 - no bitrate, logical resolution or quality-tier policy changes are mixed into results.
 
-### Stage 5B: native GPU surface follow-up
+### Stage 5B: native GPU surface - Windows implemented, macOS pending
 
-After Stage 5A is accepted, remove raw-frame transfers without changing the command-line
-or fallback contract:
+Remove raw-frame transfers without changing the command-line or fallback contract:
 
 - macOS: write or share the packed surface as a retained CVPixelBuffer/Metal-compatible
   NV12 resource accepted by VideoToolbox;
-- Windows: write a retained DX12/NV12 surface with an explicit fence token and pass it to
-  the hardware encoder backend;
-- Client: expose a retained native decoded surface and perform the existing semantic
-  unpack on GPU;
+- Windows Server: implemented a retained DX12/NV12 surface with an explicit shared
+  fence token and direct Media Foundation input;
+- Windows Client: implemented retained decoded NV12 surfaces, shared-fence wait/signal,
+  and direct GPU semantic unpack;
 - software fallback continues to use the current packed-I420 readback/upload path.
 
 Acceptance:
 
 - panel reports `surface=native-*` only for frames that avoid Server raw GPU-to-CPU
   readback;
-- native mode reports zero raw-frame Server readback bytes and, when Client native
-  decode lands, zero raw-frame Client upload bytes;
+- native mode reports zero raw-frame Server readback bytes and zero raw-frame Client
+  upload bytes;
 - surface-ring exhaustion drops old frames and never blocks rendering;
 - switching to software fallback releases native surfaces/fences and increments the
   transport generation before publishing VP8.
@@ -365,8 +372,8 @@ establish a native-surface path.
   and VP8 frames inside one accepted generation.
 - Remote Video V3 descriptors and the semantic I420 pixel contract remain unchanged in
   Stage 5A, so no benchmark-, scene- or asset-specific migration is required.
-- Keep the README explicit about per-platform completion; do not describe Windows
-  hardware selection as implemented before its supplied WebRTC package passes the rows.
+- Keep the README explicit about per-platform completion and distinguish Stage 5A
+  hardware codecs from the deferred native retained-surface path.
 
 ## Explicitly deferred
 

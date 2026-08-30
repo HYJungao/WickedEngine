@@ -2,6 +2,7 @@
 
 #include "NewPipelineScene.h"
 #include "NewPipelineTransport.h"
+#include "NewPipelineWindowsGPUInterop.h"
 
 #include <condition_variable>
 #include <atomic>
@@ -17,7 +18,7 @@ struct NewPipelineServerSettings
     bool ddgi_enabled = true;
     bool ddgi_debug_formal = false;
     uint32_t ddgi_ray_count = 256;
-    float remote_publish_fps = 1.0f;
+    float remote_publish_fps = 30.0f;
 };
 
 class NewPipelineServerRenderPath final : public wi::RenderPath3D
@@ -59,6 +60,7 @@ private:
     void StartPublishWorker();
     void StopPublishWorker();
     void QueueI420FrameForPublish(RetainedI420Frame&& frame, const RemoteVideoFrameLayout& layout);
+    void QueueNV12FrameForPublish(RetainedNV12Frame&& frame, const RemoteVideoFrameLayout& layout);
     void DrawUnavailablePreview(wi::graphics::CommandList cmd) const;
 
     static constexpr size_t kReadbackRingSize = 3;
@@ -78,12 +80,18 @@ private:
         wi::graphics::GPUBuffer metadata_upload;
         wi::graphics::GPUBuffer packed_gpu;
         std::shared_ptr<PackedReadbackStorage> readback;
+        std::shared_ptr<WindowsServerNV12Surface> native_surface;
+        WindowsNV12Footprint native_footprint;
+        std::shared_ptr<std::atomic_bool> native_completion_scheduled;
+        uint64_t native_consumer_fence_value = 0;
         RemoteVideoFrameLayout layout;
         uint32_t y_stride = 0;
         uint32_t uv_stride = 0;
         uint32_t u_offset = 0;
         uint32_t v_offset = 0;
         uint64_t gpu_submit_frame = 0;
+        wi::graphics::ResourceState packed_gpu_state =
+            wi::graphics::ResourceState::UNORDERED_ACCESS;
         bool pending = false;
     };
     std::array<PackedReadbackSlot, kReadbackRingSize> packed_readback_ring;
@@ -139,17 +147,20 @@ private:
     std::thread publish_worker;
     std::mutex publish_mutex;
     std::condition_variable publish_cv;
-    struct PendingI420Publish
+    struct PendingVideoPublish
     {
-        RetainedI420Frame frame;
+        RetainedI420Frame i420;
+        RetainedNV12Frame nv12;
         RemoteVideoFrameLayout layout;
     };
-    std::optional<PendingI420Publish> pending_i420_frame;
+    std::optional<PendingVideoPublish> pending_video_frame;
     std::atomic<uint64_t> publish_queue_drops{0};
     uint64_t remote_capture_count = 0;
     uint64_t remote_capture_drops = 0;
     uint64_t remote_readback_latency_drops = 0;
     uint64_t gpu_readback_bytes = 0;
+    bool native_nv12_runtime_disabled = false;
+    std::string native_nv12_runtime_failure;
     float transport_telemetry_window_seconds = 0.0f;
     uint64_t transport_telemetry_previous_bytes = 0;
     uint64_t transport_bitrate_bps = 0;
