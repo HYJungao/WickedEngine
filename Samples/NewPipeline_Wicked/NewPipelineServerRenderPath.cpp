@@ -442,9 +442,18 @@ void NewPipelineServerRenderPath::MaintainWebRTC(float dt)
         return;
     wi::backlog::post("Server WebRTC " + std::string{ToString(previous_webrtc_state)} + " -> " +
         ToString(stats.state) + (stats.status.empty() ? std::string{} : ": " + stats.status));
-    if (previous_webrtc_state == WebRTCTransportState::Connected &&
-        stats.state != WebRTCTransportState::Connected)
+    const bool leaving_connected =
+        previous_webrtc_state == WebRTCTransportState::Connected &&
+        stats.state != WebRTCTransportState::Connected;
+    const bool entering_connected =
+        stats.state == WebRTCTransportState::Connected &&
+        previous_webrtc_state != WebRTCTransportState::Connected;
+    if (leaving_connected || entering_connected)
     {
+        // A peer connection is a protocol identity boundary. Never let a new
+        // Client receive a frame selected by the previous Client's control
+        // packet, even when the Server process remains alive across reconnects.
+        transport_session_epoch.fetch_add(1, std::memory_order_acq_rel);
         for (PackedReadbackSlot& slot : packed_readback_ring)
         {
             slot.pending = false;
@@ -458,16 +467,36 @@ void NewPipelineServerRenderPath::MaintainWebRTC(float dt)
             slot.native_footprint = {};
         }
         packed_readback_write_index = 0;
+        publish_accumulator = 0.0f;
+        remote_capture_requested = false;
+        remote_stream_selection = {
+            kRemoteVideoWireVersionV3,
+            kRemoteEncodingProfileI420V3,
+            RemoteQualityTierV3::High};
+        remote_stream_selection_initialized = false;
+        pending_stream_status.reset();
+        last_applied_frame_id = 0;
+        last_applied_control = {};
+        has_last_applied_control = false;
+        camera_cut_pending = false;
+        packed_layout_width = 0;
+        packed_layout_height = 0;
         transport_preview_available_mask = 0;
         packed_layout_contract_valid = false;
+        remote_content_states = {};
+        remote_content_control_frame_id = 0;
+        remote_protocol_mismatch_logged = false;
+        ++remote_generation;
+        if (remote_generation == 0)
+            remote_generation = 1;
         std::lock_guard lock(publish_mutex);
         pending_video_frame.reset();
     }
-    if (stats.state == WebRTCTransportState::Connected &&
-        previous_webrtc_state != WebRTCTransportState::Connected)
+    if (entering_connected)
     {
         native_nv12_runtime_disabled = false;
         native_nv12_runtime_failure.clear();
+        transport_telemetry_previous_bytes = stats.compressed_bytes_sent;
     }
     previous_webrtc_state = stats.state;
 }
@@ -632,6 +661,20 @@ void NewPipelineServerRenderPath::PublishRemotePayload(float dt)
         return;
     }
 
+    const uint64_t control_frame_id =
+        last_applied_control.control_frame_id != 0
+        ? last_applied_control.control_frame_id
+        : last_applied_control.frame_id;
+    if (!remote_stream_selection_initialized ||
+        !has_last_applied_control || control_frame_id == 0)
+    {
+        // ICE/video-track connectivity precedes DataChannel negotiation. Do
+        // not build or publish an unidentifiable frame during that window.
+        publish_accumulator = 0.0f;
+        remote_capture_requested = false;
+        return;
+    }
+
     if (pending_stream_status.has_value())
     {
         // A selected profile must be announced before any frame using it can
@@ -697,6 +740,13 @@ void NewPipelineServerRenderPath::CaptureRequestedRemotePayload()
 void NewPipelineServerRenderPath::CapturePackedRemoteFrame(
     const std::array<const wi::graphics::Texture*, static_cast<size_t>(RemoteBufferSemantic::Count)>& sources)
 {
+    const uint64_t negotiated_control_frame_id =
+        last_applied_control.control_frame_id != 0
+        ? last_applied_control.control_frame_id
+        : last_applied_control.frame_id;
+    if (!remote_stream_selection_initialized ||
+        !has_last_applied_control || negotiated_control_frame_id == 0)
+        return;
     if (remote_stream_selection_initialized && remote_stream_selection.protocol_version == 0)
     {
         if (!remote_protocol_mismatch_logged)
@@ -1371,6 +1421,7 @@ void NewPipelineServerRenderPath::StartPublishWorker()
             RetainedI420Frame i420_frame;
             RetainedNV12Frame nv12_frame;
             RemoteVideoFrameLayout i420_layout;
+            uint64_t session_epoch = 0;
             {
                 std::unique_lock lock(publish_mutex);
                 publish_cv.wait(lock, [this]() {
@@ -1381,8 +1432,13 @@ void NewPipelineServerRenderPath::StartPublishWorker()
                 i420_frame = std::move(pending_video_frame->i420);
                 nv12_frame = std::move(pending_video_frame->nv12);
                 i420_layout = std::move(pending_video_frame->layout);
+                session_epoch = pending_video_frame->session_epoch;
                 pending_video_frame.reset();
             }
+
+            if (session_epoch !=
+                transport_session_epoch.load(std::memory_order_acquire))
+                continue;
 
             std::string error;
             const bool generation_boundary =
@@ -1397,14 +1453,19 @@ void NewPipelineServerRenderPath::StartPublishWorker()
             const bool video_sent = keyframe_ready && (nv12_frame.IsValid()
                 ? webrtc_transport.SendNV12Frame(nv12_frame)
                 : webrtc_transport.SendI420Frame(i420_frame));
-            const bool published = video_sent &&
+            const bool metadata_sent = video_sent &&
                 webrtc_transport.SendFrameMetadata(i420_layout);
+            const bool published = video_sent && metadata_sent;
             if (published)
                 published_generation = i420_layout.metadata.source_generation;
+            else if (!keyframe_ready)
+                error = "keyframe request was not acknowledged before generation boundary";
+            else if (!video_sent)
+                error = "video enqueue rejected: " +
+                    webrtc_transport.GetStats().status;
             else
-                error = keyframe_ready
-                    ? webrtc_transport.GetStats().status
-                    : "keyframe request was not acknowledged before generation boundary";
+                error = "frame metadata DataChannel rejected: " +
+                    webrtc_transport.GetStats().status;
             if (!published)
                 wi::backlog::post("Server remote publish failed: " +
                     (error.empty() ? std::string{"unknown transport error"} : error));
@@ -1441,6 +1502,8 @@ void NewPipelineServerRenderPath::QueueI420FrameForPublish(
         PendingVideoPublish pending;
         pending.i420 = std::move(frame);
         pending.layout = layout;
+        pending.session_epoch =
+            transport_session_epoch.load(std::memory_order_acquire);
         pending_video_frame = std::move(pending);
     }
     publish_cv.notify_one();
@@ -1456,6 +1519,8 @@ void NewPipelineServerRenderPath::QueueNV12FrameForPublish(
         PendingVideoPublish pending;
         pending.nv12 = std::move(frame);
         pending.layout = layout;
+        pending.session_epoch =
+            transport_session_epoch.load(std::memory_order_acquire);
         pending_video_frame = std::move(pending);
     }
     publish_cv.notify_one();

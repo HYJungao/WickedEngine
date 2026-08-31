@@ -152,8 +152,10 @@ private:
         RetainedI420Frame i420;
         RetainedNV12Frame nv12;
         RemoteVideoFrameLayout layout;
+        uint64_t session_epoch = 0;
     };
     std::optional<PendingVideoPublish> pending_video_frame;
+    std::atomic<uint64_t> transport_session_epoch{0};
     std::atomic<uint64_t> publish_queue_drops{0};
     uint64_t remote_capture_count = 0;
     uint64_t remote_capture_drops = 0;

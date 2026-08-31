@@ -1749,10 +1749,13 @@ bool WebRTCVideoTransport::SendI420Frame(const RetainedI420Frame& frame)
             impl->disconnected_frame_drops.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
-    std::unique_lock lock(impl->bridge_mutex, std::try_to_lock);
-    if (!lock.owns_lock() || impl->bridge == nullptr || !impl->server)
+    // This API is called by the dedicated latest-only publication worker, not
+    // the render thread. A short stats/lifecycle lock collision is therefore
+    // backpressure, not a failed frame, and can safely wait for the bridge.
+    std::lock_guard lock(impl->bridge_mutex);
+    if (impl->bridge == nullptr || !impl->server)
     {
-        impl->busy_frame_drops.fetch_add(1, std::memory_order_relaxed);
+        impl->disconnected_frame_drops.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
     auto* lifetime = new std::shared_ptr<void>(frame.frame_lifetime);
@@ -1782,11 +1785,14 @@ bool WebRTCVideoTransport::SendNV12Frame(const RetainedNV12Frame& frame)
             impl->disconnected_frame_drops.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
-    std::unique_lock lock(impl->bridge_mutex, std::try_to_lock);
-    if (!lock.owns_lock() || impl->bridge == nullptr || !impl->server ||
+    // Native publication uses the same worker as I420 publication, so it can
+    // wait out the brief bridge stats lock without touching frame cadence on
+    // the render thread.
+    std::lock_guard lock(impl->bridge_mutex);
+    if (impl->bridge == nullptr || !impl->server ||
         np_webrtc_bridge_supports_native_nv12(impl->bridge) != 1)
     {
-        impl->busy_frame_drops.fetch_add(1, std::memory_order_relaxed);
+        impl->disconnected_frame_drops.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
     struct Lifetime
@@ -1827,8 +1833,10 @@ bool WebRTCVideoTransport::SendFrameMetadata(const RemoteVideoFrameLayout& layou
     std::vector<uint8_t> bytes;
     if (!EncodeDownstreamFrameMetadataBytes(layout, bytes))
         return false;
-    std::unique_lock lock(impl->bridge_mutex, std::try_to_lock);
-    if (!lock.owns_lock() || impl->bridge == nullptr || !impl->server)
+    // Keep video and its exact identity metadata on the same serialized
+    // publication path. The latest-only queue already bounds upstream delay.
+    std::lock_guard lock(impl->bridge_mutex);
+    if (impl->bridge == nullptr || !impl->server)
         return false;
     return np_webrtc_bridge_send_frame_metadata(
         impl->bridge, bytes.data(), bytes.size()) == 1;
@@ -1974,9 +1982,13 @@ bool WebRTCVideoTransport::SupportsNativeNV12() const
 {
     if (!impl)
         return false;
-    std::unique_lock lock(impl->bridge_mutex, std::try_to_lock);
-    return lock.owns_lock() && impl->bridge != nullptr && impl->server &&
-        np_webrtc_bridge_supports_native_nv12(impl->bridge) == 1;
+    // The render thread must not interpret a transient bridge-mutex collision
+    // as a codec capability change. The lifecycle thread already publishes an
+    // atomic stats snapshot after querying the bridge; native_codec is true
+    // only for the confirmed retained NV12 surface path.
+    const WebRTCTransportStats stats = GetStats();
+    return stats.state == WebRTCTransportState::Connected &&
+        stats.native_codec;
 }
 
 void WebRTCVideoTransport::ReportNativeNV12Failure()

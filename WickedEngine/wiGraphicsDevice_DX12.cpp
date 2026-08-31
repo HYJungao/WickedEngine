@@ -7926,7 +7926,12 @@ std::mutex queue_locker;
 			? destination->desc.height : destination->desc.height / 2u;
 		const uint64_t row_size = static_cast<uint64_t>(width) *
 			(destination_plane == 0 ? 1u : 2u);
-		const uint64_t required_size = static_cast<uint64_t>(source_row_pitch) * height;
+		// GetCopyableFootprints() pads the distance between rows, but the final
+		// row only occupies RowSizeInBytes. In particular, the UV plane is the
+		// final subresource in an NV12 allocation, so requiring a complete padded
+		// row after its last row rejects the legal pTotalBytes returned by D3D12.
+		const uint64_t required_size =
+			static_cast<uint64_t>(source_row_pitch) * (height - 1u) + row_size;
 		if (width != expected_width || height != expected_height ||
 			row_size > source_row_pitch || source_offset > source->desc.size ||
 			required_size > source->desc.size - source_offset)
