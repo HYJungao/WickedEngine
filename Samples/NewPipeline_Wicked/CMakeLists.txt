@@ -68,6 +68,7 @@ set(NEWPIPELINE_SHARED_HEADERS
     NewPipelineTransport.h
     NewPipelineWebRTCBridge.h
     NewPipelineWebRTCWindowsCodecFactory.h
+    NewPipelineWindowsD3DInterop.h
     NewPipelineWindowsGPUInterop.h
     NewPipelineScene.h
     NewPipelineWindowsHost.h

@@ -27,12 +27,14 @@ namespace
 // encode/decode and scheduling jitter before falling back to local rendering.
 constexpr float kRemoteStaleTimeoutSeconds = 5.0f;
 constexpr uint64_t kMaxRemoteFrameAgeUsec = 5'000'000;
-constexpr uint64_t kRemotePairTimeoutUsec = 1'000'000;
+constexpr uint64_t kRemotePairTimeoutUsec = 3'000'000;
 // This queue also owns retained native decoder surfaces. Keep it below the
 // decoder's 8-slot ring so unmatched metadata can never stop decode progress.
 constexpr size_t kMaxPendingRemotePairs = 3;
-constexpr size_t kMaxPendingRemoteMetadata = 8;
-constexpr size_t kMaxMetadataReceivesPerTick = 16;
+// Metadata arrives ahead of hardware-decoded video. Mirror the bridge's
+// two-second 60 FPS window; the time-based prune remains the final bound.
+constexpr size_t kMaxPendingRemoteMetadata = 128;
+constexpr size_t kMaxMetadataReceivesPerTick = 64;
 constexpr float kRemoteFullQualitySeconds = 1.5f;
 constexpr float kElasticBlendAttackSpeed = 5.0f;
 constexpr float kElasticBlendReleaseSpeed = 10.0f;
@@ -1169,15 +1171,18 @@ bool NewPipelineClientRenderPath::TryMatchRemoteVideoFrame(
             const RemoteFrameMetadata& channel_metadata =
                 downstream_metadata_cache[metadata_index].metadata;
             // Native surfaces do not contain the in-band pixel metadata used
-            // by I420. The producer therefore stamps the video frame with an
-            // RTP timestamp deterministically derived from the serialized
-            // capture timestamp. RTP equality is the native frame identity;
-            // a wall-clock tolerance can pair adjacent 30 FPS frames and bind
-            // the wrong source_control_frame_id to the decoded texture.
+            // by I420. WebRTC applies a session-random offset to RTP timestamps,
+            // so the sender's zero-based RTP value cannot be compared directly
+            // with the decoded frame. The hardware H264 path carries the
+            // original capture timestamp in-band in SEI; exact millisecond
+            // equality remains unique at the supported frame rates.
             if (pending_video.frame.IsNativeNV12())
             {
-                if (pending_video.native_rtp_timestamp !=
-                    RemoteVideoRtpTimestamp(channel_metadata.timestamp_usec))
+                const int64_t capture_timestamp_usec =
+                    pending_video.frame.nv12.timestamp_usec;
+                if (capture_timestamp_usec < 0 ||
+                    static_cast<uint64_t>(capture_timestamp_usec) / 1000u !=
+                        channel_metadata.timestamp_usec / 1000u)
                     continue;
             }
             else
@@ -4168,7 +4173,6 @@ void NewPipelineClientRenderPath::AcceptRemoteVideoFrame(
 
 void NewPipelineClientRenderPath::CommitAcceptedRemoteMetadata(const RemoteFrameMetadata& metadata)
 {
-
     if (remote_consume.accepted_valid && remote_consume.accepted_generation == metadata.source_generation)
     {
         remote_consume.history_frame_id = remote_consume.accepted_frame_id;
@@ -4278,7 +4282,7 @@ void NewPipelineClientRenderPath::AcquireRemoteVideoFrame(float dt)
         {
             if (!remote_consume.accepted_valid)
                 remote_consume.invalid_reason =
-                    "waiting for matching video/RTP frame identity";
+                    "waiting for matching video/capture-time frame identity";
         }
         else if (!pending_remote_video_frames.empty())
         {
@@ -4320,9 +4324,9 @@ void NewPipelineClientRenderPath::AcquireRemoteVideoFrame(float dt)
     const bool agrees = retained_frame.IsNativeNV12()
         ? (video_layout.video_width == retained_frame.nv12.width &&
             video_layout.video_height == retained_frame.nv12.height &&
-            retained_frame.nv12.rtp_timestamp ==
-                RemoteVideoRtpTimestamp(
-                    video_layout.metadata.timestamp_usec))
+            retained_frame.nv12.timestamp_usec >= 0 &&
+            static_cast<uint64_t>(retained_frame.nv12.timestamp_usec) / 1000u ==
+                video_layout.metadata.timestamp_usec / 1000u)
         : (DecodeRemoteVideoFrameLayout(
                 retained_frame.i420, pixel_layout, &error) &&
             video_layout.protocol_version == pixel_layout.protocol_version &&
@@ -4339,7 +4343,7 @@ void NewPipelineClientRenderPath::AcquireRemoteVideoFrame(float dt)
     {
         ++downstream_metadata_mismatches;
         InvalidateRemote(retained_frame.IsNativeNV12()
-            ? "RTP/frame-metadata mismatch"
+            ? "capture-time/frame-metadata mismatch"
             : "pixel-band/frame-metadata mismatch");
         return;
     }

@@ -81,7 +81,11 @@ constexpr size_t kMaxDataChannelBufferedBytes = 1u * 1024u * 1024u;
 // render thread lets the receive queue retain every surface, so the decoder
 // cannot produce the ninth frame that would evict/release the first one.
 constexpr size_t kMaxReceiveVideoQueueDepth = 3u;
-constexpr size_t kMaxReceiveMetadataQueueDepth = 8u;
+// Metadata is published before the matching frame has passed through hardware
+// encode, RTP jitter buffering and hardware decode. Keep more than two seconds
+// at the maximum supported 60 FPS so transport latency cannot evict the exact
+// SEI identity before its video frame arrives.
+constexpr size_t kMaxReceiveMetadataQueueDepth = 128u;
 constexpr uint32_t kMaxVideoDimension = 8192;
 // The V3 video frame is a semantic data atlas rather than a camera image. Let congestion
 // control drop frames, but never silently downscale it because that destroys the
@@ -1930,7 +1934,14 @@ private:
         received.width = static_cast<uint32_t>(retained->width());
         received.height = static_cast<uint32_t>(retained->height());
         received.rtp_timestamp = frame.rtp_timestamp();
+#if defined(_WIN32)
+        received.timestamp_usec = native &&
+                native_surface.source_timestamp_usec > 0
+            ? native_surface.source_timestamp_usec
+            : frame.timestamp_us();
+#else
         received.timestamp_usec = frame.timestamp_us();
+#endif
         received.buffer = std::move(retained);
         {
             std::lock_guard<std::mutex> lock(video_mutex_);
@@ -2224,6 +2235,7 @@ extern "C" int np_webrtc_bridge_send_nv12_surface(
     surface.producer_fence_value = producer_fence_value;
     surface.consumer_fence_value = consumer_fence_value;
     surface.adapter_luid = adapter_luid;
+    surface.source_timestamp_usec = timestamp_usec;
     auto completion = [completion_scheduled_callback,
                           completion_scheduled_context]() {
         if (completion_scheduled_callback)
@@ -2391,7 +2403,9 @@ extern "C" int np_webrtc_video_frame_get_nv12_surface(
     *adapter_luid = surface.adapter_luid;
     *rtp_timestamp = retained->frame.rtp_timestamp;
     if (timestamp_usec)
-        *timestamp_usec = retained->frame.timestamp_usec;
+        *timestamp_usec = surface.source_timestamp_usec > 0
+            ? surface.source_timestamp_usec
+            : retained->frame.timestamp_usec;
     return 1;
 #else
     (void)retained; (void)width; (void)height; (void)texture_shared_handle;

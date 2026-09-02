@@ -1,6 +1,8 @@
 #include "NewPipelineServerApp.h"
 #include "NewPipelineWindowsHost.h"
 
+#include <cstdio>
+
 #if defined(_WIN32)
 int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR command_line, int show_command)
 {
@@ -10,7 +12,10 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR command_line, int sh
         if (std::string{arguments.Data()[i]} == "--transport_selftest")
         {
             std::string error;
-            return wicked_newpipeline::ValidateRemoteTransportSelfTest(&error) ? 0 : 1;
+            if (wicked_newpipeline::ValidateRemoteTransportSelfTest(&error))
+                return 0;
+            std::fprintf(stderr, "%s\n", error.c_str());
+            return 1;
         }
     }
     wicked_newpipeline::NewPipelineServerApp application;

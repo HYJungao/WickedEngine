@@ -1,4 +1,5 @@
 #include "NewPipelineWebRTCWindowsCodecFactory.h"
+#include "NewPipelineWindowsD3DInterop.h"
 
 #if defined(_WIN32)
 
@@ -29,6 +30,7 @@
 #include <cctype>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <memory>
@@ -409,6 +411,98 @@ bool CreateD3D11VideoDevice(
     return true;
 }
 
+HRESULT ValidateD3D11CompatibleNV12Profile(
+    ID3D11Device* d3d11_device,
+    ID3D12Device* d3d12_device,
+    UINT d3d11_bind_flags)
+{
+    if (d3d11_device == nullptr || d3d12_device == nullptr)
+        return E_INVALIDARG;
+
+    ComPtr<ID3D12Resource> resource;
+    HRESULT status =
+        wicked_newpipeline::CreateWindowsD3D11CompatibleNV12Texture(
+            d3d12_device, 64, 32, d3d11_bind_flags, &resource);
+    HANDLE shared_handle = nullptr;
+    if (SUCCEEDED(status))
+    {
+        status = d3d12_device->CreateSharedHandle(
+            resource.Get(), nullptr, GENERIC_ALL, nullptr, &shared_handle);
+    }
+
+    ComPtr<ID3D11Device1> device1;
+    ComPtr<ID3D11Texture2D> opened_texture;
+    if (SUCCEEDED(status))
+        status = d3d11_device->QueryInterface(IID_PPV_ARGS(&device1));
+    if (SUCCEEDED(status))
+    {
+        status = device1->OpenSharedResource1(
+            shared_handle, IID_PPV_ARGS(&opened_texture));
+    }
+    if (shared_handle != nullptr)
+        CloseHandle(shared_handle);
+    if (FAILED(status))
+        return status;
+
+    D3D11_TEXTURE2D_DESC opened_desc = {};
+    opened_texture->GetDesc(&opened_desc);
+    if (opened_desc.Width != 64 || opened_desc.Height != 32 ||
+        opened_desc.Format != DXGI_FORMAT_NV12 ||
+        (opened_desc.BindFlags & d3d11_bind_flags) != d3d11_bind_flags)
+        return E_UNEXPECTED;
+    return S_OK;
+}
+
+HRESULT ValidateD3D11D3D12NV12Sharing(
+    uint64_t adapter_luid,
+    bool validate_encoder_profile,
+    bool validate_decoder_profile,
+    const char** failed_profile)
+{
+    if (failed_profile != nullptr)
+        *failed_profile = nullptr;
+    if (!validate_encoder_profile && !validate_decoder_profile)
+        return S_OK;
+
+    ComPtr<ID3D11Device> d3d11_device;
+    ComPtr<ID3D11DeviceContext> d3d11_context;
+    if (!CreateD3D11VideoDevice(
+            d3d11_device, d3d11_context, adapter_luid))
+        return E_FAIL;
+
+    ComPtr<IDXGIDevice> dxgi_device;
+    ComPtr<IDXGIAdapter> adapter;
+    ComPtr<ID3D12Device> d3d12_device;
+    HRESULT status = d3d11_device.As(&dxgi_device);
+    if (SUCCEEDED(status))
+        status = dxgi_device->GetAdapter(&adapter);
+    if (SUCCEEDED(status))
+    {
+        status = D3D12CreateDevice(
+            adapter.Get(), D3D_FEATURE_LEVEL_11_0,
+            IID_PPV_ARGS(&d3d12_device));
+    }
+    if (SUCCEEDED(status) && validate_decoder_profile)
+    {
+        if (failed_profile != nullptr)
+            *failed_profile = "decoder";
+        status = ValidateD3D11CompatibleNV12Profile(
+            d3d11_device.Get(), d3d12_device.Get(),
+            D3D11_BIND_SHADER_RESOURCE);
+    }
+    if (SUCCEEDED(status) && validate_encoder_profile)
+    {
+        if (failed_profile != nullptr)
+            *failed_profile = "encoder";
+        status = ValidateD3D11CompatibleNV12Profile(
+            d3d11_device.Get(), d3d12_device.Get(),
+            D3D11_BIND_VIDEO_ENCODER);
+    }
+    if (SUCCEEDED(status) && failed_profile != nullptr)
+        *failed_profile = nullptr;
+    return status;
+}
+
 bool D3D11DeviceSupportsH264Decode(ID3D11Device* device)
 {
     if (device == nullptr)
@@ -565,6 +659,127 @@ bool NormalizeH264Sample(
     }
     AppendAnnexBNal(output, data, size);
     return true;
+}
+
+// user_data_unregistered UUID for the stable source timestamp carried beside
+// the compressed picture. capture_time_ms_ is local WebRTC timing metadata and
+// is reconstructed on the receiver, so it cannot identify the matching
+// DataChannel packet across a real RTP session.
+constexpr uint8_t kFrameIdentityUuid[16] = {
+    0x57, 0x49, 0x43, 0x4B, 0x45, 0x44, 0x2D, 0x4E,
+    0x50, 0x2D, 0x46, 0x52, 0x41, 0x4D, 0x45, 0x31,
+};
+
+void PrependFrameIdentitySEI(
+    std::vector<uint8_t>& annex_b, int64_t source_timestamp_usec)
+{
+    if (source_timestamp_usec <= 0)
+        return;
+
+    std::vector<uint8_t> rbsp;
+    rbsp.reserve(28);
+    rbsp.push_back(5); // user_data_unregistered
+    rbsp.push_back(25); // UUID + version + uint64 timestamp
+    rbsp.insert(rbsp.end(), std::begin(kFrameIdentityUuid),
+        std::end(kFrameIdentityUuid));
+    rbsp.push_back(1); // payload version
+    const uint64_t timestamp = static_cast<uint64_t>(source_timestamp_usec);
+    for (uint32_t shift = 0; shift < 64; shift += 8)
+        rbsp.push_back(static_cast<uint8_t>(timestamp >> shift));
+    rbsp.push_back(0x80); // rbsp_trailing_bits
+
+    std::vector<uint8_t> nal;
+    nal.reserve(rbsp.size() + 4);
+    nal.push_back(0x06); // SEI NAL
+    uint32_t consecutive_zeroes = 0;
+    for (const uint8_t byte : rbsp)
+    {
+        if (consecutive_zeroes >= 2 && byte <= 0x03)
+        {
+            nal.push_back(0x03);
+            consecutive_zeroes = 0;
+        }
+        nal.push_back(byte);
+        consecutive_zeroes = byte == 0 ? consecutive_zeroes + 1 : 0;
+    }
+
+    std::vector<uint8_t> complete;
+    complete.reserve(sizeof(kAnnexBStartCode) + nal.size() + annex_b.size());
+    AppendAnnexBNal(complete, nal.data(), nal.size());
+    complete.insert(complete.end(), annex_b.begin(), annex_b.end());
+    annex_b = std::move(complete);
+}
+
+std::optional<int64_t> ParseFrameIdentitySEI(
+    const uint8_t* data, size_t size)
+{
+    std::vector<uint8_t> annex_b;
+    if (!NormalizeH264Sample(data, size, annex_b))
+        return std::nullopt;
+    for (const NalUnit& unit : SplitAnnexB(annex_b.data(), annex_b.size()))
+    {
+        if (unit.size <= 1 || (unit.data[0] & 0x1fu) != 6)
+            continue;
+
+        std::vector<uint8_t> rbsp;
+        rbsp.reserve(unit.size - 1);
+        uint32_t consecutive_zeroes = 0;
+        for (size_t index = 1; index < unit.size; ++index)
+        {
+            const uint8_t byte = unit.data[index];
+            if (consecutive_zeroes >= 2 && byte == 0x03)
+            {
+                consecutive_zeroes = 0;
+                continue;
+            }
+            rbsp.push_back(byte);
+            consecutive_zeroes = byte == 0 ? consecutive_zeroes + 1 : 0;
+        }
+
+        size_t cursor = 0;
+        while (cursor < rbsp.size())
+        {
+            uint32_t payload_type = 0;
+            while (cursor < rbsp.size() && rbsp[cursor] == 0xff)
+            {
+                payload_type += 0xff;
+                ++cursor;
+            }
+            if (cursor >= rbsp.size())
+                break;
+            payload_type += rbsp[cursor++];
+
+            size_t payload_size = 0;
+            while (cursor < rbsp.size() && rbsp[cursor] == 0xff)
+            {
+                payload_size += 0xff;
+                ++cursor;
+            }
+            if (cursor >= rbsp.size())
+                break;
+            payload_size += rbsp[cursor++];
+            if (payload_size > rbsp.size() - cursor)
+                break;
+
+            if (payload_type == 5 && payload_size >= 25 &&
+                std::equal(std::begin(kFrameIdentityUuid),
+                    std::end(kFrameIdentityUuid), rbsp.begin() + cursor) &&
+                rbsp[cursor + 16] == 1)
+            {
+                uint64_t timestamp = 0;
+                for (uint32_t byte = 0; byte < 8; ++byte)
+                {
+                    timestamp |= static_cast<uint64_t>(
+                        rbsp[cursor + 17 + byte]) << (byte * 8);
+                }
+                if (timestamp > 0 &&
+                    timestamp <= static_cast<uint64_t>(INT64_MAX))
+                    return static_cast<int64_t>(timestamp);
+            }
+            cursor += payload_size;
+        }
+    }
+    return std::nullopt;
 }
 
 bool ParseAvcConfigurationRecord(
@@ -751,6 +966,7 @@ public:
                 (adapter_luid_ != 0 && native_surface.adapter_luid != adapter_luid_))
                 return WEBRTC_VIDEO_CODEC_ERR_PARAMETER;
             pending.native_buffer = source_buffer;
+            pending.source_timestamp_usec = native_surface.source_timestamp_usec;
             if (failure_)
                 failure_->native_frames.fetch_add(1, std::memory_order_relaxed);
         }
@@ -777,6 +993,8 @@ public:
 
         pending.rtp_timestamp = frame.rtp_timestamp();
         pending.timestamp_usec = frame.timestamp_us();
+        if (pending.source_timestamp_usec <= 0)
+            pending.source_timestamp_usec = pending.timestamp_usec;
         pending.force_keyframe =
             force_next_keyframe_.exchange(false, std::memory_order_acq_rel);
         if (frame_types != nullptr)
@@ -832,6 +1050,7 @@ private:
         webrtc::scoped_refptr<webrtc::VideoFrameBuffer> native_buffer;
         uint32_t rtp_timestamp = 0;
         int64_t timestamp_usec = 0;
+        int64_t source_timestamp_usec = 0;
         bool force_keyframe = false;
     };
 
@@ -840,6 +1059,7 @@ private:
         LONGLONG sample_time = 0;
         uint32_t rtp_timestamp = 0;
         int64_t timestamp_usec = 0;
+        int64_t source_timestamp_usec = 0;
         webrtc::scoped_refptr<webrtc::VideoFrameBuffer> native_buffer;
         ComPtr<ID3D11Fence> native_fence;
         uint64_t native_consumer_fence_value = 0;
@@ -1324,6 +1544,7 @@ private:
         {
             submitted_frames_.push_back({sample_time,
                 frame.rtp_timestamp, frame.timestamp_usec,
+                frame.source_timestamp_usec,
                 frame.native_buffer, native_fence,
                 native_consumer_fence_value});
             if (submitted_frames_.size() > kMaxSubmittedFrames)
@@ -1448,6 +1669,9 @@ private:
                 break;
         }
         submitted_frames_.erase(submitted_frames_.begin(), std::next(metadata));
+
+        PrependFrameIdentitySEI(
+            annex_b, frame_metadata.source_timestamp_usec);
 
         webrtc::EncodedImage image;
         image.SetEncodedData(webrtc::EncodedImageBuffer::Create(
@@ -1803,7 +2027,8 @@ public:
         frame.width = width;
         frame.height = height;
         frame.rtp_timestamp = input.RtpTimestamp();
-        frame.timestamp_usec = input.capture_time_ms_ * 1000;
+        frame.timestamp_usec = ParseFrameIdentitySEI(input.data(), input.size())
+            .value_or(input.capture_time_ms_ * 1000);
         frame.keyframe = input.IsKey();
 
         bool overflow = false;
@@ -2023,8 +2248,11 @@ private:
         {
             VARIANT value;
             VariantInit(&value);
-            value.vt = VT_BOOL;
-            value.boolVal = VARIANT_TRUE;
+            // The Media Foundation H264 decoder is the documented exception
+            // to the nominal VT_BOOL low-latency contract: it requires VT_UI4.
+            // AVDecVideoAcceleration_H264 is also a VT_UI4 property.
+            value.vt = VT_UI4;
+            value.ulVal = TRUE;
             codec_api->SetValue(&CODECAPI_AVDecVideoAcceleration_H264, &value);
             codec_api->SetValue(&CODECAPI_AVLowLatencyMode, &value);
             VariantClear(&value);
@@ -2391,28 +2619,11 @@ private:
         }
 
         auto slot = std::make_shared<DecodedSurfaceSlot>();
-        D3D12_HEAP_PROPERTIES heap = {};
-        heap.Type = D3D12_HEAP_TYPE_DEFAULT;
-        heap.CreationNodeMask = 1;
-        heap.VisibleNodeMask = 1;
-        D3D12_RESOURCE_DESC desc = {};
-        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        desc.Width = width;
-        desc.Height = height;
-        desc.DepthOrArraySize = 1;
-        desc.MipLevels = 1;
-        desc.Format = DXGI_FORMAT_NV12;
-        desc.SampleDesc.Count = 1;
-        desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
         uint32_t failure_stage = 1;
-        HRESULT status = d3d12_device_->CreateCommittedResource(
-            &heap,
-            D3D12_HEAP_FLAG_SHARED,
-            &desc,
-            D3D12_RESOURCE_STATE_COMMON,
-            nullptr,
-            IID_PPV_ARGS(&slot->shared_texture));
+        HRESULT status =
+            wicked_newpipeline::CreateWindowsD3D11CompatibleNV12Texture(
+                d3d12_device_.Get(), width, height,
+                D3D11_BIND_SHADER_RESOURCE, &slot->shared_texture);
         if (SUCCEEDED(status))
         {
             failure_stage = 2;
@@ -2460,7 +2671,8 @@ private:
     }
 
     webrtc::scoped_refptr<webrtc::VideoFrameBuffer> RetainDXGINV12(
-        IMFDXGIBuffer* dxgi_buffer, uint32_t width, uint32_t height)
+        IMFDXGIBuffer* dxgi_buffer, uint32_t width, uint32_t height,
+        int64_t source_timestamp_usec)
     {
         if (dxgi_buffer == nullptr || !d3d_context4_ || adapter_luid_ == 0)
             return nullptr;
@@ -2529,6 +2741,7 @@ private:
         surface.producer_fence_value = producer_value;
         surface.consumer_fence_value = consumer_value;
         surface.adapter_luid = adapter_luid_;
+        surface.source_timestamp_usec = source_timestamp_usec;
         // The render path normally signals consumer_value after its D3D12
         // unpack. A decoded frame can also be superseded in WebRTC's receive
         // queue or in the RTP/metadata pairing queue before it ever reaches
@@ -2694,7 +2907,9 @@ private:
         ComPtr<IMFDXGIBuffer> dxgi_buffer;
         if (SUCCEEDED(buffer.As(&dxgi_buffer)))
         {
-            decoded_buffer = RetainDXGINV12(dxgi_buffer.Get(), width, height);
+            decoded_buffer = RetainDXGINV12(
+                dxgi_buffer.Get(), width, height,
+                frame_metadata.timestamp_usec);
             // A DXGI-backed decoder output must remain valid even when native
             // cross-API retention is unavailable (for example, a missing LUID
             // or a transient shared-surface allocation failure). Falling back
@@ -3313,6 +3528,7 @@ extern "C" int np_validate_windows_video_codec_factories(
     native_test_surface.producer_fence_value = 3;
     native_test_surface.consumer_fence_value = 4;
     native_test_surface.adapter_luid = 5;
+    native_test_surface.source_timestamp_usec = 123456789;
     auto native_test = np_create_windows_native_nv12_buffer(
         native_test_surface,
         [&native_release_count]() { native_release_count.fetch_add(1); },
@@ -3324,7 +3540,8 @@ extern "C" int np_validate_windows_video_codec_factories(
             native_test.get(), native_test_roundtrip) ||
         native_test_roundtrip.texture_shared_handle !=
             native_test_surface.texture_shared_handle ||
-        native_test_roundtrip.consumer_fence_value != 4)
+        native_test_roundtrip.consumer_fence_value != 4 ||
+        native_test_roundtrip.source_timestamp_usec != 123456789)
         return fail("Windows retained NV12 frame-buffer roundtrip failed");
     np_mark_windows_native_nv12_completion_scheduled(native_test.get());
     np_mark_windows_native_nv12_completion_scheduled(native_test.get());
@@ -3339,6 +3556,15 @@ extern "C" int np_validate_windows_video_codec_factories(
     if (invalid_native_test || native_release_count.load() != 2 ||
         native_completion_count.load() != 1)
         return fail("Windows invalid retained NV12 surface leaked its release callback");
+
+    std::vector<uint8_t> identity_test = {
+        0, 0, 0, 1, 0x65, 0x88, 0x84,
+    };
+    PrependFrameIdentitySEI(identity_test, 123456789);
+    const std::optional<int64_t> identity_timestamp =
+        ParseFrameIdentitySEI(identity_test.data(), identity_test.size());
+    if (!identity_timestamp || *identity_timestamp != 123456789)
+        return fail("Windows H264 frame-identity SEI roundtrip failed");
 
     NPWindowsVideoCodecFactories software =
         np_create_windows_video_codec_factories(false, 0);
@@ -3361,6 +3587,21 @@ extern "C" int np_validate_windows_video_codec_factories(
             true, validation_adapter_luid);
     if (!factories.encoder || !factories.decoder)
         return fail("Windows hardware codec factory construction failed");
+    const char* failed_shared_profile = nullptr;
+    const HRESULT shared_surface_status = ValidateD3D11D3D12NV12Sharing(
+            validation_adapter_luid,
+            factories.hardware_encoder_available,
+            factories.hardware_decoder_available,
+            &failed_shared_profile);
+    if (FAILED(shared_surface_status))
+    {
+        char message[128] = {};
+        std::snprintf(message, sizeof(message),
+            "Windows D3D11/D3D12 NV12 %s shared-surface self-test failed: 0x%08X",
+            failed_shared_profile != nullptr ? failed_shared_profile : "device",
+            static_cast<uint32_t>(shared_surface_status));
+        return fail(message);
+    }
     const auto encoder_formats = factories.encoder->GetSupportedFormats();
     const bool has_h264_encoder = std::any_of(
         encoder_formats.begin(), encoder_formats.end(), IsH264);

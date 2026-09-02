@@ -1,6 +1,7 @@
 #include "NewPipelineWindowsGPUInterop.h"
 
 #include "NewPipelineTransport.h"
+#include "NewPipelineWindowsD3DInterop.h"
 
 #include <string_view>
 
@@ -43,6 +44,7 @@ wi::graphics::GraphicsDevice_DX12* GetDX12Device()
 
 struct ServerState
 {
+    ComPtr<ID3D12Resource> texture;
     ComPtr<ID3D12Fence> fence;
     HANDLE fence_handle = nullptr;
     HANDLE texture_handle = nullptr;
@@ -103,19 +105,24 @@ bool EnsureWindowsServerNV12Surface(
         desc.height = height;
         desc.format = wi::graphics::Format::NV12;
         desc.bind_flags = wi::graphics::BindFlag::NONE;
-        desc.misc_flags = wi::graphics::ResourceMiscFlag::SHARED;
-        // D3D12 owns the allocation and Media Foundation's D3D11 device opens
-        // its NT handle. This is the documented D3D11/D3D12 interop direction
-        // and avoids relying on incompatible D3D11 shared-resource flags.
         desc.layout = wi::graphics::ResourceState::COMMON;
-        if (!device->CreateTexture(&desc, nullptr, &replacement.texture) ||
-            replacement.texture.shared_handle == nullptr)
+        HRESULT status = CreateWindowsD3D11CompatibleNV12Texture(
+            device->GetD3D12Device(), width, height,
+            D3D11_BIND_VIDEO_ENCODER,
+            &state->texture);
+        if (SUCCEEDED(status))
         {
-            SetError(error, "DX12 shared NV12 texture creation failed");
+            status = device->GetD3D12Device()->CreateSharedHandle(
+                state->texture.Get(), nullptr, GENERIC_ALL, nullptr,
+                &state->texture_handle);
+        }
+        if (FAILED(status) || state->texture_handle == nullptr ||
+            !device->OpenSharedTexture(
+                state->texture_handle, &desc, &replacement.texture))
+        {
+            SetError(error, "D3D11-compatible DX12 NV12 texture creation failed");
             return false;
         }
-        state->texture_handle = static_cast<HANDLE>(
-            replacement.texture.shared_handle);
 
         if (FAILED(device->GetD3D12Device()->CreateFence(
                 0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&state->fence))) ||

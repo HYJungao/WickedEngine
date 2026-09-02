@@ -22,6 +22,10 @@ struct NPWindowsNativeNV12Surface
     uint64_t producer_fence_value = 0;
     uint64_t consumer_fence_value = 0;
     uint64_t adapter_luid = 0;
+    // Original producer timestamp. WebRTC may rewrite the VideoFrame capture
+    // time before Encode(), so native frames retain their stable identity in
+    // the buffer itself.
+    int64_t source_timestamp_usec = 0;
 };
 
 webrtc::scoped_refptr<webrtc::VideoFrameBuffer>
