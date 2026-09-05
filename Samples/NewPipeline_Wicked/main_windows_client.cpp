@@ -1,10 +1,24 @@
 #include "NewPipelineClientApp.h"
 #include "NewPipelineWindowsHost.h"
 
+#include <cstdio>
+
 #if defined(_WIN32)
 int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR command_line, int show_command)
 {
     auto arguments = wicked_newpipeline::GetWindowsCommandLineArguments();
+    for (int i = 1; i < arguments.Count(); ++i)
+    {
+        if (std::string{arguments.Data()[i]} == "--transport_selftest")
+        {
+            std::string error;
+            if (wicked_newpipeline::ValidateRemoteTransportSelfTest(&error) &&
+                wicked_newpipeline::ValidateRemoteClientPairingSelfTest(&error))
+                return 0;
+            std::fprintf(stderr, "%s\n", error.c_str());
+            return 1;
+        }
+    }
     wicked_newpipeline::NewPipelineClientApp application;
     wi::arguments::Parse(command_line);
     application.ConfigureFromCommandLine(arguments.Count(), arguments.Data());

@@ -2,6 +2,7 @@
 
 #import <AppKit/AppKit.h>
 #include <Carbon/Carbon.h>
+#include <cstdio>
 #include <filesystem>
 
 #include "wiHelper.h"
@@ -17,6 +18,18 @@ int main(int argc, char* argv[])
 {
     @autoreleasepool
     {
+        for (int i = 1; i < argc; ++i)
+        {
+            if (std::string{argv[i]} == "--transport_selftest")
+            {
+                std::string error;
+                if (wicked_newpipeline::ValidateRemoteTransportSelfTest(&error) &&
+                    wicked_newpipeline::ValidateRemoteClientPairingSelfTest(&error))
+                    return 0;
+                std::fprintf(stderr, "%s\n", error.c_str());
+                return 1;
+            }
+        }
         const std::filesystem::path bundled_shader_source =
             std::filesystem::path(wi::helper::GetCurrentPath()) /
             ".." / "WickedEngine" / "shaders";

@@ -1061,12 +1061,16 @@ void NewPipelineClientRenderPath::MaintainWebRTC(float dt)
         return;
     wi::backlog::post("Client WebRTC " + std::string{ToString(previous_webrtc_state)} + " -> " +
         ToString(stats.state) + (stats.status.empty() ? std::string{} : ": " + stats.status));
-    if (previous_webrtc_state == WebRTCTransportState::Connected &&
-        stats.state != WebRTCTransportState::Connected)
-    {
-        ClearPendingRemoteFrames();
-        InvalidateRemote("transport disconnected");
-    }
+    const bool leaving_connected =
+        previous_webrtc_state == WebRTCTransportState::Connected &&
+        stats.state != WebRTCTransportState::Connected;
+    const bool entering_connected =
+        previous_webrtc_state != WebRTCTransportState::Connected &&
+        stats.state == WebRTCTransportState::Connected;
+    if (leaving_connected)
+        ResetRemoteTransportSession("transport disconnected", false);
+    if (entering_connected)
+        ResetRemoteTransportSession("new transport session", true);
     previous_webrtc_state = stats.state;
 }
 
@@ -1129,6 +1133,42 @@ void NewPipelineClientRenderPath::ClearPendingRemoteFrames()
     downstream_metadata_cache.clear();
     pending_remote_video_frames.clear();
     remote_native_surface_cache.clear();
+}
+
+void NewPipelineClientRenderPath::ResetRemoteTransportSession(
+    const std::string& reason,
+    bool request_control_snapshot)
+{
+    ClearPendingRemoteFrames();
+    remote_consume = {};
+    accepted_remote_metadata = {};
+    accepted_remote_contract_v3 = {};
+    accepted_remote_contract_v3_valid = false;
+    accepted_remote_source_control_frame_id = 0;
+    accepted_remote_buffer_mask = 0;
+    negotiated_stream_selection = {};
+    negotiated_stream_control_frame_id = 0;
+    negotiated_stream_selection_valid = false;
+    remote_ddgi_frame_index = 0;
+    remote_ddgi_reset_reason = DDGIResetReason::None;
+    remote_codec_wait_seconds = 0.0f;
+    remote_codec_wait_logged = false;
+    transport_bitrate_bps = 0;
+    transport_telemetry_previous_bytes = 0;
+    transport_telemetry_window_seconds = 0.0f;
+    remote_unchanged_skip_logged = false;
+    ResetRemoteGBufferHistory();
+
+    if (request_control_snapshot)
+    {
+        // A new peer has no authoritative control snapshot even if the local
+        // camera did not change while signaling. Force one immediately after
+        // the Connected transition while retaining the monotonic frame ID.
+        last_published_control_packet = {};
+        has_published_control_packet = false;
+        control_publish_accumulator = kControlHeartbeatIntervalSeconds;
+    }
+    InvalidateRemote(reason);
 }
 
 void NewPipelineClientRenderPath::PrunePendingRemoteFrames(uint64_t now_usec)
@@ -1219,13 +1259,62 @@ bool NewPipelineClientRenderPath::TryMatchRemoteVideoFrame(
     layout = pending_metadata;
     layout.metadata.local_receive_timestamp_usec = NowUsec();
 
+    // Both queues are ordered by arrival, not by frame identity. The metadata
+    // DataChannel is deliberately unordered, so erasing a deque prefix here
+    // can discard a newer metadata record that happened to arrive first.
     pending_remote_video_frames.erase(
-        pending_remote_video_frames.begin(),
-        std::next(pending_remote_video_frames.begin(), match.video_index + 1));
+        std::next(pending_remote_video_frames.begin(), match.video_index));
     downstream_metadata_cache.erase(
-        downstream_metadata_cache.begin(),
-        std::next(downstream_metadata_cache.begin(), match.metadata_index + 1));
+        std::next(downstream_metadata_cache.begin(), match.metadata_index));
     ++downstream_metadata_matches;
+    return true;
+}
+
+bool ValidateRemoteClientPairingSelfTest(std::string* error)
+{
+    const auto fail = [error](const char* message) {
+        if (error != nullptr)
+            *error = message;
+        return false;
+    };
+
+    NewPipelineClientRenderPath path;
+    RemoteVideoFrameLayout metadata_11;
+    metadata_11.metadata.frame_id = 11;
+    metadata_11.metadata.source_generation = 7;
+    metadata_11.metadata.local_receive_timestamp_usec = 100;
+    RemoteVideoFrameLayout metadata_10 = metadata_11;
+    metadata_10.metadata.frame_id = 10;
+    metadata_10.metadata.local_receive_timestamp_usec = 110;
+    path.downstream_metadata_cache.push_back(metadata_11);
+    path.downstream_metadata_cache.push_back(metadata_10);
+
+    NewPipelineClientRenderPath::PendingRemoteVideoFrame video_10;
+    video_10.pixel_layout.metadata.frame_id = 10;
+    video_10.pixel_layout.metadata.source_generation = 7;
+    video_10.local_receive_timestamp_usec = 120;
+    path.pending_remote_video_frames.push_back(video_10);
+
+    RetainedRemoteVideoFrame frame;
+    RemoteVideoFrameLayout layout;
+    if (!path.TryMatchRemoteVideoFrame(frame, layout) ||
+        layout.metadata.frame_id != 10)
+        return fail("unordered metadata did not match frame 10");
+    if (!path.pending_remote_video_frames.empty() ||
+        path.downstream_metadata_cache.size() != 1 ||
+        path.downstream_metadata_cache.front().metadata.frame_id != 11)
+        return fail("matching frame 10 discarded reordered metadata 11");
+
+    NewPipelineClientRenderPath::PendingRemoteVideoFrame video_11;
+    video_11.pixel_layout.metadata.frame_id = 11;
+    video_11.pixel_layout.metadata.source_generation = 7;
+    video_11.local_receive_timestamp_usec = 130;
+    path.pending_remote_video_frames.push_back(video_11);
+    if (!path.TryMatchRemoteVideoFrame(frame, layout) ||
+        layout.metadata.frame_id != 11 ||
+        !path.pending_remote_video_frames.empty() ||
+        !path.downstream_metadata_cache.empty())
+        return fail("preserved metadata 11 did not match its later video frame");
     return true;
 }
 
@@ -4370,7 +4459,8 @@ void NewPipelineClientRenderPath::AcquireRemoteVideoFrame(float dt)
         return;
     }
 
-    if (remote_consume.latest_generation == metadata.source_generation &&
+    if (!metadata.reset_this_frame &&
+        remote_consume.latest_generation == metadata.source_generation &&
         remote_consume.latest_frame_id != 0 && metadata.frame_id <= remote_consume.latest_frame_id)
     {
         ++downstream_out_of_order_drops;

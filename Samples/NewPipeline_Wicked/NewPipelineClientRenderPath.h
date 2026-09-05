@@ -97,6 +97,7 @@ private:
     bool TryMatchRemoteVideoFrame(RetainedRemoteVideoFrame& frame, RemoteVideoFrameLayout& layout);
     void PrunePendingRemoteFrames(uint64_t now_usec);
     void ClearPendingRemoteFrames();
+    void ResetRemoteTransportSession(const std::string& reason, bool request_control_snapshot);
     void MaintainWebRTC(float dt);
     bool ValidateRemoteVideoLayout(const RemoteVideoFrameLayout& layout, std::string& reason) const;
     bool IsControlPacketChanged(const ClientControlPacket& packet) const;
@@ -353,5 +354,9 @@ private:
     bool remote_unchanged_skip_logged = false;
     bool remote_payload_read_logged = false;
     mutable bool debug_preview_invalid_logged = false;
+
+    friend bool ValidateRemoteClientPairingSelfTest(std::string* error);
 };
+
+bool ValidateRemoteClientPairingSelfTest(std::string* error = nullptr);
 } // namespace wicked_newpipeline

@@ -827,8 +827,11 @@ public:
     NPWebRTCBridgeState GetState() const
     {
 #if defined(__APPLE__)
-        if (hardware_encoder_failure_ &&
+        if (server_ && hardware_encoder_failure_ &&
             hardware_encoder_failure_->failed.load(std::memory_order_acquire))
+            return NP_WEBRTC_FAILED;
+        if (!server_ && hardware_decoder_failure_ &&
+            hardware_decoder_failure_->failed.load(std::memory_order_acquire))
             return NP_WEBRTC_FAILED;
 #elif defined(_WIN32)
         if (server_ && hardware_encoder_failure_ &&
@@ -848,9 +851,19 @@ public:
     std::string GetStatus() const
     {
 #if defined(__APPLE__)
-        if (hardware_encoder_failure_ &&
+        if (server_ && hardware_encoder_failure_ &&
             hardware_encoder_failure_->failed.load(std::memory_order_acquire))
             return "VideoToolbox H264 encoder failed; requesting software fallback";
+        if (!server_ && hardware_decoder_failure_ &&
+            hardware_decoder_failure_->failed.load(std::memory_order_acquire))
+        {
+            return "VideoToolbox H264 decoder failed at stage " +
+                std::to_string(hardware_decoder_failure_->failure_stage.load(
+                    std::memory_order_relaxed)) + " (OSStatus " +
+                std::to_string(hardware_decoder_failure_->failure_status.load(
+                    std::memory_order_relaxed)) +
+                "); reconnecting with VP8 fallback";
+        }
 #elif defined(_WIN32)
         if (server_ && hardware_encoder_failure_ &&
             hardware_encoder_failure_->failed.load(std::memory_order_acquire))
@@ -1179,11 +1192,17 @@ public:
     {
         MaybeRequestCodecTelemetry();
 #if defined(__APPLE__)
-        if (hardware_encoder_failure_ &&
+        if (server_ && hardware_encoder_failure_ &&
             hardware_encoder_failure_->failed.load(std::memory_order_acquire))
         {
             active_encoder_mode_ = "fallback-software";
             fallback_reason_ = "hardware-runtime-failed";
+        }
+        if (!server_ && hardware_decoder_failure_ &&
+            hardware_decoder_failure_->failed.load(std::memory_order_acquire))
+        {
+            input_surface_ = "i420-decoded";
+            fallback_reason_ = "hardware-decoder-runtime-failed";
         }
 #elif defined(_WIN32)
         if (server_ && hardware_encoder_failure_ &&
@@ -1242,7 +1261,11 @@ public:
             }
             else if (negotiated_codec.find("h264") != std::string::npos &&
                 encoder_preference_ == NP_WEBRTC_ENCODER_HARDWARE
-#if defined(_WIN32)
+#if defined(__APPLE__)
+                && !(hardware_encoder_failure_ &&
+                    hardware_encoder_failure_->failed.load(
+                        std::memory_order_acquire))
+#elif defined(_WIN32)
                 && !(hardware_encoder_failure_ &&
                     hardware_encoder_failure_->failed.load(
                         std::memory_order_acquire))
@@ -1472,6 +1495,8 @@ private:
             np_create_apple_video_codec_factories(
                 server_ && encoder_preference_ == NP_WEBRTC_ENCODER_HARDWARE);
         hardware_encoder_failure_ = apple_factories.hardware_failure;
+        hardware_decoder_failure_ =
+            apple_factories.hardware_decoder_failure;
         encoder_factory = std::move(apple_factories.encoder);
         decoder_factory = std::move(apple_factories.decoder);
         if (server_ && encoder_preference_ == NP_WEBRTC_ENCODER_HARDWARE)
@@ -2074,6 +2099,7 @@ private:
     std::string fallback_reason_ = "none";
 #if defined(__APPLE__)
     std::shared_ptr<NPHardwareEncoderFailureSignal> hardware_encoder_failure_;
+    std::shared_ptr<NPHardwareDecoderFailureSignal> hardware_decoder_failure_;
 #elif defined(_WIN32)
     std::shared_ptr<NPWindowsHardwareEncoderFailureSignal> hardware_encoder_failure_;
     std::shared_ptr<NPWindowsHardwareDecoderFailureSignal> hardware_decoder_failure_;

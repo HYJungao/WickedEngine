@@ -31,6 +31,11 @@
 namespace
 {
 constexpr uint8_t kAnnexBStartCode[] = {0, 0, 0, 1};
+std::atomic_bool g_hardware_decoder_runtime_disabled{false};
+constexpr uint32_t kDecoderFailureSessionCreate = 1;
+constexpr uint32_t kDecoderFailureSubmit = 2;
+constexpr uint32_t kDecoderFailureOutput = 3;
+constexpr uint32_t kDecoderFailureConversion = 4;
 
 void HardwareProbeCallback(
     void*, void*, OSStatus, VTEncodeInfoFlags, CMSampleBufferRef)
@@ -65,7 +70,8 @@ bool HardwareH264DecoderAvailable()
 {
     static const bool available =
         VTIsHardwareDecodeSupported(kCMVideoCodecType_H264);
-    return available;
+    return available &&
+        !g_hardware_decoder_runtime_disabled.load(std::memory_order_acquire);
 }
 
 bool IsH264(const webrtc::SdpVideoFormat& format)
@@ -463,12 +469,24 @@ struct DecoderFrameContext
 class VideoToolboxH264Decoder final : public webrtc::VideoDecoder
 {
 public:
+    explicit VideoToolboxH264Decoder(
+        std::shared_ptr<NPHardwareDecoderFailureSignal> failure) :
+        failure_(std::move(failure))
+    {
+    }
+
     ~VideoToolboxH264Decoder() override { Release(); }
 
-    bool Configure(const Settings&) override { return true; }
+    bool Configure(const Settings&) override
+    {
+        return !g_hardware_decoder_runtime_disabled.load(
+            std::memory_order_acquire);
+    }
 
     int32_t Decode(const webrtc::EncodedImage& input, int64_t) override
     {
+        if (failure_ && failure_->failed.load(std::memory_order_acquire))
+            return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
         const std::vector<NalUnit> units = SplitAnnexB(input.data(), input.size());
         if (units.empty())
             return WEBRTC_VIDEO_CODEC_ERROR;
@@ -527,7 +545,10 @@ public:
             session_, sample, flags, context.get(), nullptr);
         CFRelease(sample);
         if (decode_status != noErr)
+        {
+            SignalFailure(kDecoderFailureSubmit, decode_status);
             return WEBRTC_VIDEO_CODEC_ERROR;
+        }
         context.release();
         return WEBRTC_VIDEO_CODEC_OK;
     }
@@ -570,6 +591,19 @@ public:
     }
 
 private:
+    void SignalFailure(uint32_t stage, OSStatus status)
+    {
+        g_hardware_decoder_runtime_disabled.store(
+            true, std::memory_order_release);
+        if (failure_)
+        {
+            failure_->failure_stage.store(stage, std::memory_order_relaxed);
+            failure_->failure_status.store(
+                static_cast<int32_t>(status), std::memory_order_relaxed);
+            failure_->failed.store(true, std::memory_order_release);
+        }
+    }
+
     bool CreateSession(const std::vector<uint8_t>& sps, const std::vector<uint8_t>& pps)
     {
         if (session_ != nullptr)
@@ -586,8 +620,11 @@ private:
         }
         const uint8_t* parameter_sets[] = {sps.data(), pps.data()};
         const size_t parameter_sizes[] = {sps.size(), pps.size()};
-        if (CMVideoFormatDescriptionCreateFromH264ParameterSets(kCFAllocatorDefault,
-                2, parameter_sets, parameter_sizes, 4, &format_) != noErr || format_ == nullptr)
+        const OSStatus format_status =
+            CMVideoFormatDescriptionCreateFromH264ParameterSets(
+                kCFAllocatorDefault, 2, parameter_sets, parameter_sizes, 4,
+                &format_);
+        if (format_status != noErr || format_ == nullptr)
             return false;
 
         const int32_t pixel_format = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
@@ -617,7 +654,11 @@ private:
         CFRelease(empty);
         CFRelease(pixel_format_number);
         if (status != noErr || session_ == nullptr)
+        {
+            SignalFailure(kDecoderFailureSessionCreate, status != noErr
+                ? status : static_cast<OSStatus>(-1));
             return false;
+        }
         sps_ = sps;
         pps_ = pps;
         return true;
@@ -635,9 +676,15 @@ private:
         std::unique_ptr<DecoderFrameContext> context(
             static_cast<DecoderFrameContext*>(source_refcon));
         auto* decoder = static_cast<VideoToolboxH264Decoder*>(output_refcon);
-        if (decoder == nullptr || context == nullptr || status != noErr ||
-            image_buffer == nullptr || CVPixelBufferGetPlaneCount(image_buffer) < 2)
+        if (decoder == nullptr)
             return;
+        if (context == nullptr || status != noErr || image_buffer == nullptr ||
+            CVPixelBufferGetPlaneCount(image_buffer) < 2)
+        {
+            decoder->SignalFailure(kDecoderFailureOutput, status != noErr
+                ? status : static_cast<OSStatus>(-1));
+            return;
+        }
         CVPixelBufferLockBaseAddress(image_buffer, kCVPixelBufferLock_ReadOnly);
         const int width = static_cast<int>(CVPixelBufferGetWidth(image_buffer));
         const int height = static_cast<int>(CVPixelBufferGetHeight(image_buffer));
@@ -652,7 +699,12 @@ private:
             i420->MutableDataV(), i420->StrideV(), width, height) : -1;
         CVPixelBufferUnlockBaseAddress(image_buffer, kCVPixelBufferLock_ReadOnly);
         if (convert_status != 0)
+        {
+            decoder->SignalFailure(
+                kDecoderFailureConversion,
+                static_cast<OSStatus>(convert_status));
             return;
+        }
         webrtc::VideoFrame frame = webrtc::VideoFrame::Builder{}
             .set_video_frame_buffer(i420)
             .set_rtp_timestamp(context->rtp_timestamp)
@@ -667,6 +719,7 @@ private:
             callback->Decoded(frame, std::nullopt, std::nullopt);
     }
 
+    std::shared_ptr<NPHardwareDecoderFailureSignal> failure_;
     mutable std::mutex mutex_;
     webrtc::DecodedImageCallback* callback_ = nullptr;
     VTDecompressionSessionRef session_ = nullptr;
@@ -715,6 +768,12 @@ private:
 class VideoToolboxDecoderFactory final : public webrtc::VideoDecoderFactory
 {
 public:
+    explicit VideoToolboxDecoderFactory(
+        std::shared_ptr<NPHardwareDecoderFailureSignal> failure) :
+        failure_(std::move(failure))
+    {
+    }
+
     std::vector<webrtc::SdpVideoFormat> GetSupportedFormats() const override
     {
         if (!HardwareH264DecoderAvailable())
@@ -737,9 +796,12 @@ public:
         const webrtc::SdpVideoFormat& format) override
     {
         return IsH264(format) && HardwareH264DecoderAvailable()
-            ? std::make_unique<VideoToolboxH264Decoder>()
+            ? std::make_unique<VideoToolboxH264Decoder>(failure_)
             : nullptr;
     }
+
+private:
+    std::shared_ptr<NPHardwareDecoderFailureSignal> failure_;
 };
 
 bool ContainsFormat(
@@ -864,6 +926,8 @@ NPAppleVideoCodecFactories np_create_apple_video_codec_factories(
 {
     NPAppleVideoCodecFactories result;
     result.hardware_failure = std::make_shared<NPHardwareEncoderFailureSignal>();
+    result.hardware_decoder_failure =
+        std::make_shared<NPHardwareDecoderFailureSignal>();
     auto encoders = std::make_unique<CombinedVideoEncoderFactory>();
     auto decoders = std::make_unique<CombinedVideoDecoderFactory>();
 
@@ -872,7 +936,8 @@ NPAppleVideoCodecFactories np_create_apple_video_codec_factories(
         result.hardware_encoder_available = true;
         encoders->Add(std::make_unique<VideoToolboxEncoderFactory>(result.hardware_failure));
     }
-    decoders->Add(std::make_unique<VideoToolboxDecoderFactory>());
+    decoders->Add(std::make_unique<VideoToolboxDecoderFactory>(
+        result.hardware_decoder_failure));
     encoders->Add(std::make_unique<webrtc::VideoEncoderFactoryTemplate<
         webrtc::LibvpxVp8EncoderTemplateAdapter>>());
     decoders->Add(std::make_unique<webrtc::VideoDecoderFactoryTemplate<
@@ -896,7 +961,8 @@ extern "C" int np_validate_apple_video_codec_factories(
     };
     NPAppleVideoCodecFactories software =
         np_create_apple_video_codec_factories(false);
-    if (!software.encoder || !software.decoder)
+    if (!software.encoder || !software.decoder ||
+        !software.hardware_decoder_failure)
         return fail("Apple software codec factory construction failed");
     for (const webrtc::SdpVideoFormat& format :
         software.encoder->GetSupportedFormats())
@@ -907,7 +973,8 @@ extern "C" int np_validate_apple_video_codec_factories(
 
     NPAppleVideoCodecFactories hardware =
         np_create_apple_video_codec_factories(true);
-    if (!hardware.encoder || !hardware.decoder)
+    if (!hardware.encoder || !hardware.decoder ||
+        !hardware.hardware_decoder_failure)
         return fail("Apple hardware codec factory construction failed");
     if (!hardware.hardware_encoder_available)
         return 1;
