@@ -121,6 +121,8 @@ private:
     void ApplyEnvironmentProbeSettings(bool log_changes);
     void LoadStaticLightingAssets();
     void LoadEnvironmentProbeAsset();
+    void RefreshStaticLightingForSun();
+    void PrepareRemoteGBufferHistoryCapture();
     void InitializeBlackEnvironmentProbe(wi::scene::EnvironmentProbeComponent& probe);
     void PlaceNewEnvironmentProbe(wi::scene::TransformComponent& transform) const;
     void CreateEnvironmentProbeMipViews();
@@ -327,6 +329,8 @@ private:
     bool has_published_control_packet = false;
     bool scene_initialized = false;
     bool baked_sun_reference_valid = false;
+    NewPipelineSunState probe_baked_sun_state;
+    bool probe_baked_sun_reference_valid = false;
     bool static_lighting_bake_requested = false;
     bool camera_control_start = true;
     bool input_active = true;

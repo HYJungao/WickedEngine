@@ -259,10 +259,14 @@ the source or captures a probe. Missing, corrupt and stale packages use a black
 fallback and expose `MISSING`, `CORRUPT` or `STALE` in the Client panel.
 
 Lightmaps and the Reflection Probe share the `ClientStaticLighting` asset-state
-service. Changing the runtime sun away from the baked sun marks both contributions
-`STALE` and disables them instead of combining mismatched static and realtime
-lighting. Returning to the baked sun reloads the validated packages. Sun controls
-are locked while a static-lighting bake is active.
+service, with independent bake-lighting references. The validated derived scene
+supplies the Lightmap/VLM bake sun and initializes the runtime sun and UI on cold
+start. Probe package version 3 stores its own bake sun; older probe packages are
+preserved but reported as `STALE` and require a Probe rebake. Changing the runtime
+sun disables each mismatched contribution, including per-instance VLM SH. Returning
+to an asset's bake sun reloads its validated package. A standalone Probe bake never
+changes Lightmap/VLM validity. Sun controls are locked while a static-lighting bake
+is active.
 
 ## Remote video V3
 
@@ -306,11 +310,13 @@ needed to pair decoded pixels. The unordered, partially reliable `np.frame_meta`
 DataChannel carries an explicit endian-safe V3 metadata record and descriptor
 contract. The Client retains video frames and metadata in separate bounded queues and accepts
 the newest matching pair regardless of which side arrived first. I420 frames use
-the pixel-band identity; retained native NV12 frames use the exact producer-assigned
-90 kHz RTP timestamp derived from the serialized `timestamp_usec`, avoiding a CPU
-surface map without reverting to a fuzzy clock comparison. Unmatched entries expire
-after one second; the low-latency video queue is capped at three frames and the
-metadata queue at eight entries. A transient unmatched frame does not discard the last accepted remote
+the pixel-band identity; both Windows and macOS H.264 encoders carry the exact
+producer `timestamp_usec` in a shared SEI record. Retained native NV12 frames match
+that source timestamp at microsecond precision, independently of WebRTC RTP offsets
+and receiver clocks. A Windows decoder output without this SEI uses I420 and its
+pixel identity band, retaining H.264. Native matching requires no CPU surface map.
+Unmatched entries expire after three seconds; the low-latency video queue is capped
+at three frames and the Client metadata pairing cache at 128 entries. A transient unmatched frame does not discard the last accepted remote
 input. A matched pair is still rejected if its protocol, dimensions, layout
 checksum, descriptor checksum, generation or control-frame identity disagrees.
 
@@ -333,8 +339,11 @@ CPU-addressable I420/readback path; a native Metal/CVPixelBuffer path is still o
 The Server panel and Client remote status report DDGI frame/convergence state.
 Scene-generation and significant authoritative-sun changes clear Server DDGI
 history and publish the reset reason in the video metadata. `--transport_selftest`
-runs command-line encoder-selection checks, V3 descriptor/status checks, High/Balanced atlas-area
-checks, retained-content cadence, scalar I420 numeric tolerance, formal blend
-endpoints and pixel-band/DataChannel agreement without opening a window. See
+runs command-line encoder-selection checks, disconnected-control wake/cleanup checks,
+shared H.264 source-identity checks (including actual VideoToolbox encoding when
+available), V3 descriptor/status checks, High/Balanced atlas-area checks, retained-content cadence, scalar I420 numeric tolerance, formal blend
+endpoints and pixel-band/DataChannel agreement without opening a window. The Client
+also tests exact native pairing, history-slot retirement, independent static-lighting
+validity, stale VLM unbinding and persisted Probe sun validation. See
 [`docs/ROADMAP.md`](docs/ROADMAP.md) for the remaining platform/runtime
 validation matrix.

@@ -19,6 +19,7 @@ enum class ClientLightingAssetState : uint8_t
 };
 
 const char* ToString(ClientLightingAssetState state);
+bool ValidateClientStaticLightingSelfTest(std::string* error = nullptr);
 
 struct ClientReflectionProbeDescriptor
 {
@@ -27,6 +28,7 @@ struct ClientReflectionProbeDescriptor
     XMFLOAT4 rotation = XMFLOAT4(0, 0, 0, 1);
     XMFLOAT3 scale = XMFLOAT3(1, 1, 1);
     uint32_t resolution = 128;
+    NewPipelineSunState baked_sun;
 };
 
 struct ClientReflectionProbePackageResult
@@ -35,6 +37,8 @@ struct ClientReflectionProbePackageResult
     ClientLightingAssetState state = ClientLightingAssetState::Unavailable;
     wi::Resource resource;
     uint32_t mip_count = 0;
+    NewPipelineSunState baked_sun;
+    bool baked_sun_valid = false;
     std::string diagnostic;
 };
 
@@ -82,12 +86,12 @@ public:
 
     void SetLightmapStatus(ClientLightingAssetState state, std::string message);
     void SetProbeStatus(ClientLightingAssetState state, std::string message);
-    void MarkStale(const std::string& reason);
-    void ClearStale();
+    void MarkLightmapsStale(const std::string& reason);
+    void ClearLightmapsStale();
 
     ClientLightingAssetState GetLightmapState() const { return lightmap_state; }
     ClientLightingAssetState GetProbeState() const { return probe_state; }
-    bool IsStale() const { return stale; }
+    bool AreLightmapsStale() const { return stale; }
     const std::string& GetStaleReason() const { return stale_reason; }
     const std::string& GetLightmapStatus() const { return lightmap_status; }
     const std::string& GetProbeStatus() const { return probe_status; }

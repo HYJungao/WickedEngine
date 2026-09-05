@@ -1,4 +1,5 @@
 #include "NewPipelineTransport.h"
+#include "NewPipelineVideoFrameIdentity.h"
 #if defined(__APPLE__)
 extern "C" int np_validate_apple_video_codec_factories(
     char* error, size_t error_capacity);
@@ -769,6 +770,32 @@ bool DecodeRemoteVideoFrameLayout(
 
 bool ValidateRemoteTransportSelfTest(std::string* error)
 {
+    if (!ValidateRemoteTransportLifecycleSelfTest(error))
+        return false;
+    const std::vector<uint8_t> picture = {0, 0, 0, 1, 0x65, 0x88, 0x84};
+    // Include start-code-like byte patterns to exercise SEI emulation prevention.
+    for (const int64_t timestamp : std::array<int64_t, 4>{1, 0x000003000001ll, 123456789, INT64_MAX})
+    {
+        auto encoded = picture;
+        video_identity::PrependFrameIdentitySEI(encoded, timestamp);
+        if (video_identity::ParseFrameIdentitySEI(encoded.data(), encoded.size()) != timestamp ||
+            !std::equal(picture.rbegin(), picture.rend(), encoded.rbegin()))
+        {
+            SetError(error, "shared H264 source identity roundtrip failed");
+            return false;
+        }
+        const size_t sei_size = encoded.size() - picture.size();
+        if (video_identity::ParseFrameIdentitySEI(encoded.data(), sei_size - 2).has_value())
+        {
+            SetError(error, "truncated H264 identity was accepted");
+            return false;
+        }
+    }
+    if (video_identity::ParseFrameIdentitySEI(picture.data(), picture.size()).has_value())
+    {
+        SetError(error, "missing H264 source identity was fabricated");
+        return false;
+    }
     char program[] = "newpipeline";
     char software_argument[] = "--remote_encoder=software";
     char invalid_argument[] = "--remote_encoder=invalid";
@@ -1383,6 +1410,12 @@ struct WebRTCVideoTransport::Impl
 
     void PublishStats(WebRTCTransportStats stats)
     {
+        if (stats.state != WebRTCTransportState::Connected)
+        {
+            std::lock_guard lock(control_queue_mutex);
+            pending_control = {};
+            control_pending.store(false, std::memory_order_release);
+        }
         stats.connection_attempts = connection_attempts.load(std::memory_order_relaxed);
         stats.disconnected_frame_drops = disconnected_frame_drops.load(std::memory_order_relaxed);
         stats.busy_frame_drops = busy_frame_drops.load(std::memory_order_relaxed);
@@ -1403,7 +1436,19 @@ struct WebRTCVideoTransport::Impl
         NPWebRTCBridge* detached = bridge;
         bridge = nullptr;
         bridge_attached.store(false, std::memory_order_release);
+        {
+            std::lock_guard control_lock(control_queue_mutex);
+            pending_control = {};
+            control_pending.store(false, std::memory_order_release);
+        }
         return detached;
+    }
+
+    bool HasSendableControl() const
+    {
+        return control_pending.load(std::memory_order_acquire) &&
+            bridge_attached.load(std::memory_order_acquire) &&
+            std::atomic_load(&stats_snapshot)->state == WebRTCTransportState::Connected;
     }
 
     void DestroyBridge()
@@ -1460,7 +1505,7 @@ struct WebRTCVideoTransport::Impl
                     : next_retry;
                 lifecycle_cv.wait_until(lock, wake_time, [&] {
                     return shutdown || request_revision != applied_revision ||
-                        control_pending.load(std::memory_order_acquire);
+                        HasSendableControl();
                 });
                 if (shutdown)
                     break;
@@ -1553,8 +1598,7 @@ struct WebRTCVideoTransport::Impl
             {
                 std::unique_lock lock(lifecycle_mutex);
                 lifecycle_cv.wait_until(lock, next_retry, [&] {
-                    return shutdown || request_revision != applied_revision ||
-                        control_pending.load(std::memory_order_acquire);
+                    return shutdown || request_revision != applied_revision;
                 });
                 continue;
             }
@@ -1628,6 +1672,47 @@ struct WebRTCVideoTransport::Impl
         PublishStats(std::move(disabled));
     }
 };
+
+bool ValidateRemoteTransportLifecycleSelfTest(std::string* error)
+{
+    WebRTCVideoTransport::Impl state;
+    WebRTCTransportStats connected;
+    connected.state = WebRTCTransportState::Connected;
+    state.PublishStats(connected);
+    state.bridge_attached.store(true);
+    state.control_pending.store(true);
+    if (!state.HasSendableControl())
+    {
+        SetError(error, "connected control did not wake the service");
+        return false;
+    }
+    WebRTCTransportStats disconnected;
+    disconnected.state = WebRTCTransportState::Signaling;
+    state.PublishStats(disconnected);
+    if (state.control_pending.load())
+    {
+        SetError(error, "disconnect retained a previous-session control");
+        return false;
+    }
+    // Model SendControl racing a stale Connected stats snapshot. Even if it
+    // queues after disconnect, the waiting thread must respect its deadline.
+    state.control_pending.store(true);
+    std::unique_lock lock(state.lifecycle_mutex);
+    if (state.lifecycle_cv.wait_until(lock,
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(10),
+            [&] { return state.HasSendableControl(); }))
+    {
+        SetError(error, "disconnected pending control bypassed service wait");
+        return false;
+    }
+    state.DetachBridge();
+    if (state.control_pending.load() || state.HasSendableControl())
+    {
+        SetError(error, "detached session retained a control wakeup");
+        return false;
+    }
+    return true;
+}
 
 WebRTCVideoTransport::WebRTCVideoTransport() : impl(std::make_unique<Impl>())
 {

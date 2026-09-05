@@ -2056,7 +2056,7 @@ private:
         if (connected)
             SetStatus("WebRTC video track connected");
         else if (state == webrtc::PeerConnectionInterface::kIceConnectionFailed)
-            SetStatus("WebRTC ICE failed");
+            Fail("WebRTC ICE failed; recreating peer connection");
     }
     void OnIceGatheringChange(webrtc::PeerConnectionInterface::IceGatheringState) override {}
     void OnIceCandidate(const webrtc::IceCandidateInterface* candidate) override

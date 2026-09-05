@@ -1,4 +1,5 @@
 #include "NewPipelineWebRTCAppleCodecFactory.h"
+#include "NewPipelineVideoFrameIdentity.h"
 
 #if defined(__APPLE__)
 
@@ -8,6 +9,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -378,6 +381,8 @@ private:
             encoder->HardwareFailure();
             return;
         }
+        wicked_newpipeline::video_identity::PrependFrameIdentitySEI(
+            annex_b, context->timestamp_usec);
         webrtc::EncodedImage image;
         image.SetEncodedData(webrtc::EncodedImageBuffer::Create(
             annex_b.data(), annex_b.size()));
@@ -1000,9 +1005,54 @@ extern "C" int np_validate_apple_video_codec_factories(
     const webrtc::VideoEncoder::Settings settings(
         webrtc::VideoEncoder::Capabilities(false), 1, 1200);
     const int result = encoder->InitEncode(&codec, settings);
-    encoder->Release();
     if (result != WEBRTC_VIDEO_CODEC_OK)
+    {
+        encoder->Release();
         return fail("VideoToolbox H264 encoder initialization failed");
+    }
+    class IdentityCallback final : public webrtc::EncodedImageCallback
+    {
+    public:
+        Result OnEncodedImage(const webrtc::EncodedImage& image,
+            const webrtc::CodecSpecificInfo*) override
+        {
+            std::lock_guard lock(mutex);
+            complete = true;
+            valid = image.IsKey() &&
+                wicked_newpipeline::video_identity::ParseFrameIdentitySEI(
+                    image.data(), image.size()) == 1234567;
+            condition.notify_one();
+            return Result(Result::OK, image.RtpTimestamp());
+        }
+        bool Wait()
+        {
+            std::unique_lock lock(mutex);
+            return condition.wait_for(lock, std::chrono::seconds(3),
+                [&] { return complete; }) && valid;
+        }
+    private:
+        std::mutex mutex;
+        std::condition_variable condition;
+        bool complete = false;
+        bool valid = false;
+    } callback;
+    const bool registered = encoder->RegisterEncodeCompleteCallback(&callback) == WEBRTC_VIDEO_CODEC_OK;
+    auto i420 = webrtc::I420Buffer::Create(640, 360);
+    bool identity_valid = false;
+    if (registered && i420)
+    {
+        webrtc::I420Buffer::SetBlack(i420.get());
+        const auto frame = webrtc::VideoFrame::Builder{}
+            .set_video_frame_buffer(i420)
+            .set_timestamp_us(1234567)
+            .set_rtp_timestamp(90000)
+            .build();
+        const std::vector<webrtc::VideoFrameType> types = {webrtc::VideoFrameType::kVideoFrameKey};
+        identity_valid = encoder->Encode(frame, &types) == WEBRTC_VIDEO_CODEC_OK && callback.Wait();
+    }
+    encoder->Release();
+    if (!identity_valid)
+        return fail("VideoToolbox H264 output lost exact source SEI identity");
     return 1;
 }
 

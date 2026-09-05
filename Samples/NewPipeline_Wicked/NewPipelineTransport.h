@@ -212,5 +212,8 @@ public:
 private:
     struct Impl;
     std::unique_ptr<Impl> impl;
+    friend bool ValidateRemoteTransportLifecycleSelfTest(std::string* error);
 };
+
+bool ValidateRemoteTransportLifecycleSelfTest(std::string* error = nullptr);
 } // namespace wicked_newpipeline

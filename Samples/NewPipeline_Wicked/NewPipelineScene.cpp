@@ -856,6 +856,16 @@ void ApplySunStateToScene(wi::scene::Scene& scene, const NewPipelineSunState& st
     }
 }
 
+bool ClientLightingSunMatches(const NewPipelineSunState& a, const NewPipelineSunState& b)
+{
+    const auto close = [](float x, float y) { return std::abs(x - y) <= 0.0001f; };
+    return a.enabled == b.enabled &&
+        close(a.direction.x, b.direction.x) && close(a.direction.y, b.direction.y) &&
+        close(a.direction.z, b.direction.z) && close(a.color.x, b.color.x) &&
+        close(a.color.y, b.color.y) && close(a.color.z, b.color.z) &&
+        close(a.enabled ? a.intensity : 0.0f, b.enabled ? b.intensity : 0.0f);
+}
+
 NewPipelineSunState ExtractSunStateFromScene(const wi::scene::Scene& scene)
 {
     NewPipelineSunState state = MakeSunStateFromAngles(true, -35.0f, 50.0f);
@@ -867,6 +877,10 @@ NewPipelineSunState ExtractSunStateFromScene(const wi::scene::Scene& scene)
         state.direction = NormalizeOrDefault(light->direction);
         state.color = light->color;
         state.intensity = std::max(0.0f, light->intensity);
+        state.yaw_degrees = wi::math::RadiansToDegrees(
+            std::atan2(state.direction.x, state.direction.z));
+        state.pitch_degrees = wi::math::RadiansToDegrees(std::atan2(
+            std::hypot(state.direction.x, state.direction.z), state.direction.y));
     }
     return state;
 }

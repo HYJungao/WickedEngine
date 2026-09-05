@@ -65,6 +65,7 @@ void InitializeDefaultCamera(
     const wi::scene::Scene* source_scene = nullptr);
 void ApplySunStateToScene(wi::scene::Scene& scene, const NewPipelineSunState& state);
 NewPipelineSunState ExtractSunStateFromScene(const wi::scene::Scene& scene);
+bool ClientLightingSunMatches(const NewPipelineSunState& a, const NewPipelineSunState& b);
 void ApplyControlPacketToCameraAndScene(
     const ClientControlPacket& packet,
     wi::scene::CameraComponent& camera,

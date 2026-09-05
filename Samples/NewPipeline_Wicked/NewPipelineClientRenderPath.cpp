@@ -231,12 +231,6 @@ bool NearlyEqual(
     return true;
 }
 
-bool SunMatches(const NewPipelineSunState& a, const NewPipelineSunState& b)
-{
-    return a.enabled == b.enabled && NearlyEqual(a.direction, b.direction) &&
-        NearlyEqual(a.color, b.color) && NearlyEqual(a.intensity, b.intensity);
-}
-
 std::string EnabledString(bool value)
 {
     return value ? "enabled" : "disabled";
@@ -310,23 +304,7 @@ void NewPipelineClientRenderPath::SetSunState(const NewPipelineSunState& value)
     if (scene_initialized)
     {
         ApplySunStateToScene(local_scene, sun_state);
-        if (baked_sun_reference_valid && !SunMatches(sun_state, baked_sun_state))
-        {
-            client_static_lighting.MarkStale("runtime sun differs from baked sun");
-            lightmap_bake_status = client_static_lighting.GetLightmapStatus();
-            reflection_probe_status = client_static_lighting.GetProbeStatus();
-            client_static_lighting.DisableLightmaps(local_scene);
-            if (wi::scene::EnvironmentProbeComponent* probe = local_scene.probes.GetComponent(environment_probe_entity))
-            {
-                InitializeBlackEnvironmentProbe(*probe);
-                CreateEnvironmentProbeMipViews();
-            }
-        }
-        else if (baked_sun_reference_valid && client_static_lighting.IsStale())
-        {
-            client_static_lighting.ClearStale();
-            LoadStaticLightingAssets();
-        }
+        RefreshStaticLightingForSun();
     }
 }
 
@@ -337,6 +315,43 @@ void NewPipelineClientRenderPath::SetDebugPreviewMode(DebugPreviewMode mode)
     setDDGIOutputDebugPreview(wi::RenderPath3D::DDGIOutputDebugPreview::Disabled);
     debug_preview_invalid_logged = false;
     wi::backlog::post(std::string{"Client debug preview mode: "} + ToString(debug_preview_mode));
+}
+
+void NewPipelineClientRenderPath::RefreshStaticLightingForSun()
+{
+    if (baked_sun_reference_valid &&
+        !ClientLightingSunMatches(sun_state, baked_sun_state))
+    {
+        client_static_lighting.MarkLightmapsStale("runtime sun differs from lightmap/VLM bake");
+        client_static_lighting.DisableLightmaps(local_scene);
+    }
+    else if (baked_sun_reference_valid && client_static_lighting.AreLightmapsStale())
+    {
+        LoadStaticLightingAssets();
+    }
+    lightmap_bake_status = client_static_lighting.GetLightmapStatus();
+
+    if (!probe_baked_sun_reference_valid)
+        return;
+    if (!ClientLightingSunMatches(sun_state, probe_baked_sun_state))
+    {
+        if (client_static_lighting.GetProbeState() == ClientLightingAssetState::Valid)
+        {
+            client_static_lighting.SetProbeStatus(ClientLightingAssetState::Stale,
+                "Reflection Probe: STALE runtime sun differs from probe bake");
+            if (auto* probe = local_scene.probes.GetComponent(environment_probe_entity))
+            {
+                InitializeBlackEnvironmentProbe(*probe);
+                CreateEnvironmentProbeMipViews();
+            }
+        }
+    }
+    else if (client_static_lighting.GetProbeState() == ClientLightingAssetState::Stale &&
+        render_settings.environment_probe_enabled)
+    {
+        LoadEnvironmentProbeAsset();
+    }
+    reflection_probe_status = client_static_lighting.GetProbeStatus();
 }
 
 std::string NewPipelineClientRenderPath::GetEffectiveAlgorithmSummary() const
@@ -942,6 +957,18 @@ void NewPipelineClientRenderPath::ScheduleVolumetricLightmapReadback() const
     volumetric_readback_error.clear();
 }
 
+void NewPipelineClientRenderPath::PrepareRemoteGBufferHistoryCapture()
+{
+    // Retire the destination before UpdateElasticLighting selects resources.
+    // RenderAO will overwrite this texture before Visibility_Shade executes;
+    // a binding made while it still identified the old frame would be stale.
+    if (has_published_control_packet &&
+        last_published_control_packet.control_frame_id != 0 &&
+        last_published_control_packet.control_frame_id != remote_gbuffer_history_last_capture &&
+        remote_gbuffer_history_active_capacity != 0)
+        remote_gbuffer_history[remote_gbuffer_history_write_index].valid = false;
+}
+
 void NewPipelineClientRenderPath::CaptureRemoteGBufferHistory(
     wi::graphics::CommandList cmd) const
 {
@@ -994,6 +1021,7 @@ void NewPipelineClientRenderPath::Update(float dt)
     UpdateClientVolumetricLightmapInstances();
     PollRemoteFrameMetadata();
     AcquireRemoteVideoFrame(dt);
+    PrepareRemoteGBufferHistoryCapture();
     UpdateElasticLighting(dt);
 
     if (!status_logged)
@@ -1210,19 +1238,16 @@ bool NewPipelineClientRenderPath::TryMatchRemoteVideoFrame(
         {
             const RemoteFrameMetadata& channel_metadata =
                 downstream_metadata_cache[metadata_index].metadata;
-            // Native surfaces do not contain the in-band pixel metadata used
-            // by I420. WebRTC applies a session-random offset to RTP timestamps,
-            // so the sender's zero-based RTP value cannot be compared directly
-            // with the decoded frame. The hardware H264 path carries the
-            // original capture timestamp in-band in SEI; exact millisecond
-            // equality remains unique at the supported frame rates.
+            // Both hardware encoders carry the exact producer timestamp in
+            // the shared SEI contract. Receiver clocks and RTP offsets are
+            // never used as substitutes for this identity.
             if (pending_video.frame.IsNativeNV12())
             {
                 const int64_t capture_timestamp_usec =
                     pending_video.frame.nv12.timestamp_usec;
-                if (capture_timestamp_usec < 0 ||
-                    static_cast<uint64_t>(capture_timestamp_usec) / 1000u !=
-                        channel_metadata.timestamp_usec / 1000u)
+                if (capture_timestamp_usec <= 0 ||
+                    static_cast<uint64_t>(capture_timestamp_usec) !=
+                        channel_metadata.timestamp_usec)
                     continue;
             }
             else
@@ -1315,7 +1340,71 @@ bool ValidateRemoteClientPairingSelfTest(std::string* error)
         !path.pending_remote_video_frames.empty() ||
         !path.downstream_metadata_cache.empty())
         return fail("preserved metadata 11 did not match its later video frame");
-    return true;
+    // Native frames must match the exact source clock, even when two records
+    // happen to lie in the same millisecond or the RTP clock has an offset.
+    auto owner = std::make_shared<int>(0);
+    NewPipelineClientRenderPath::PendingRemoteVideoFrame native;
+    native.frame.nv12.width = 4;
+    native.frame.nv12.height = 4;
+    native.frame.nv12.texture_shared_handle = owner.get();
+    native.frame.nv12.fence_shared_handle = owner.get();
+    native.frame.nv12.producer_fence_value = 1;
+    native.frame.nv12.consumer_fence_value = 2;
+    native.frame.nv12.adapter_luid = 1;
+    native.frame.nv12.frame_lifetime = owner;
+    native.frame.nv12.timestamp_usec = 1234567;
+    native.native_rtp_timestamp = 0xf0000000;
+    native.local_receive_timestamp_usec = 140;
+    path.pending_remote_video_frames.push_back(native);
+    metadata_11.metadata.timestamp_usec = 1234568;
+    path.downstream_metadata_cache.push_back(metadata_11);
+    if (path.TryMatchRemoteVideoFrame(frame, layout))
+        return fail("native pairing accepted a different microsecond identity");
+    path.downstream_metadata_cache.front().metadata.timestamp_usec = 1234567;
+    if (!path.TryMatchRemoteVideoFrame(frame, layout))
+        return fail("native pairing depended on the receiver RTP offset");
+
+    path.remote_gbuffer_history_active_capacity = 2;
+    path.remote_gbuffer_history_write_index = 0;
+    path.remote_gbuffer_history_last_capture = 11;
+    path.remote_gbuffer_history[0].valid = true;
+    path.remote_gbuffer_history[0].control_frame_id = 10;
+    path.remote_gbuffer_history[1].valid = true;
+    path.has_published_control_packet = true;
+    path.last_published_control_packet.control_frame_id = 12;
+    path.PrepareRemoteGBufferHistoryCapture();
+    if (path.remote_gbuffer_history[0].valid || !path.remote_gbuffer_history[1].valid)
+        return fail("history overwrite did not retire exactly its destination before binding");
+    path.remote_gbuffer_history[0].valid = true;
+    path.last_published_control_packet.control_frame_id = 11;
+    path.PrepareRemoteGBufferHistoryCapture();
+    if (!path.remote_gbuffer_history[0].valid)
+        return fail("unchanged heartbeat retired a retained history entry");
+
+    const auto sun_a = MakeSunStateFromAngles(true, -35, 50);
+    const auto sun_b = MakeSunStateFromAngles(true, 40, 25);
+    path.baked_sun_state = sun_a;
+    path.baked_sun_reference_valid = true;
+    path.probe_baked_sun_state = sun_b;
+    path.probe_baked_sun_reference_valid = true;
+    path.sun_state = sun_b;
+    path.client_static_lighting.SetLightmapStatus(ClientLightingAssetState::Valid, "test lightmap A");
+    path.client_static_lighting.SetProbeStatus(ClientLightingAssetState::Valid, "test probe B");
+    path.RefreshStaticLightingForSun();
+    if (!path.client_static_lighting.AreLightmapsStale() ||
+        path.client_static_lighting.GetProbeState() != ClientLightingAssetState::Valid ||
+        !ClientLightingSunMatches(path.baked_sun_state, sun_a))
+        return fail("independent probe bake changed lightmap lighting validity");
+    path.client_volumetric_lightmap.dimensions = XMUINT3(2, 2, 2);
+    path.client_volumetric_lightmap.bounds_max = XMFLOAT3(1, 1, 1);
+    path.client_volumetric_lightmap.probes.resize(8);
+    path.local_scene.instanceArraySize = 1;
+    path.visibilityResources.buffer_client_vlm_instances = &path.volumetric_instance_buffer;
+    path.UpdateClientVolumetricLightmapInstances();
+    if (path.visibilityResources.buffer_client_vlm_instances != nullptr ||
+        path.visibilityResources.buffer_client_vlm_instances_upload != nullptr)
+        return fail("stale baked VLM remained bound");
+    return ValidateClientStaticLightingSelfTest(error);
 }
 
 void NewPipelineClientRenderPath::InitializeSceneIfNeeded()
@@ -1375,12 +1464,14 @@ void NewPipelineClientRenderPath::InitializeSceneIfNeeded()
         wi::backlog::post("Client Lightmap package unavailable: procedural scene has no persistent source asset");
     }
 
-    scene_initialized = true;
-    ApplyEnvironmentProbeSettings(false);
+    // LoadLightmaps installs the validated derived scene, including the sun
+    // used for the bake. Initialize UI/runtime state from that final scene.
+    sun_state = ExtractSunStateFromScene(local_scene);
     baked_sun_state = sun_state;
     baked_sun_reference_valid =
-        client_static_lighting.GetLightmapState() == ClientLightingAssetState::Valid ||
-        client_static_lighting.GetProbeState() == ClientLightingAssetState::Valid;
+        client_static_lighting.GetLightmapState() == ClientLightingAssetState::Valid;
+    scene_initialized = true;
+    ApplyEnvironmentProbeSettings(false);
 }
 
 void NewPipelineClientRenderPath::ApplyRenderSettings(bool log_changes)
@@ -1802,6 +1893,7 @@ void NewPipelineClientRenderPath::InitializeBlackEnvironmentProbe(wi::scene::Env
 
 void NewPipelineClientRenderPath::LoadEnvironmentProbeAsset()
 {
+    probe_baked_sun_reference_valid = false;
     environment_probe_load_attempted = true;
     reflection_probe_mip_subresources.clear();
     reflection_probe_asset_path = scene_asset_path.empty()
@@ -1828,6 +1920,8 @@ void NewPipelineClientRenderPath::LoadEnvironmentProbeAsset()
     const ClientReflectionProbeDescriptor descriptor = ClientReflectionProbePackage::Describe(
         local_scene, environment_probe_entity, kClientReflectionProbeResolution);
     ClientReflectionProbePackageResult load_result = client_static_lighting.LoadProbe(scene_asset_path, descriptor);
+    probe_baked_sun_state = load_result.baked_sun;
+    probe_baked_sun_reference_valid = load_result.baked_sun_valid;
     reflection_probe_status = load_result.diagnostic;
     if (!load_result.success)
     {
@@ -1855,6 +1949,14 @@ void NewPipelineClientRenderPath::LoadStaticLightingAssets()
         return;
     const ClientLightmapPackageResult lightmap_result =
         client_static_lighting.LoadLightmaps(scene_asset_path, local_scene);
+    baked_sun_reference_valid = lightmap_result.success;
+    if (lightmap_result.success)
+        baked_sun_state = ExtractSunStateFromScene(local_scene);
+    // Scene replacement must not silently replace the user's runtime sun.
+    ApplySunStateToScene(local_scene, sun_state);
+    client_static_lighting.ClearLightmapsStale();
+    if (baked_sun_reference_valid && !ClientLightingSunMatches(sun_state, baked_sun_state))
+        client_static_lighting.MarkLightmapsStale("runtime sun differs from lightmap/VLM bake");
     client_volumetric_lightmap =
         lightmap_result.success
             ? lightmap_result.volumetric_lightmap
@@ -1871,7 +1973,7 @@ void NewPipelineClientRenderPath::LoadStaticLightingAssets()
     environment_probe_load_attempted = false;
     if (render_settings.environment_probe_enabled)
         ApplyEnvironmentProbeSettings(false);
-    if (!render_settings.baked_lightmaps_enabled)
+    if (!render_settings.baked_lightmaps_enabled || client_static_lighting.AreLightmapsStale())
         client_static_lighting.DisableLightmaps(local_scene);
 }
 
@@ -1917,7 +2019,7 @@ void NewPipelineClientRenderPath::ApplyBakedLightmapSettings(bool previous_enabl
         return;
 
     const bool changed = previous_enabled != render_settings.baked_lightmaps_enabled;
-    if (changed && render_settings.baked_lightmaps_enabled && !client_static_lighting.IsStale())
+    if (changed && render_settings.baked_lightmaps_enabled && !client_static_lighting.AreLightmapsStale())
     {
         RestoreBakedLightmaps();
     }
@@ -2205,9 +2307,8 @@ void NewPipelineClientRenderPath::UpdateReflectionProbeBake()
     reflection_probe_status = "Reflection Probe: VALID 128px, " +
         std::to_string(probe->texture.GetDesc().mip_levels) + " mips -> " + reflection_probe_asset_path;
     client_static_lighting.SetProbeStatus(ClientLightingAssetState::Valid, reflection_probe_status);
-    client_static_lighting.ClearStale();
-    baked_sun_state = sun_state;
-    baked_sun_reference_valid = true;
+    probe_baked_sun_state = verify_result.baked_sun;
+    probe_baked_sun_reference_valid = verify_result.baked_sun_valid;
     static_lighting_bake_requested = false;
     wi::backlog::post(reflection_probe_status);
 }
@@ -3218,6 +3319,7 @@ void NewPipelineClientRenderPath::UpdateClientVolumetricLightmapInstances()
     visibilityResources.buffer_client_vlm_instances = nullptr;
     visibilityResources.buffer_client_vlm_instances_upload = nullptr;
     if (!render_settings.baked_lightmaps_enabled ||
+        client_static_lighting.AreLightmapsStale() ||
         !render_settings.dynamic_object_vlm_enabled ||
         !client_volumetric_lightmap.IsValid() ||
         local_scene.instanceArraySize == 0)
@@ -3556,7 +3658,7 @@ void NewPipelineClientRenderPath::FinishLightmapBake()
         ClientLightmapPackage::DerivedScenePathForScene(scene_asset_path) + " + " +
         ClientLightmapPackage::PackagePathForScene(scene_asset_path);
     client_static_lighting.SetLightmapStatus(ClientLightingAssetState::Valid, lightmap_bake_status);
-    client_static_lighting.ClearStale();
+    client_static_lighting.ClearLightmapsStale();
     baked_sun_state = sun_state;
     baked_sun_reference_valid = true;
     prepared_scene_temp_path.clear();
@@ -3620,28 +3722,8 @@ void NewPipelineClientRenderPath::ReloadSceneAfterLightmapBakeAbort()
     if (!result.loaded_asset_path.empty())
         scene_asset_path = result.loaded_asset_path;
     scene_source_root_entity = result.loaded_root_entity;
-    ApplySunStateToScene(local_scene, sun_state);
-    const ClientLightmapPackageResult package_result =
-        client_static_lighting.LoadLightmaps(scene_asset_path, local_scene);
-    client_volumetric_lightmap =
-        package_result.success
-            ? package_result.volumetric_lightmap
-            : ClientVolumetricLightmapData{};
-    if (package_result.scene_replaced)
-        scene_source_root_entity = wi::ecs::INVALID_ENTITY;
-    wi::backlog::post(package_result.diagnostic);
-    lightmap_bake_status = client_static_lighting.GetLightmapStatus();
+    LoadStaticLightingAssets();
     AdvanceSceneGeneration("lightmap abort scene reload");
-    ApplyEnvironmentProbeSettings(false);
-    if (baked_sun_reference_valid && !SunMatches(sun_state, baked_sun_state))
-    {
-        client_static_lighting.MarkStale("runtime sun differs from baked sun");
-        lightmap_bake_status = client_static_lighting.GetLightmapStatus();
-        reflection_probe_status = client_static_lighting.GetProbeStatus();
-        client_static_lighting.DisableLightmaps(local_scene);
-        if (wi::scene::EnvironmentProbeComponent* probe = local_scene.probes.GetComponent(environment_probe_entity))
-            InitializeBlackEnvironmentProbe(*probe);
-    }
 }
 
 void NewPipelineClientRenderPath::LogLightmapSceneParity(const char* phase)
@@ -4413,9 +4495,9 @@ void NewPipelineClientRenderPath::AcquireRemoteVideoFrame(float dt)
     const bool agrees = retained_frame.IsNativeNV12()
         ? (video_layout.video_width == retained_frame.nv12.width &&
             video_layout.video_height == retained_frame.nv12.height &&
-            retained_frame.nv12.timestamp_usec >= 0 &&
-            static_cast<uint64_t>(retained_frame.nv12.timestamp_usec) / 1000u ==
-                video_layout.metadata.timestamp_usec / 1000u)
+            retained_frame.nv12.timestamp_usec > 0 &&
+            static_cast<uint64_t>(retained_frame.nv12.timestamp_usec) ==
+                video_layout.metadata.timestamp_usec)
         : (DecodeRemoteVideoFrameLayout(
                 retained_frame.i420, pixel_layout, &error) &&
             video_layout.protocol_version == pixel_layout.protocol_version &&

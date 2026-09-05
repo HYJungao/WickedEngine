@@ -18,7 +18,7 @@ namespace wicked_newpipeline
 namespace
 {
 constexpr std::array<uint8_t, 4> kProbeMagic = {'N', 'P', 'R', 'B'};
-constexpr uint32_t kProbeVersion = 2;
+constexpr uint32_t kProbeVersion = 3;
 constexpr uint32_t kProbeFormatBC6H = static_cast<uint32_t>(wi::graphics::Format::BC6H_UF16);
 constexpr uint32_t kMaxProbeIdLength = 4096;
 
@@ -97,6 +97,48 @@ bool Matches(const ClientReflectionProbeDescriptor& a, const ClientReflectionPro
         NearlyEqual(a.scale.y, b.scale.y) && NearlyEqual(a.scale.z, b.scale.z);
 }
 
+wi::vector<uint8_t> EncodeProbePackage(
+    uint64_t source_scene_hash, uint64_t derived_scene_hash,
+    const ClientReflectionProbeDescriptor& descriptor, uint32_t mip_count,
+    const wi::vector<uint8_t>& dds)
+{
+    wi::vector<uint8_t> bytes;
+    bytes.insert(bytes.end(), kProbeMagic.begin(), kProbeMagic.end());
+    AppendInteger(bytes, kProbeVersion);
+    AppendInteger(bytes, source_scene_hash);
+    AppendInteger(bytes, derived_scene_hash);
+    AppendInteger(bytes, static_cast<uint32_t>(descriptor.id.size()));
+    bytes.insert(bytes.end(), descriptor.id.begin(), descriptor.id.end());
+    AppendInteger(bytes, static_cast<uint32_t>(descriptor.baked_sun.enabled));
+    AppendFloat(bytes, descriptor.baked_sun.direction.x);
+    AppendFloat(bytes, descriptor.baked_sun.direction.y);
+    AppendFloat(bytes, descriptor.baked_sun.direction.z);
+    AppendFloat(bytes, descriptor.baked_sun.color.x);
+    AppendFloat(bytes, descriptor.baked_sun.color.y);
+    AppendFloat(bytes, descriptor.baked_sun.color.z);
+    AppendFloat(bytes, descriptor.baked_sun.intensity);
+    AppendFloat(bytes, descriptor.position.x);
+    AppendFloat(bytes, descriptor.position.y);
+    AppendFloat(bytes, descriptor.position.z);
+    AppendFloat(bytes, descriptor.rotation.x);
+    AppendFloat(bytes, descriptor.rotation.y);
+    AppendFloat(bytes, descriptor.rotation.z);
+    AppendFloat(bytes, descriptor.rotation.w);
+    AppendFloat(bytes, descriptor.scale.x);
+    AppendFloat(bytes, descriptor.scale.y);
+    AppendFloat(bytes, descriptor.scale.z);
+    AppendInteger(bytes, descriptor.resolution);
+    AppendInteger(bytes, mip_count);
+    AppendInteger(bytes, kProbeFormatBC6H);
+    const uint64_t payload_offset = bytes.size() + sizeof(uint64_t) * 2 + sizeof(uint32_t);
+    AppendInteger(bytes, payload_offset);
+    AppendInteger(bytes, static_cast<uint64_t>(dds.size()));
+    AppendInteger(bytes, CRC32(dds.data(), dds.size()));
+    bytes.insert(bytes.end(), dds.begin(), dds.end());
+
+    return bytes;
+}
+
 bool CommitAtomically(const std::string& path, const wi::vector<uint8_t>& bytes, std::string& error)
 {
     namespace fs = std::filesystem;
@@ -142,6 +184,72 @@ bool CommitAtomically(const std::string& path, const wi::vector<uint8_t>& bytes,
     return true;
 }
 } // namespace
+
+bool ValidateClientStaticLightingSelfTest(std::string* error)
+{
+    const auto fail = [error](const char* message) {
+        if (error != nullptr)
+            *error = message;
+        return false;
+    };
+    const auto sun_a = MakeSunStateFromAngles(true, -35, 50);
+    const auto sun_b = MakeSunStateFromAngles(true, 40, 25);
+    wi::scene::Scene derived_scene;
+    ApplySunStateToScene(derived_scene, sun_b);
+    const auto loaded_sun = ExtractSunStateFromScene(derived_scene);
+    if (!ClientLightingSunMatches(loaded_sun, sun_b) ||
+        !ClientLightingSunMatches(MakeSunStateFromAngles(loaded_sun.enabled,
+            loaded_sun.yaw_degrees, loaded_sun.pitch_degrees), sun_b))
+        return fail("derived lighting did not restore matching runtime/UI sun");
+
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const fs::path temporary_root = fs::temp_directory_path(ec);
+    if (ec)
+        return fail("static lighting self-test has no temporary directory");
+    const fs::path directory = temporary_root / ("newpipeline-lighting-test-" + MakeProbeId(0));
+    if (!fs::create_directory(directory, ec) || ec)
+        return fail("static lighting self-test could not create fixtures");
+    struct Cleanup
+    {
+        fs::path directory;
+        ~Cleanup() { std::error_code ignored; fs::remove_all(directory, ignored); }
+    } cleanup{directory};
+    const std::string source = (directory / "fixture.wiscene").string();
+    const std::string derived = ClientLightmapPackage::DerivedScenePathForScene(source);
+    const uint8_t fixture_byte = 42;
+    if (!wi::helper::FileWrite(source, &fixture_byte, 1) ||
+        !wi::helper::FileWrite(derived, &fixture_byte, 1))
+        return fail("static lighting self-test could not write hash fixtures");
+    ClientReflectionProbeDescriptor descriptor;
+    descriptor.id = "fixture-probe";
+    descriptor.baked_sun = sun_a;
+    const wi::vector<uint8_t> payload = {1, 2, 3, 4};
+    auto bytes = EncodeProbePackage(ClientLightmapPackage::HashFile(source),
+        ClientLightmapPackage::HashFile(derived), descriptor, 1, payload);
+    const std::string package = ClientReflectionProbePackage::PackagePathForScene(source);
+    if (!wi::helper::FileWrite(package, bytes.data(), bytes.size()))
+        return fail("static lighting self-test could not write probe fixture");
+    descriptor.baked_sun = sun_b;
+    ClientReflectionProbePackage loader;
+    auto result = loader.Load(source, descriptor);
+    if (result.success || result.state != ClientLightingAssetState::Stale ||
+        !result.baked_sun_valid || !ClientLightingSunMatches(result.baked_sun, sun_a))
+        return fail("persisted probe lighting was not rejected under a different sun");
+    bytes.back() ^= 1;
+    if (!wi::helper::FileWrite(package, bytes.data(), bytes.size()))
+        return fail("static lighting self-test fixture update failed");
+    result = loader.Load(source, descriptor);
+    if (result.state != ClientLightingAssetState::Corrupt || result.baked_sun_valid)
+        return fail("corrupt probe payload supplied a trusted bake identity");
+    bytes[4] = 2;
+    if (!wi::helper::FileWrite(package, bytes.data(), bytes.size()))
+        return fail("static lighting self-test old version fixture failed");
+    result = loader.Load(source, descriptor);
+    if (result.state != ClientLightingAssetState::Stale || result.baked_sun_valid)
+        return fail("old probe package fabricated a bake lighting reference");
+    return true;
+}
 
 const char* ToString(ClientLightingAssetState state)
 {
@@ -199,6 +307,7 @@ ClientReflectionProbeDescriptor ClientReflectionProbePackage::Describe(
     ClientReflectionProbeDescriptor descriptor;
     descriptor.id = GetProbeId(scene, entity);
     descriptor.resolution = resolution;
+    descriptor.baked_sun = ExtractSunStateFromScene(scene);
     if (const wi::scene::TransformComponent* transform = scene.transforms.GetComponent(entity))
     {
         descriptor.position = transform->translation_local;
@@ -250,6 +359,27 @@ ClientReflectionProbePackageResult ClientReflectionProbePackage::Load(
     }
     stored.id.assign(reinterpret_cast<const char*>(bytes.data() + cursor), id_length);
     cursor += id_length;
+    if (version != kProbeVersion)
+    {
+        result.state = ClientLightingAssetState::Stale;
+        result.diagnostic = "Reflection Probe: STALE package has no validated bake lighting; rebake Probe";
+        return result;
+    }
+    uint32_t sun_enabled = 0;
+    if (!ReadInteger(bytes, cursor, sun_enabled) || sun_enabled > 1 ||
+        !ReadFloat(bytes, cursor, stored.baked_sun.direction.x) ||
+        !ReadFloat(bytes, cursor, stored.baked_sun.direction.y) ||
+        !ReadFloat(bytes, cursor, stored.baked_sun.direction.z) ||
+        !ReadFloat(bytes, cursor, stored.baked_sun.color.x) ||
+        !ReadFloat(bytes, cursor, stored.baked_sun.color.y) ||
+        !ReadFloat(bytes, cursor, stored.baked_sun.color.z) ||
+        !ReadFloat(bytes, cursor, stored.baked_sun.intensity))
+    {
+        result.state = ClientLightingAssetState::Corrupt;
+        result.diagnostic = "Reflection Probe: CORRUPT bake lighting descriptor";
+        return result;
+    }
+    stored.baked_sun.enabled = sun_enabled != 0;
     if (!ReadFloat(bytes, cursor, stored.position.x) || !ReadFloat(bytes, cursor, stored.position.y) ||
         !ReadFloat(bytes, cursor, stored.position.z) || !ReadFloat(bytes, cursor, stored.rotation.x) ||
         !ReadFloat(bytes, cursor, stored.rotation.y) || !ReadFloat(bytes, cursor, stored.rotation.z) ||
@@ -288,6 +418,15 @@ ClientReflectionProbePackageResult ClientReflectionProbePackage::Load(
     {
         result.state = ClientLightingAssetState::Corrupt;
         result.diagnostic = "Reflection Probe: CORRUPT payload CRC mismatch";
+        return result;
+    }
+
+    result.baked_sun = stored.baked_sun;
+    result.baked_sun_valid = true;
+    if (!ClientLightingSunMatches(stored.baked_sun, expected.baked_sun))
+    {
+        result.state = ClientLightingAssetState::Stale;
+        result.diagnostic = "Reflection Probe: STALE runtime sun differs from probe bake";
         return result;
     }
 
@@ -359,31 +498,8 @@ bool ClientReflectionProbePackage::Save(
         return false;
     }
 
-    wi::vector<uint8_t> bytes;
-    bytes.insert(bytes.end(), kProbeMagic.begin(), kProbeMagic.end());
-    AppendInteger(bytes, kProbeVersion);
-    AppendInteger(bytes, source_scene_hash);
-    AppendInteger(bytes, derived_scene_hash);
-    AppendInteger(bytes, static_cast<uint32_t>(descriptor.id.size()));
-    bytes.insert(bytes.end(), descriptor.id.begin(), descriptor.id.end());
-    AppendFloat(bytes, descriptor.position.x);
-    AppendFloat(bytes, descriptor.position.y);
-    AppendFloat(bytes, descriptor.position.z);
-    AppendFloat(bytes, descriptor.rotation.x);
-    AppendFloat(bytes, descriptor.rotation.y);
-    AppendFloat(bytes, descriptor.rotation.z);
-    AppendFloat(bytes, descriptor.rotation.w);
-    AppendFloat(bytes, descriptor.scale.x);
-    AppendFloat(bytes, descriptor.scale.y);
-    AppendFloat(bytes, descriptor.scale.z);
-    AppendInteger(bytes, descriptor.resolution);
-    AppendInteger(bytes, desc.mip_levels);
-    AppendInteger(bytes, kProbeFormatBC6H);
-    const uint64_t payload_offset = bytes.size() + sizeof(uint64_t) * 2 + sizeof(uint32_t);
-    AppendInteger(bytes, payload_offset);
-    AppendInteger(bytes, static_cast<uint64_t>(dds.size()));
-    AppendInteger(bytes, CRC32(dds.data(), dds.size()));
-    bytes.insert(bytes.end(), dds.begin(), dds.end());
+    const wi::vector<uint8_t> bytes = EncodeProbePackage(
+        source_scene_hash, derived_scene_hash, descriptor, desc.mip_levels, dds);
 
     if (!CommitAtomically(PackagePathForScene(scene_path), bytes, error))
         return false;
@@ -478,17 +594,15 @@ void ClientStaticLighting::SetProbeStatus(ClientLightingAssetState state, std::s
     probe_status = std::move(message);
 }
 
-void ClientStaticLighting::MarkStale(const std::string& reason)
+void ClientStaticLighting::MarkLightmapsStale(const std::string& reason)
 {
     stale = true;
     stale_reason = reason;
     if (lightmap_state == ClientLightingAssetState::Valid)
         SetLightmapStatus(ClientLightingAssetState::Stale, "Lightmap: STALE " + reason);
-    if (probe_state == ClientLightingAssetState::Valid)
-        SetProbeStatus(ClientLightingAssetState::Stale, "Reflection Probe: STALE " + reason);
 }
 
-void ClientStaticLighting::ClearStale()
+void ClientStaticLighting::ClearLightmapsStale()
 {
     stale = false;
     stale_reason.clear();
