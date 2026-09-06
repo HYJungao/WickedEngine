@@ -153,6 +153,11 @@ struct WebRTCTransportStats
     uint64_t disconnected_control_drops = 0;
     uint64_t queued_control_drops = 0;
     uint64_t lifecycle_last_duration_usec = 0;
+    uint64_t control_receive_busy = 0;
+    uint64_t metadata_receive_busy = 0;
+    uint64_t video_receive_busy = 0;
+    uint64_t control_send_last_usec = 0;
+    uint64_t control_send_max_usec = 0;
     uint64_t cpu_full_frame_copy_bytes = 0;
     uint64_t cpu_conversion_usec = 0;
     uint64_t retained_frame_acquires = 0;
@@ -198,6 +203,7 @@ public:
     bool SendI420Frame(const RetainedI420Frame& frame);
     bool SendNV12Frame(const RetainedNV12Frame& frame);
     bool SendFrameMetadata(const RemoteVideoFrameLayout& layout);
+    // Synchronous: publication worker only, never the render thread.
     bool SendStreamStatus(const RemoteStreamStatus& status);
     bool RequestKeyframe();
     bool TryReceiveFrameMetadata(

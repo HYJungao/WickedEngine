@@ -1,4 +1,5 @@
 #include "NewPipelineTransport.h"
+#include "NewPipelinePacing.h"
 #include "NewPipelineVideoFrameIdentity.h"
 #if defined(__APPLE__)
 extern "C" int np_validate_apple_video_codec_factories(
@@ -17,6 +18,8 @@ extern "C" int np_validate_windows_video_codec_factories(
 #include <cstring>
 #include <limits>
 #include <thread>
+#include <shared_mutex>
+#include <future>
 #include <utility>
 
 namespace wicked_newpipeline
@@ -770,6 +773,112 @@ bool DecodeRemoteVideoFrameLayout(
 
 bool ValidateRemoteTransportSelfTest(std::string* error)
 {
+    // Exercise the production cadence at fixed and fluctuating render rates.
+    // The former reset-to-zero implementation sends only ~406 controls at
+    // 61 FPS over 20 seconds, instead of the expected ~600.
+    for (const int fps : {24, 59, 60, 61, 75, 90, 120, 144})
+    {
+        float accumulator = 0;
+        int sent = 0;
+        for (int tick = 0; tick < fps * 20; ++tick)
+        {
+            accumulator += 1.0f / fps;
+            sent += ConsumeControlPublishInterval(accumulator, 1.0f / 30.0f) ? 1 : 0;
+        }
+        if (std::abs(sent - std::min(fps, 30) * 20) > 1)
+        {
+            SetError(error, "control cadence drifted at " + std::to_string(fps) + " FPS");
+            return false;
+        }
+    }
+    float accumulator = 0;
+    double elapsed = 0;
+    int sent = 0;
+    for (int tick = 0; tick < 2400; ++tick)
+    {
+        const float dt = 1.0f / (tick % 2 ? 61.0f : 59.0f);
+        elapsed += dt;
+        accumulator += dt;
+        sent += ConsumeControlPublishInterval(accumulator, 1.0f / 30.0f) ? 1 : 0;
+    }
+    if (std::abs(sent - elapsed * 30.0) > 1.0)
+    {
+        SetError(error, "control cadence drifted under fluctuating render FPS");
+        return false;
+    }
+    accumulator = 5.0f;
+    if (!ConsumeControlPublishInterval(accumulator, 1.0f / 30.0f) ||
+        ConsumeControlPublishInterval(accumulator, 1.0f / 30.0f))
+    {
+        SetError(error, "control stall replayed obsolete snapshots in a burst");
+        return false;
+    }
+    accumulator = 0.19f;
+    if (ConsumeControlPublishInterval(accumulator, 1.0f / 5.0f) ||
+        !ConsumeControlPublishInterval(accumulator, 1.0f / 30.0f))
+    {
+        SetError(error, "heartbeat to dirty-input transition delayed the snapshot");
+        return false;
+    }
+
+    RemoteStreamStatus selected;
+    selected.control_frame_id = 1;
+    selected.code = RemoteStreamStatusCode::Selected;
+    selected.selection = {kRemoteVideoWireVersionV3, kRemoteEncodingProfileI420V3, RemoteQualityTierV3::High};
+    StreamStatusPublication status;
+    if (status.CanPublish(selected, selected.selection) || !status.ShouldSend(selected, 0))
+    {
+        SetError(error, "first video bypassed negotiation status");
+        return false;
+    }
+    status.RecordAttempt(selected, false, 0);
+    if (status.CanPublish(selected, selected.selection) || status.ShouldSend(selected, 99'999) ||
+        !status.ShouldSend(selected, 100'000))
+    {
+        SetError(error, "failed negotiation status did not apply bounded retry");
+        return false;
+    }
+    status.RecordAttempt(selected, true, 100'000);
+    // An unchanged heartbeat must still repair status loss on the wire.
+    if (!status.CanPublish(selected, selected.selection) || status.ShouldSend(selected, 299'999) ||
+        !status.ShouldSend(selected, 300'000))
+    {
+        SetError(error, "active selection did not permit video / periodic status recovery");
+        return false;
+    }
+    ++selected.control_frame_id;
+    status.RecordAttempt(selected, false, 300'000);
+    if (!status.CanPublish(selected, selected.selection))
+    {
+        SetError(error, "ordinary input status failure blocked active video");
+        return false;
+    }
+    auto changed = selected;
+    changed.selection.quality_tier = RemoteQualityTierV3::Balanced;
+    if (!status.ShouldSend(changed, 300'001) || status.CanPublish(changed, changed.selection))
+    {
+        SetError(error, "changed selection reused an old announcement");
+        return false;
+    }
+    status.RecordAttempt(changed, true, 300'001);
+    if (!status.CanPublish(changed, changed.selection) || status.CanPublish(changed, selected.selection))
+    {
+        SetError(error, "selection transition published a stale queued layout");
+        return false;
+    }
+    auto rejected = changed;
+    rejected.code = RemoteStreamStatusCode::NoCommonProtocol;
+    if (status.CanPublish(rejected, changed.selection))
+    {
+        SetError(error, "rejected selection published video");
+        return false;
+    }
+    status = {};
+    if (status.CanPublish(changed, changed.selection))
+    {
+        SetError(error, "reconnect reused previous session announcement");
+        return false;
+    }
     if (!ValidateRemoteTransportLifecycleSelfTest(error))
         return false;
     const std::vector<uint8_t> picture = {0, 0, 0, 1, 0x65, 0x88, 0x84};
@@ -1344,7 +1453,14 @@ struct WebRTCVideoTransport::Impl
     bool desired_running = false;
     bool shutdown = false;
 
-    std::mutex bridge_mutex;
+    // Shared operations pin the bridge while its independently synchronized
+    // channels run concurrently. Only attach/detach requires exclusive access;
+    // a signaling BlockingCall must never exclude render-thread receives.
+    std::shared_mutex bridge_mutex;
+    // The C bridge's two-call receive API has per-stream staging storage.
+    std::mutex control_receive_mutex;
+    std::mutex metadata_receive_mutex;
+    std::mutex video_receive_mutex;
     NPWebRTCBridge* bridge = nullptr;
     bool server = false;
     std::atomic_bool bridge_attached{false};
@@ -1362,6 +1478,11 @@ struct WebRTCVideoTransport::Impl
     std::atomic<uint64_t> cpu_conversion_usec{0};
     std::atomic<uint64_t> retained_frame_acquires{0};
     std::atomic<uint64_t> retained_i420_bytes{0};
+    std::atomic<uint64_t> control_receive_busy{0};
+    std::atomic<uint64_t> metadata_receive_busy{0};
+    std::atomic<uint64_t> video_receive_busy{0};
+    std::atomic<uint64_t> control_send_last_usec{0};
+    std::atomic<uint64_t> control_send_max_usec{0};
     std::mutex control_queue_mutex;
     ClientControlPacket pending_control = {};
     std::atomic_bool control_pending{false};
@@ -1426,13 +1547,18 @@ struct WebRTCVideoTransport::Impl
         stats.cpu_conversion_usec = cpu_conversion_usec.load(std::memory_order_relaxed);
         stats.retained_frame_acquires = retained_frame_acquires.load(std::memory_order_relaxed);
         stats.retained_i420_bytes = retained_i420_bytes.load(std::memory_order_relaxed);
+        stats.control_receive_busy = control_receive_busy.load(std::memory_order_relaxed);
+        stats.metadata_receive_busy = metadata_receive_busy.load(std::memory_order_relaxed);
+        stats.video_receive_busy = video_receive_busy.load(std::memory_order_relaxed);
+        stats.control_send_last_usec = control_send_last_usec.load(std::memory_order_relaxed);
+        stats.control_send_max_usec = control_send_max_usec.load(std::memory_order_relaxed);
         std::atomic_store(&stats_snapshot,
             std::make_shared<const WebRTCTransportStats>(std::move(stats)));
     }
 
     NPWebRTCBridge* DetachBridge()
     {
-        std::lock_guard lock(bridge_mutex);
+        std::unique_lock lock(bridge_mutex);
         NPWebRTCBridge* detached = bridge;
         bridge = nullptr;
         bridge_attached.store(false, std::memory_order_release);
@@ -1540,14 +1666,14 @@ struct WebRTCVideoTransport::Impl
 
             NPWebRTCBridge* current = nullptr;
             {
-                std::lock_guard lock(bridge_mutex);
+                std::shared_lock lock(bridge_mutex);
                 current = bridge;
             }
             if (current != nullptr)
             {
                 WebRTCTransportStats stats;
                 {
-                    std::lock_guard lock(bridge_mutex);
+                    std::shared_lock lock(bridge_mutex);
                     stats = ReadNativeStats(bridge);
                 }
                 apply_encoder_request(stats, role_server, config);
@@ -1560,12 +1686,20 @@ struct WebRTCVideoTransport::Impl
                         packet = pending_control;
                         control_pending.store(false, std::memory_order_release);
                     }
-                    std::lock_guard lock(bridge_mutex);
+                    std::shared_lock lock(bridge_mutex);
                     if (bridge != nullptr && !server)
                     {
                         std::vector<uint8_t> bytes;
                         if (SerializeClientControlPacket(packet, bytes, nullptr))
+                        {
+                            const uint64_t begin = NowUsec();
                             np_webrtc_bridge_send_control(bridge, bytes.data(), bytes.size());
+                            const uint64_t elapsed = NowUsec() - begin;
+                            control_send_last_usec.store(elapsed, std::memory_order_relaxed);
+                            control_send_max_usec.store(std::max(elapsed,
+                                control_send_max_usec.load(std::memory_order_relaxed)),
+                                std::memory_order_relaxed);
+                        }
                     }
                 }
                 PublishStats(stats);
@@ -1657,7 +1791,7 @@ struct WebRTCVideoTransport::Impl
             }
 
             {
-                std::lock_guard lock(bridge_mutex);
+                std::unique_lock lock(bridge_mutex);
                 bridge = candidate;
                 server = role_server;
                 bridge_attached.store(true, std::memory_order_release);
@@ -1676,6 +1810,38 @@ struct WebRTCVideoTransport::Impl
 bool ValidateRemoteTransportLifecycleSelfTest(std::string* error)
 {
     WebRTCVideoTransport::Impl state;
+    // Hold the production send-side lifetime lock while simulating a stalled
+    // signaling call. Receivers must still acquire it, and detach must wait.
+    std::promise<void> send_entered;
+    std::promise<void> release_send;
+    auto release = release_send.get_future();
+    std::thread sender([&] {
+        std::shared_lock lock(state.bridge_mutex);
+        send_entered.set_value();
+        release.wait();
+    });
+    send_entered.get_future().wait();
+    bool receive_ready = false;
+    bool detach_excluded = false;
+    {
+        std::shared_lock receive(state.bridge_mutex, std::try_to_lock);
+        receive_ready = receive.owns_lock();
+    }
+    {
+        std::unique_lock detach(state.bridge_mutex, std::try_to_lock);
+        detach_excluded = !detach.owns_lock();
+    }
+    auto detached = std::async(std::launch::async, [&] { return state.DetachBridge(); });
+    const bool detach_waited = detached.wait_for(std::chrono::milliseconds(10)) ==
+        std::future_status::timeout;
+    release_send.set_value();
+    sender.join();
+    detached.get();
+    if (!receive_ready || !detach_excluded || !detach_waited)
+    {
+        SetError(error, "bridge lifetime lock blocked receive or failed to pin an active send");
+        return false;
+    }
     WebRTCTransportStats connected;
     connected.state = WebRTCTransportState::Connected;
     state.PublishStats(connected);
@@ -1809,8 +1975,19 @@ bool WebRTCVideoTransport::TryReceiveControl(ClientControlPacket& packet)
 {
     if (!impl || GetStats().state != WebRTCTransportState::Connected)
         return false;
-    std::unique_lock lock(impl->bridge_mutex, std::try_to_lock);
-    if (!lock.owns_lock() || impl->bridge == nullptr || !impl->server)
+    std::unique_lock receive_lock(impl->control_receive_mutex, std::try_to_lock);
+    if (!receive_lock.owns_lock())
+    {
+        impl->control_receive_busy.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    std::shared_lock lock(impl->bridge_mutex, std::try_to_lock);
+    if (!lock.owns_lock())
+    {
+        impl->control_receive_busy.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (impl->bridge == nullptr || !impl->server)
         return false;
     size_t required = 0;
     int result = np_webrtc_bridge_receive_control(impl->bridge, nullptr, 0, &required);
@@ -1837,7 +2014,7 @@ bool WebRTCVideoTransport::SendI420Frame(const RetainedI420Frame& frame)
     // This API is called by the dedicated latest-only publication worker, not
     // the render thread. A short stats/lifecycle lock collision is therefore
     // backpressure, not a failed frame, and can safely wait for the bridge.
-    std::lock_guard lock(impl->bridge_mutex);
+    std::shared_lock lock(impl->bridge_mutex);
     if (impl->bridge == nullptr || !impl->server)
     {
         impl->disconnected_frame_drops.fetch_add(1, std::memory_order_relaxed);
@@ -1873,7 +2050,7 @@ bool WebRTCVideoTransport::SendNV12Frame(const RetainedNV12Frame& frame)
     // Native publication uses the same worker as I420 publication, so it can
     // wait out the brief bridge stats lock without touching frame cadence on
     // the render thread.
-    std::lock_guard lock(impl->bridge_mutex);
+    std::shared_lock lock(impl->bridge_mutex);
     if (impl->bridge == nullptr || !impl->server ||
         np_webrtc_bridge_supports_native_nv12(impl->bridge) != 1)
     {
@@ -1920,7 +2097,7 @@ bool WebRTCVideoTransport::SendFrameMetadata(const RemoteVideoFrameLayout& layou
         return false;
     // Keep video and its exact identity metadata on the same serialized
     // publication path. The latest-only queue already bounds upstream delay.
-    std::lock_guard lock(impl->bridge_mutex);
+    std::shared_lock lock(impl->bridge_mutex);
     if (impl->bridge == nullptr || !impl->server)
         return false;
     return np_webrtc_bridge_send_frame_metadata(
@@ -1934,8 +2111,8 @@ bool WebRTCVideoTransport::SendStreamStatus(const RemoteStreamStatus& status)
     std::vector<uint8_t> bytes;
     if (!SerializeRemoteStreamStatus(status, bytes, nullptr))
         return false;
-    std::unique_lock lock(impl->bridge_mutex, std::try_to_lock);
-    if (!lock.owns_lock() || impl->bridge == nullptr || !impl->server)
+    std::shared_lock lock(impl->bridge_mutex);
+    if (impl->bridge == nullptr || !impl->server)
         return false;
     return np_webrtc_bridge_send_frame_metadata(
         impl->bridge, bytes.data(), bytes.size()) == 1;
@@ -1948,7 +2125,7 @@ bool WebRTCVideoTransport::RequestKeyframe()
     // This runs on the Server publication worker, never the RenderPath thread.
     // Execute synchronously so the encoder observes the keyframe request before
     // the first frame carrying a new generation/layout is submitted.
-    std::lock_guard lock(impl->bridge_mutex);
+    std::shared_lock lock(impl->bridge_mutex);
     return impl->bridge != nullptr && impl->server &&
         np_webrtc_bridge_request_keyframe(impl->bridge) == 1;
 }
@@ -1962,8 +2139,19 @@ bool WebRTCVideoTransport::TryReceiveFrameMetadata(
         *stream_status = {};
     if (!impl || GetStats().state != WebRTCTransportState::Connected)
         return false;
-    std::unique_lock lock(impl->bridge_mutex, std::try_to_lock);
-    if (!lock.owns_lock() || impl->bridge == nullptr || impl->server)
+    std::unique_lock receive_lock(impl->metadata_receive_mutex, std::try_to_lock);
+    if (!receive_lock.owns_lock())
+    {
+        impl->metadata_receive_busy.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    std::shared_lock lock(impl->bridge_mutex, std::try_to_lock);
+    if (!lock.owns_lock())
+    {
+        impl->metadata_receive_busy.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (impl->bridge == nullptr || impl->server)
         return false;
     size_t required = 0;
     int result = np_webrtc_bridge_receive_frame_metadata(impl->bridge, nullptr, 0, &required);
@@ -2003,8 +2191,19 @@ bool WebRTCVideoTransport::TryAcquireVideoFrame(RetainedRemoteVideoFrame& frame)
     frame = {};
     if (!impl || GetStats().state != WebRTCTransportState::Connected)
         return false;
-    std::unique_lock lock(impl->bridge_mutex, std::try_to_lock);
-    if (!lock.owns_lock() || impl->bridge == nullptr || impl->server)
+    std::unique_lock receive_lock(impl->video_receive_mutex, std::try_to_lock);
+    if (!receive_lock.owns_lock())
+    {
+        impl->video_receive_busy.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    std::shared_lock lock(impl->bridge_mutex, std::try_to_lock);
+    if (!lock.owns_lock())
+    {
+        impl->video_receive_busy.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (impl->bridge == nullptr || impl->server)
         return false;
     NPWebRTCVideoFrame* retained = nullptr;
     if (np_webrtc_bridge_acquire_video_frame(impl->bridge, &retained) != 1 || retained == nullptr)
@@ -2082,7 +2281,7 @@ void WebRTCVideoTransport::ReportNativeNV12Failure()
         return;
     // This is a one-shot error path. Use a blocking lock so the notification
     // cannot be silently lost to an ordinary signaling/stats lock collision.
-    std::lock_guard lock(impl->bridge_mutex);
+    std::shared_lock lock(impl->bridge_mutex);
     if (impl->bridge != nullptr && !impl->server)
         np_webrtc_bridge_report_native_nv12_failure(impl->bridge);
 }

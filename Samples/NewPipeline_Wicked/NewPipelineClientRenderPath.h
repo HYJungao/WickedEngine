@@ -3,6 +3,7 @@
 #include "NewPipelineClientStaticLighting.h"
 #include "NewPipelineScene.h"
 #include "NewPipelineTransport.h"
+#include "NewPipelinePacing.h"
 #include "NewPipelineWindowsGPUInterop.h"
 
 #include <string>
@@ -326,6 +327,9 @@ private:
     uint32_t scene_generation = 1;
     ClientControlPacket last_published_control_packet;
     float control_publish_accumulator = 0.0f;
+    PacingSamples control_publish_intervals;
+    PacingSamples remote_accept_intervals;
+    PacingSamples client_update_intervals;
     bool has_published_control_packet = false;
     bool scene_initialized = false;
     bool baked_sun_reference_valid = false;

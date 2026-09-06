@@ -2091,7 +2091,8 @@ private:
     bool use_internet_ice_ = false;
     NPWebRTCEncoderPreference encoder_preference_ = NP_WEBRTC_ENCODER_HARDWARE;
     uint64_t adapter_luid_ = 0;
-    bool native_nv12_enabled_ = false;
+    // Codec stats may disable native surfaces concurrently with publication.
+    std::atomic_bool native_nv12_enabled_{false};
     std::string requested_encoder_mode_ = "unknown";
     std::string active_encoder_mode_ = "unknown";
     std::string input_surface_ = "i420-readback";

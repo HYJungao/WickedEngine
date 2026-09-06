@@ -337,9 +337,32 @@ The macOS VideoToolbox backend remains hardware accelerated through its existing
 CPU-addressable I420/readback path; a native Metal/CVPixelBuffer path is still open.
 
 The Server panel and Client remote status report DDGI frame/convergence state.
+Client control snapshots target 30 Hz while changing and 5 Hz while unchanged.
+The timer retains fractional time across updates and coalesces missed periods,
+so small render-FPS changes do not turn 30 Hz input into 20 Hz input. Bridge
+operations share a lifetime lock; independent receive queues remain accessible
+while the signaling thread sends controls, and bridge destruction waits for all
+active operations to finish.
+
+The Server publication worker coalesces status replies, repeats them at 5 Hz to
+recover lost status packets, and retries a rejected send after 100 ms. A new
+selection is announced immediately, subject to that retry delay if it fails.
+Only the first announcement of a selection gates its video frames; ordinary
+control/status traffic never gates render-thread capture or completed readback.
+Reconnect clears both pending status and the worker's remembered announcement.
+
+The Client's `Pacing p50/p95/p99 ms` line summarizes the last 120 control-enqueue,
+remote-frame acceptance, and local Update intervals. It measures wall-clock
+cadence, not GPU execution time. `receive-busy[m/v]` counts unsuccessful metadata
+and video receive-lock attempts. The Server reports status-send failures, frames
+gated by an unannounced/mismatched selection, and last/maximum status-send time;
+the Client also reports last/maximum control-send time. Use these alongside
+capture/queue drops and codec counters when comparing idle, movement and turning.
+
 Scene-generation and significant authoritative-sun changes clear Server DDGI
 history and publish the reset reason in the video metadata. `--transport_selftest`
-runs command-line encoder-selection checks, disconnected-control wake/cleanup checks,
+runs fixed/fluctuating-FPS control cadence, status backpressure/selection/reconnect,
+concurrent receive/bridge-destruction, command-line encoder-selection and disconnected-control wake/cleanup checks,
 shared H.264 source-identity checks (including actual VideoToolbox encoding when
 available), V3 descriptor/status checks, High/Balanced atlas-area checks, retained-content cadence, scalar I420 numeric tolerance, formal blend
 endpoints and pixel-band/DataChannel agreement without opening a window. The Client

@@ -400,7 +400,14 @@ std::string NewPipelineClientRenderPath::GetDebugStatusSummary() const
                 std::to_string(downstream_out_of_order_drops) + "/" +
                 std::to_string(downstream_stale_status_drops) +
             " pending=" + std::to_string(downstream_metadata_cache.size()) + "/" +
-                std::to_string(pending_remote_video_frames.size());
+                std::to_string(pending_remote_video_frames.size()) +
+            "\nPacing p50/p95/p99 ms: control=" + control_publish_intervals.SummaryMilliseconds() +
+            " remote=" + remote_accept_intervals.SummaryMilliseconds() +
+            " update=" + client_update_intervals.SummaryMilliseconds() +
+            " receive-busy[m/v]=" + std::to_string(transport.metadata_receive_busy) + "/" +
+                std::to_string(transport.video_receive_busy) +
+            " control-send[last/max]=" + std::to_string(transport.control_send_last_usec / 1000u) + "/" +
+                std::to_string(transport.control_send_max_usec / 1000u) + " ms";
     return GetEffectiveAlgorithmSummary() + "\n" + client_static_lighting.GetStatusSummary() + transport_status +
         "\nPrimary light: stable-id=" + std::to_string(GetNewPipelineSunStableId(local_scene)) +
         " shadow-index=" +
@@ -1009,6 +1016,7 @@ void NewPipelineClientRenderPath::CaptureRemoteGBufferHistory(
 
 void NewPipelineClientRenderPath::Update(float dt)
 {
+    client_update_intervals.Mark(NowUsec());
     InitializeSceneIfNeeded();
     UpdateReflectionProbeBake();
     UpdateLightmapBake(dt);
@@ -1169,6 +1177,8 @@ void NewPipelineClientRenderPath::ResetRemoteTransportSession(
 {
     ClearPendingRemoteFrames();
     remote_consume = {};
+    control_publish_intervals = {};
+    remote_accept_intervals = {};
     accepted_remote_metadata = {};
     accepted_remote_contract_v3 = {};
     accepted_remote_contract_v3_valid = false;
@@ -3867,7 +3877,7 @@ bool NewPipelineClientRenderPath::IsControlPacketChanged(const ClientControlPack
 
 void NewPipelineClientRenderPath::PublishControlPacket(float dt)
 {
-    control_publish_accumulator += dt;
+    control_publish_accumulator += std::max(0.0f, dt);
     ClientControlPacket packet = MakeControlPacketFromCameraAndScene(local_camera, local_scene, frame_id + 1, scene_generation);
     packet.preferred_quality_tier = config.remote_quality_tier;
     packet.control_frame_id = has_published_control_packet
@@ -3875,10 +3885,9 @@ void NewPipelineClientRenderPath::PublishControlPacket(float dt)
         : packet.frame_id;
     const bool changed = IsControlPacketChanged(packet);
     const float publish_interval = changed ? kControlDirtyPublishIntervalSeconds : kControlHeartbeatIntervalSeconds;
-    if (control_publish_accumulator < publish_interval)
+    if (!ConsumeControlPublishInterval(control_publish_accumulator, publish_interval))
         return;
 
-    control_publish_accumulator = 0.0f;
     packet.frame_id = ++frame_id;
     // frame_id is the heartbeat/transport sequence. control_frame_id changes
     // only when the camera, viewport, scene or lighting state changes, so
@@ -3899,6 +3908,7 @@ void NewPipelineClientRenderPath::PublishControlPacket(float dt)
     if (!webrtc_transport.SendControl(packet))
         return;
 
+    control_publish_intervals.Mark(NowUsec());
     last_published_control_packet = packet;
     has_published_control_packet = true;
 }
@@ -4355,6 +4365,7 @@ void NewPipelineClientRenderPath::CommitAcceptedRemoteMetadata(const RemoteFrame
         remote_consume.history_valid = false;
     }
 
+    remote_accept_intervals.Mark(NowUsec());
     remote_consume.accepted_frame_id = metadata.frame_id;
     remote_consume.accepted_generation = metadata.source_generation;
     remote_consume.width = metadata.width;

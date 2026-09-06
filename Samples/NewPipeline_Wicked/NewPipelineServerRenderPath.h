@@ -123,7 +123,6 @@ private:
         kRemoteEncodingProfileI420V3,
         RemoteQualityTierV3::High};
     bool remote_stream_selection_initialized = false;
-    std::optional<RemoteStreamStatus> pending_stream_status;
     std::array<RemoteBufferContentStateV3,
         static_cast<size_t>(RemoteBufferSemantic::Count)>
         remote_content_states = {};
@@ -155,6 +154,13 @@ private:
         uint64_t session_epoch = 0;
     };
     std::optional<PendingVideoPublish> pending_video_frame;
+    // Latest status is protected by publish_mutex and periodically re-sent by
+    // the same worker that serializes video and exact frame metadata.
+    std::optional<RemoteStreamStatus> pending_stream_status;
+    std::atomic<uint64_t> stream_status_send_failures{0};
+    std::atomic<uint64_t> stream_status_send_last_usec{0};
+    std::atomic<uint64_t> stream_status_send_max_usec{0};
+    std::atomic<uint64_t> stream_status_gated_frames{0};
     std::atomic<uint64_t> transport_session_epoch{0};
     std::atomic<uint64_t> publish_queue_drops{0};
     uint64_t remote_capture_count = 0;

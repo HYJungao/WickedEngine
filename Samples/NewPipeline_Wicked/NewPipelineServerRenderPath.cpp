@@ -1,4 +1,5 @@
 #include "NewPipelineServerRenderPath.h"
+#include "NewPipelinePacing.h"
 
 #include "wiHelper.h"
 #include "wiImage.h"
@@ -122,7 +123,12 @@ std::string NewPipelineServerRenderPath::GetDebugStatusSummary() const
             " readback=" + std::to_string(gpu_readback_bytes / 1024u) + " KiB" +
             " cpu-copy=" + std::to_string(
                 transport.cpu_full_frame_copy_bytes / 1024u) + " KiB" +
-            " convert=" + std::to_string(transport.cpu_conversion_usec / 1000u) + " ms";
+            " convert=" + std::to_string(transport.cpu_conversion_usec / 1000u) + " ms" +
+            "\nStatus: failures=" + std::to_string(stream_status_send_failures.load(std::memory_order_relaxed)) +
+            " gated-frames=" + std::to_string(stream_status_gated_frames.load(std::memory_order_relaxed)) +
+            " send[last/max]=" + std::to_string(stream_status_send_last_usec.load(std::memory_order_relaxed) / 1000u) + "/" +
+                std::to_string(stream_status_send_max_usec.load(std::memory_order_relaxed) / 1000u) + " ms" +
+            " control-receive-busy=" + std::to_string(transport.control_receive_busy);
     return GetEffectiveAlgorithmSummary() + "\nSun shadow slice: " + shadow +
         " stable-id=" + std::to_string(authoritative_shadow_light_id) +
         " generation=" + std::to_string(authoritative_shadow_light_generation) +
@@ -453,7 +459,13 @@ void NewPipelineServerRenderPath::MaintainWebRTC(float dt)
         // A peer connection is a protocol identity boundary. Never let a new
         // Client receive a frame selected by the previous Client's control
         // packet, even when the Server process remains alive across reconnects.
-        transport_session_epoch.fetch_add(1, std::memory_order_acq_rel);
+        {
+            std::lock_guard lock(publish_mutex);
+            transport_session_epoch.fetch_add(1, std::memory_order_acq_rel);
+            pending_video_frame.reset();
+            pending_stream_status.reset();
+        }
+        publish_cv.notify_one();
         for (PackedReadbackSlot& slot : packed_readback_ring)
         {
             slot.pending = false;
@@ -474,7 +486,6 @@ void NewPipelineServerRenderPath::MaintainWebRTC(float dt)
             kRemoteEncodingProfileI420V3,
             RemoteQualityTierV3::High};
         remote_stream_selection_initialized = false;
-        pending_stream_status.reset();
         last_applied_frame_id = 0;
         last_applied_control = {};
         has_last_applied_control = false;
@@ -489,8 +500,6 @@ void NewPipelineServerRenderPath::MaintainWebRTC(float dt)
         ++remote_generation;
         if (remote_generation == 0)
             remote_generation = 1;
-        std::lock_guard lock(publish_mutex);
-        pending_video_frame.reset();
     }
     if (entering_connected)
     {
@@ -675,19 +684,8 @@ void NewPipelineServerRenderPath::PublishRemotePayload(float dt)
         return;
     }
 
-    if (pending_stream_status.has_value())
-    {
-        // A selected profile must be announced before any frame using it can
-        // enter the capture/publish pipeline. If the non-blocking channel is
-        // temporarily busy, retain the status and keep capture disabled.
-        if (!webrtc_transport.SendStreamStatus(*pending_stream_status))
-        {
-            remote_capture_requested = false;
-            return;
-        }
-        pending_stream_status.reset();
-    }
-
+    // Status backpressure is handled by the publication worker. Continue
+    // draining completed transfers and capturing while ordinary input arrives.
     ConsumeCompletedPackedReadback();
 
     if (settings.remote_publish_fps <= 0.0f)
@@ -1416,29 +1414,84 @@ void NewPipelineServerRenderPath::StartPublishWorker()
     publish_worker = std::thread([this]() {
         bool first_packed_frame_published = false;
         uint32_t published_generation = 0;
+        uint64_t worker_session_epoch = 0;
+        StreamStatusPublication status_publication;
         for (;;)
         {
             RetainedI420Frame i420_frame;
             RetainedNV12Frame nv12_frame;
             RemoteVideoFrameLayout i420_layout;
             uint64_t session_epoch = 0;
+            std::optional<RemoteStreamStatus> stream_status;
+            bool has_video = false;
             {
                 std::unique_lock lock(publish_mutex);
-                publish_cv.wait(lock, [this]() {
-                    return publish_worker_stop || pending_video_frame.has_value();
-                });
-                if (publish_worker_stop && !pending_video_frame.has_value())
-                    return;
-                i420_frame = std::move(pending_video_frame->i420);
-                nv12_frame = std::move(pending_video_frame->nv12);
-                i420_layout = std::move(pending_video_frame->layout);
-                session_epoch = pending_video_frame->session_epoch;
-                pending_video_frame.reset();
+                for (;;)
+                {
+                    if (publish_worker_stop)
+                        return;
+                    session_epoch = transport_session_epoch.load(std::memory_order_acquire);
+                    if (session_epoch != worker_session_epoch)
+                    {
+                        worker_session_epoch = session_epoch;
+                        status_publication = {};
+                        published_generation = 0;
+                    }
+                    const uint64_t now = NowUsec();
+                    if (pending_video_frame || (pending_stream_status &&
+                        status_publication.ShouldSend(*pending_stream_status, now)))
+                        break;
+                    if (pending_stream_status)
+                    {
+                        publish_cv.wait_for(lock, std::chrono::microseconds(
+                            status_publication.next_attempt_usec - now));
+                    }
+                    else
+                        publish_cv.wait(lock);
+                }
+                stream_status = pending_stream_status;
+                if (pending_video_frame)
+                {
+                    has_video = pending_video_frame->session_epoch == session_epoch;
+                    i420_frame = std::move(pending_video_frame->i420);
+                    nv12_frame = std::move(pending_video_frame->nv12);
+                    i420_layout = std::move(pending_video_frame->layout);
+                    pending_video_frame.reset();
+                }
             }
 
             if (session_epoch !=
                 transport_session_epoch.load(std::memory_order_acquire))
                 continue;
+
+            if (stream_status && status_publication.ShouldSend(*stream_status, NowUsec()))
+            {
+                const uint64_t begin = NowUsec();
+                const bool sent = webrtc_transport.SendStreamStatus(*stream_status);
+                const uint64_t end = NowUsec();
+                const uint64_t elapsed = end - begin;
+                stream_status_send_last_usec.store(elapsed, std::memory_order_relaxed);
+                stream_status_send_max_usec.store(std::max(elapsed,
+                    stream_status_send_max_usec.load(std::memory_order_relaxed)),
+                    std::memory_order_relaxed);
+                if (!sent)
+                    stream_status_send_failures.fetch_add(1, std::memory_order_relaxed);
+                status_publication.RecordAttempt(*stream_status, sent, end);
+            }
+            if (!has_video || session_epoch !=
+                transport_session_epoch.load(std::memory_order_acquire))
+                continue;
+
+            const RemoteStreamSelection frame_selection = {
+                i420_layout.protocol_version, i420_layout.encoding_profile_id,
+                i420_layout.quality_tier};
+            if (!stream_status || !status_publication.CanPublish(*stream_status, frame_selection))
+            {
+                // Only first negotiation / a changed selection gates frames.
+                // Failed routine acknowledgements cannot stop an active stream.
+                stream_status_gated_frames.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
 
             std::string error;
             const bool generation_boundary =
@@ -1486,6 +1539,8 @@ void NewPipelineServerRenderPath::StopPublishWorker()
     {
         std::lock_guard lock(publish_mutex);
         publish_worker_stop = true;
+        pending_video_frame.reset();
+        pending_stream_status.reset();
     }
     publish_cv.notify_all();
     if (publish_worker.joinable())
@@ -1634,7 +1689,6 @@ void NewPipelineServerRenderPath::ApplyLatestControlPacket()
 
     const RemoteStreamSelection negotiated = NegotiateRemoteStream(packet);
     const RemoteStreamStatus stream_status = BuildRemoteStreamStatus(packet);
-    pending_stream_status = stream_status;
     if (!remote_stream_selection_initialized || negotiated != remote_stream_selection)
     {
         remote_stream_selection = negotiated;
@@ -1659,6 +1713,12 @@ void NewPipelineServerRenderPath::ApplyLatestControlPacket()
             " quality=" + std::to_string(static_cast<uint32_t>(remote_stream_selection.quality_tier)) +
             " generation=" + std::to_string(remote_generation));
     }
+
+    {
+        std::lock_guard lock(publish_mutex);
+        pending_stream_status = stream_status;
+    }
+    publish_cv.notify_one();
 
     const bool first_control = last_applied_frame_id == 0;
     bool camera_cut = false;
