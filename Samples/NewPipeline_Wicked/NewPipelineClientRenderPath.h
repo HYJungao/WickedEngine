@@ -330,6 +330,10 @@ private:
     PacingSamples control_publish_intervals;
     PacingSamples remote_accept_intervals;
     PacingSamples client_update_intervals;
+    uint64_t pacing_replay_start_usec = 0;
+    uint32_t pacing_replay_phase = 0;
+    XMFLOAT3 pacing_replay_origin = {};
+    XMFLOAT3 pacing_replay_rotation = {};
     bool has_published_control_packet = false;
     bool scene_initialized = false;
     bool baked_sun_reference_valid = false;

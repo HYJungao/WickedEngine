@@ -1,4 +1,5 @@
 #include "NewPipelineClientRenderPath.h"
+#include "NewPipelinePacingTrace.h"
 
 #include "wiArchive.h"
 #include "wiHelper.h"
@@ -1016,7 +1017,9 @@ void NewPipelineClientRenderPath::CaptureRemoteGBufferHistory(
 
 void NewPipelineClientRenderPath::Update(float dt)
 {
-    client_update_intervals.Mark(NowUsec());
+    static PacingTrace& trace = *new PacingTrace("time_us,phase,dt_us,update_us,control_us,base_us,poll_us,acquire_us,elastic_us,control_id,accepted_id,source_control_id,source_us,generation,decoded,decode_queue,meta_pending,video_pending,meta_busy,video_busy,pair_expired,old_drops,texture_creates");
+    const uint64_t begin = NowUsec();
+    client_update_intervals.Mark(begin);
     InitializeSceneIfNeeded();
     UpdateReflectionProbeBake();
     UpdateLightmapBake(dt);
@@ -1025,12 +1028,30 @@ void NewPipelineClientRenderPath::Update(float dt)
     MaintainWebRTC(dt);
     PublishControlPacket(dt);
 
+    const uint64_t control_end = NowUsec();
     wi::RenderPath3D::Update(dt);
     UpdateClientVolumetricLightmapInstances();
+    const uint64_t base_end = NowUsec();
     PollRemoteFrameMetadata();
+    const uint64_t poll_end = NowUsec();
     AcquireRemoteVideoFrame(dt);
+    const uint64_t acquire_end = NowUsec();
     PrepareRemoteGBufferHistoryCapture();
     UpdateElasticLighting(dt);
+    if (trace.Enabled())
+    {
+        const uint64_t end = NowUsec();
+        const auto stats = webrtc_transport.GetStats();
+        trace.Record({begin, pacing_replay_phase, uint64_t(std::max(dt, 0.0f) * 1e6f),
+            end - begin, control_end - begin, base_end - control_end,
+            poll_end - base_end, acquire_end - poll_end, end - acquire_end,
+            last_published_control_packet.control_frame_id, remote_consume.accepted_frame_id,
+            accepted_remote_source_control_frame_id, accepted_remote_metadata.timestamp_usec,
+            remote_consume.accepted_generation, stats.frames_decoded, stats.decoded_queue_depth,
+            downstream_metadata_cache.size(), pending_remote_video_frames.size(),
+            stats.metadata_receive_busy, stats.video_receive_busy, downstream_pair_expirations,
+            downstream_out_of_order_drops, remote_texture_creation_count});
+    }
 
     if (!status_logged)
     {
@@ -3758,6 +3779,37 @@ void NewPipelineClientRenderPath::LogLightmapSceneParity(const char* phase)
 
 void NewPipelineClientRenderPath::UpdateLocalCamera(float dt)
 {
+    // Explicit diagnostic replay, never enabled in normal interactive runs.
+    // This exercises camera -> control -> capture -> codec -> acceptance with
+    // deterministic motion; it does not claim to synthesize OS input events.
+    static const bool replay = std::getenv("NP_PACING_REPLAY") != nullptr;
+    if (replay)
+    {
+        if (pacing_replay_start_usec == 0 && remote_consume.accepted_valid)
+        {
+            pacing_replay_start_usec = NowUsec();
+            pacing_replay_origin = camera_position;
+            pacing_replay_rotation = camera_rotation;
+        }
+        if (pacing_replay_start_usec != 0)
+        {
+            const double t = double(NowUsec() - pacing_replay_start_usec) / 1e6;
+            pacing_replay_phase = t < 10 ? 0 : t < 25 ? 1 : t < 45 ? 2 : t < 65 ? 3 : 4;
+            camera_position = pacing_replay_origin;
+            camera_rotation = pacing_replay_rotation;
+            if (pacing_replay_phase == 2)
+                camera_position.x += 1.5f * float(std::sin((t - 25) * 6.28318530718 / 10));
+            if (pacing_replay_phase == 3)
+                camera_rotation.y += 0.35f * float(std::sin((t - 45) * 6.28318530718 / 10));
+            wi::scene::TransformComponent transform;
+            transform.Translate(camera_position);
+            transform.RotateRollPitchYaw(camera_rotation);
+            transform.UpdateTransform();
+            local_camera.TransformCamera(transform);
+        }
+        local_camera.UpdateCamera();
+        return;
+    }
     if (!input_active)
     {
         camera_control_start = true;

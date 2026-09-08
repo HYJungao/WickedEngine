@@ -1,5 +1,10 @@
 #include "NewPipelineWebRTCAppleCodecFactory.h"
 #include "NewPipelineVideoFrameIdentity.h"
+#include "NewPipelinePacingTrace.h"
+extern "C" int np_trace_i420_frame_identity(
+    uint32_t width, uint32_t height, const uint8_t* y, int y_stride,
+    const uint8_t* u, int u_stride, const uint8_t* v, int v_stride,
+    uint64_t* frame_id, uint32_t* generation);
 
 #if defined(__APPLE__)
 
@@ -161,6 +166,10 @@ bool SampleToAnnexB(CMSampleBufferRef sample, bool keyframe, std::vector<uint8_t
 
 struct EncoderFrameContext
 {
+    uint64_t submit_usec = 0;
+    uint64_t prepare_usec = 0;
+    uint64_t source_frame_id = 0;
+    uint32_t source_generation = 0;
     uint32_t rtp_timestamp = 0;
     int64_t timestamp_usec = 0;
     uint32_t width = 0;
@@ -198,9 +207,26 @@ public:
         CFDictionarySetValue(encoder_spec,
             kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder,
             kCFBooleanTrue);
+        // Ask VT for reusable IOSurface-backed NV12 input buffers, avoiding
+        // per-frame pixel-buffer attribute dictionaries and creation work.
+        const int32_t pixel_format = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+        CFNumberRef pixel_format_number = CFNumberCreate(
+            kCFAllocatorDefault, kCFNumberSInt32Type, &pixel_format);
+        CFDictionaryRef surface_properties = CFDictionaryCreate(
+            kCFAllocatorDefault, nullptr, nullptr, 0,
+            &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+        const void* pixel_keys[] = {
+            kCVPixelBufferPixelFormatTypeKey, kCVPixelBufferIOSurfacePropertiesKey};
+        const void* pixel_values[] = {pixel_format_number, surface_properties};
+        CFDictionaryRef pixel_attributes = CFDictionaryCreate(
+            kCFAllocatorDefault, pixel_keys, pixel_values, 2,
+            &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
         const OSStatus status = VTCompressionSessionCreate(
             kCFAllocatorDefault, width_, height_, kCMVideoCodecType_H264,
-            encoder_spec, nullptr, nullptr, &CompressionOutputCallback, this, &session_);
+            encoder_spec, pixel_attributes, nullptr, &CompressionOutputCallback, this, &session_);
+        CFRelease(pixel_attributes);
+        CFRelease(surface_properties);
+        CFRelease(pixel_format_number);
         CFRelease(encoder_spec);
         if (status != noErr || session_ == nullptr)
             return HardwareFailure();
@@ -213,7 +239,8 @@ public:
         SetSessionInt(session_, kVTCompressionPropertyKey_ExpectedFrameRate, framerate_);
         SetSessionInt(session_, kVTCompressionPropertyKey_MaxKeyFrameInterval,
             std::max<uint32_t>(framerate_ * 2u, 1u));
-        if (VTCompressionSessionPrepareToEncodeFrames(session_) != noErr)
+        if (VTCompressionSessionPrepareToEncodeFrames(session_) != noErr ||
+            VTCompressionSessionGetPixelBufferPool(session_) == nullptr)
             return HardwareFailure();
         initialized_ = true;
         return WEBRTC_VIDEO_CODEC_OK;
@@ -249,29 +276,42 @@ public:
     {
         if (!initialized_ || session_ == nullptr)
             return WEBRTC_VIDEO_CODEC_UNINITIALIZED;
+        const uint64_t prepare_begin = wicked_newpipeline::PacingTrace::NowUsec();
         const auto i420 = frame.video_frame_buffer()->ToI420();
         if (!i420 || i420->width() != static_cast<int>(width_) ||
             i420->height() != static_cast<int>(height_))
             return WEBRTC_VIDEO_CODEC_ERR_PARAMETER;
 
         CVPixelBufferRef pixel_buffer = nullptr;
-        const CFDictionaryKeyCallBacks* key_callbacks = &kCFTypeDictionaryKeyCallBacks;
-        const CFDictionaryValueCallBacks* value_callbacks = &kCFTypeDictionaryValueCallBacks;
-        CFMutableDictionaryRef attributes = CFDictionaryCreateMutable(
-            kCFAllocatorDefault, 1, key_callbacks, value_callbacks);
-        CFDictionaryRef empty_surface_properties = CFDictionaryCreate(
-            kCFAllocatorDefault, nullptr, nullptr, 0, key_callbacks, value_callbacks);
-        CFDictionarySetValue(attributes, kCVPixelBufferIOSurfacePropertiesKey,
-            empty_surface_properties);
-        const CVReturn create_status = CVPixelBufferCreate(kCFAllocatorDefault,
-            width_, height_, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-            attributes, &pixel_buffer);
-        CFRelease(empty_surface_properties);
-        CFRelease(attributes);
+        // The session owns the pool and may replace it after property changes.
+        // VT retains submitted buffers until encoding completes, so the pool
+        // cannot recycle a surface that is still being encoded.
+        CVPixelBufferPoolRef pool = VTCompressionSessionGetPixelBufferPool(session_);
+        if (pool == nullptr)
+            return HardwareFailure();
+        const CVReturn create_status = CVPixelBufferPoolCreatePixelBuffer(
+            kCFAllocatorDefault, pool, &pixel_buffer);
         if (create_status != kCVReturnSuccess || pixel_buffer == nullptr)
+        {
+            if (pixel_buffer != nullptr)
+                CVPixelBufferRelease(pixel_buffer);
             return WEBRTC_VIDEO_CODEC_MEMORY;
+        }
 
-        CVPixelBufferLockBaseAddress(pixel_buffer, 0);
+        if (CVPixelBufferGetPixelFormatType(pixel_buffer) !=
+                kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
+            CVPixelBufferGetWidth(pixel_buffer) != width_ ||
+            CVPixelBufferGetHeight(pixel_buffer) != height_ ||
+            CVPixelBufferGetPlaneCount(pixel_buffer) != 2)
+        {
+            CVPixelBufferRelease(pixel_buffer);
+            return HardwareFailure();
+        }
+        if (CVPixelBufferLockBaseAddress(pixel_buffer, 0) != kCVReturnSuccess)
+        {
+            CVPixelBufferRelease(pixel_buffer);
+            return WEBRTC_VIDEO_CODEC_MEMORY;
+        }
         const int convert_status = libyuv::I420ToNV12(
             i420->DataY(), i420->StrideY(),
             i420->DataU(), i420->StrideU(),
@@ -303,6 +343,15 @@ public:
                 &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
         }
         auto context = std::make_unique<EncoderFrameContext>();
+        context->submit_usec = wicked_newpipeline::PacingTrace::NowUsec();
+        context->prepare_usec = context->submit_usec - prepare_begin;
+        if (std::getenv("NP_PACING_TRACE"))
+        {
+            np_trace_i420_frame_identity(width_, height_,
+                i420->DataY(), i420->StrideY(), i420->DataU(), i420->StrideU(),
+                i420->DataV(), i420->StrideV(),
+                &context->source_frame_id, &context->source_generation);
+        }
         context->rtp_timestamp = frame.rtp_timestamp();
         context->timestamp_usec = frame.timestamp_us();
         context->width = width_;
@@ -384,6 +433,14 @@ private:
         wicked_newpipeline::video_identity::PrependFrameIdentitySEI(
             annex_b, context->timestamp_usec);
         webrtc::EncodedImage image;
+        {
+            static auto& trace = *new wicked_newpipeline::PacingTrace(
+                "time_us,rtc_source_us,submit_us,encode_us,bytes,width,height,frame_id,generation,prepare_us", ".encoder.csv");
+            const uint64_t now = wicked_newpipeline::PacingTrace::NowUsec();
+            trace.Record({now, uint64_t(context->timestamp_usec), context->submit_usec,
+                now - context->submit_usec, annex_b.size(), context->width, context->height,
+                context->source_frame_id, context->source_generation, context->prepare_usec});
+        }
         image.SetEncodedData(webrtc::EncodedImageBuffer::Create(
             annex_b.data(), annex_b.size()));
         image.SetRtpTimestamp(context->rtp_timestamp);

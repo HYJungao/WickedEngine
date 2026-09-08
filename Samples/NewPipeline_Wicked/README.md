@@ -335,8 +335,19 @@ the Server then reports `zero-raw-readback=yes` and the Client reports
 retaining H.264; VP8 reports the same surface fallback after codec fallback.
 The macOS VideoToolbox backend remains hardware accelerated through its existing
 CPU-addressable I420/readback path; a native Metal/CVPixelBuffer path is still open.
+Its encoder obtains IOSurface-backed NV12 buffers from the compression session's
+pixel-buffer pool, avoiding per-frame attribute dictionaries and buffer creation.
+Buffers retained by VideoToolbox remain unavailable for reuse until encoding is
+finished. The format, dimensions, plane count and CPU mapping result are checked
+before conversion; this does not change semantic resolution or encoding quality.
 
 The Server panel and Client remote status report DDGI frame/convergence state.
+The Server applies the existing High video budget at both the RTP encoding and
+PeerConnection levels: minimum/start 20 Mbps, maximum 120 Mbps. This keeps the
+connection bandwidth controller and pacer consistent with the semantic stream
+when motion follows an idle scene. This remains a high-bandwidth stream policy;
+it is not an adaptive low-bandwidth Internet quality tier.
+
 Client control snapshots target 30 Hz while changing and 5 Hz while unchanged.
 The timer retains fractional time across updates and coalesces missed periods,
 so small render-FPS changes do not turn 30 Hz input into 20 Hz input. Bridge
@@ -358,6 +369,38 @@ and video receive-lock attempts. The Server reports status-send failures, frames
 gated by an unannounced/mismatched selection, and last/maximum status-send time;
 the Client also reports last/maximum control-send time. Use these alongside
 capture/queue drops and codec counters when comparing idle, movement and turning.
+
+For an opt-in local CSV recording, set `NP_PACING_TRACE` to a writable file
+path before launching each peer (use different files). Client rows include the
+accepted producer timestamp and frame ID, control identity, per-Update stage
+CPU durations, and receive/pair counters; Server rows include captures,
+publication/codec counters and stage durations. Files flush once per second.
+VideoToolbox encoder callbacks additionally write `.encoder.csv` with exact
+pixel-band frame identity, input preparation duration and submit/output times. WebRTC writes `.rtp-out.csv`
+and `.rtp-in.csv` with cumulative packet send delay, jitter-buffer delay, packet
+loss and codec counters. Use interval differences and the corresponding packet
+or frame counts to calculate means; RTC source time is a different clock from
+the original capture time, so align encoder records using generation/frame ID.
+`NP_PACING_REPLAY=1` on the Client runs a deterministic camera workload after
+the first accepted frame: 10 seconds warmup, 15 seconds idle, 20 seconds lateral
+movement, 20 seconds turning, then idle. The `phase` column is 0/1/2/3/4.
+This tests camera-driven transport work, not OS keyboard/mouse event delivery.
+`NP_PACING_REMOTE_PREVIEW=1` selects Remote Indirect Diffuse for the recording.
+`NP_PACING_SCALE=0.5` on both peers and `NP_PACING_NO_PHYSICS=1` are diagnostic
+workload controls for separate A/B runs; omit them for production defaults.
+Do not run a sampling profiler during the measured CSV interval: process
+sampling can perturb the frame times. Warmup/loading rows are not steady-state
+performance measurements.
+
+For a separate GPU profiling run, set `WI_PROFILER_TRACE` to a CSV path on each
+peer. This enables the engine's existing profiler with its overlay hidden and
+exports rolling 20-frame range means once per second, plus raw timestamps and
+their frequency. These are not per-frame percentiles. Metal compute timestamps
+use command-buffer boundaries to avoid stale begin values observed on Apple M5;
+counter resolution waits for preceding stages before its Blit-stage read. This
+splits compute encoders while profiling, so use a separate run with profiling
+disabled for final frame-pacing comparisons. Render-pass timestamps without
+fragments may still be invalid on Apple GPUs; exclude invalid ranges.
 
 Scene-generation and significant authoritative-sun changes clear Server DDGI
 history and publish the reset reason in the video metadata. `--transport_selftest`

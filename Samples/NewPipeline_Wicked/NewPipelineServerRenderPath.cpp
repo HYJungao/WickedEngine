@@ -1,5 +1,6 @@
 #include "NewPipelineServerRenderPath.h"
 #include "NewPipelinePacing.h"
+#include "NewPipelinePacingTrace.h"
 
 #include "wiHelper.h"
 #include "wiImage.h"
@@ -178,6 +179,8 @@ void NewPipelineServerRenderPath::Start()
 
 void NewPipelineServerRenderPath::Update(float dt)
 {
+    static PacingTrace& trace = *new PacingTrace("time_us,dt_us,update_us,control_us,base_us,publish_us,control_id,captured,capture_drop,readback_drop,queue_drop,encoded,sent,status_fail,status_gated,control_busy");
+    const uint64_t begin = NowUsec();
     InitializeSceneIfNeeded();
     MaintainWebRTC(dt);
     ApplyLatestControlPacket();
@@ -185,6 +188,7 @@ void NewPipelineServerRenderPath::Update(float dt)
     // Apply Scene::Update() before deriving the wire-visible light generation.
     // This matches the Client lifecycle and prevents transform normalization
     // from changing the identity after it has already been published.
+    const uint64_t control_end = NowUsec();
     wi::RenderPath3D::Update(dt);
     RefreshAuthoritativeShadowIdentity();
     visibilityResources.texture_primary_light_visibility =
@@ -195,7 +199,20 @@ void NewPipelineServerRenderPath::Update(float dt)
         ? static_cast<int>(authoritative_shadow_index) : -1;
 
     LogDDGIStatusIfNeeded();
+    const uint64_t base_end = NowUsec();
     PublishRemotePayload(dt);
+    if (trace.Enabled())
+    {
+        const uint64_t end = NowUsec();
+        const auto stats = webrtc_transport.GetStats();
+        trace.Record({begin, uint64_t(std::max(dt, 0.0f) * 1e6f), end - begin,
+            control_end - begin, base_end - control_end, end - base_end,
+            last_applied_control.control_frame_id, remote_capture_count,
+            remote_capture_drops, remote_readback_latency_drops,
+            publish_queue_drops.load(), stats.frames_encoded, stats.sent_frames,
+            stream_status_send_failures.load(), stream_status_gated_frames.load(),
+            stats.control_receive_busy});
+    }
 
     if (!status_logged)
     {

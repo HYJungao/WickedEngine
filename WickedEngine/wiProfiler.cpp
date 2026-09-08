@@ -20,6 +20,9 @@
 #include <mutex>
 #include <atomic>
 #include <sstream>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 
 using namespace wi::graphics;
 
@@ -64,6 +67,19 @@ namespace wi::profiler
 
 	void BeginFrame()
 	{
+		// Opt-in diagnostic export of the existing profiler ranges. This uses
+		// the normal delayed timestamp readback, without a synchronous GPU wait.
+		static FILE* trace_file = []() -> FILE* {
+			const char* path = std::getenv("WI_PROFILER_TRACE");
+			FILE* file = path && *path ? std::fopen(path, "w") : nullptr;
+			if (file) std::fprintf(file, "time_us,kind,name,mean_ms,raw_begin,raw_end,frame_begin,frame_end,frequency_hz\n");
+			return file;
+		}();
+		static uint64_t trace_last_usec = 0;
+		const uint64_t trace_now = trace_file ? uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+			std::chrono::steady_clock::now().time_since_epoch()).count()) : 0;
+		const bool trace_write = trace_file && trace_now - trace_last_usec >= 1'000'000;
+		if (trace_file) ENABLED_REQUEST = true;
 		if (ENABLED_REQUEST != ENABLED)
 		{
 			ranges.clear();
@@ -116,9 +132,17 @@ namespace wi::profiler
 		// This should be done before we begin reallocating new queries for current buffer index
 		const uint64_t* queryResults = (const uint64_t*)queryResultBuffer[queryheap_idx].mapped_data;
 		double gpu_frequency = (double)device->GetTimestampFrequency() / 1000.0;
+		uint64_t frame_begin = 0, frame_end = 0;
+		auto frame_it = ranges.find(gpu_frame);
+		if (queryResults && frame_it != ranges.end())
+		{
+			const int b = frame_it->second.gpuBegin[queryheap_idx], e = frame_it->second.gpuEnd[queryheap_idx];
+			if (b >= 0 && e >= 0) { frame_begin = queryResults[b]; frame_end = queryResults[e]; }
+		}
 		for (auto& x : ranges)
 		{
 			auto& range = x.second;
+			uint64_t raw_begin = 0, raw_end = 0;
 			if (!range.in_use)
 				continue;
 
@@ -130,6 +154,7 @@ namespace wi::profiler
 				{
 					const uint64_t begin_result = queryResults[begin_idx];
 					const uint64_t end_result = queryResults[end_idx];
+					raw_begin = begin_result; raw_end = end_result;
 					range.time = (float)abs((double)(end_result - begin_result) / gpu_frequency);
 					if (range.time > 1000000.0f)
 					{
@@ -152,7 +177,23 @@ namespace wi::profiler
 				range.time = avg_time / arraysize(range.times);
 			}
 
+			if (trace_write && range.avg_counter > arraysize(range.times))
+			{
+				// CSV escape names (including quotes), which are authored by callers.
+				std::fprintf(trace_file, "%llu,%s,\"", (unsigned long long)trace_now, range.IsCPURange() ? "CPU" : "GPU");
+				for (char character : range.name)
+				{
+					if (character == '"') std::fputc('"', trace_file);
+					std::fputc(character, trace_file);
+				}
+				std::fprintf(trace_file, "\",%.6f,%llu,%llu,%llu,%llu,%llu\n", range.time, (unsigned long long)raw_begin, (unsigned long long)raw_end, (unsigned long long)frame_begin, (unsigned long long)frame_end, (unsigned long long)device->GetTimestampFrequency());
+			}
 			range.in_use = false;
+		}
+		if (trace_write)
+		{
+			std::fflush(trace_file);
+			trace_last_usec = trace_now;
 		}
 
 		device->QueryReset(
@@ -163,7 +204,8 @@ namespace wi::profiler
 		);
 
 		gpu_frame = BeginRangeGPU("GPU Frame", cmd);
-		drawn_this_frame = false;
+		// Headless recording avoids the profiler overlay's presentation cost.
+		drawn_this_frame = trace_file != nullptr;
 	}
 	void EndFrame(CommandList cmd)
 	{

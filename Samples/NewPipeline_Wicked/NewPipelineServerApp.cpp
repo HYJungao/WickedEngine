@@ -1,4 +1,6 @@
 #include "NewPipelineServerApp.h"
+#include <cstdlib>
+#include "wiPhysics.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -181,6 +183,15 @@ void NewPipelineServerApp::Initialize()
     infoDisplay.fpsinfo     = true;
     infoDisplay.device_name = true;
 
+    // Explicit workload controls for local pacing A/B recordings only.
+    if (const char* scale = std::getenv("NP_PACING_SCALE"))
+    {
+        const float value = std::strtof(scale, nullptr);
+        if (value >= 0.25f && value <= 1.0f)
+            render_path.resolutionScale = value;
+    }
+    if (std::getenv("NP_PACING_NO_PHYSICS"))
+        wi::physics::SetSimulationEnabled(false);
     ActivatePath(&render_path);
 }
 

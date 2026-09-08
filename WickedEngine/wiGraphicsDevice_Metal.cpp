@@ -4480,7 +4480,12 @@ using namespace metal_internal;
 				}
 				else if (commandlist.compute_encoder.get() != nullptr)
 				{
-					commandlist.compute_encoder->writeTimestamp(MTL4::TimestampGranularityPrecise, internal_state->counter_heap.get(), index);
+					// Command-buffer timestamps avoid stale begin values observed
+					// with Metal 4 compute-encoder timestamps on Apple M5. Splitting
+					// encoders only affects runs that explicitly request queries.
+					commandlist.compute_encoder->endEncoding();
+					commandlist.compute_encoder.reset();
+					commandlist.commandbuffer->writeTimestampIntoHeap(internal_state->counter_heap.get(), index);
 				}
 				else
 				{
@@ -4508,6 +4513,11 @@ using namespace metal_internal;
 				commandlist.compute_encoder->copyFromBuffer(internal_state->buffer.get(), index * sizeof(uint64_t), dst_internal->buffer.get(), dest_offset, count * sizeof(uint64_t));
 				break;
 			case GpuQueryType::TIMESTAMP:
+				// Counter resolve runs at StageBlit and does not implicitly wait
+				// for preceding timestamp writes at other stages (Metal 4).
+				if (commandlist.compute_encoder.get() == nullptr)
+					commandlist.compute_encoder = NS::TransferPtr(commandlist.commandbuffer->computeCommandEncoder()->retain());
+				commandlist.compute_encoder->barrierAfterStages(MTL::StageAll, MTL::StageBlit, MTL4::VisibilityOptionNone);
 				if (commandlist.compute_encoder.get() != nullptr)
 				{
 					commandlist.compute_encoder->endEncoding();

@@ -771,6 +771,30 @@ bool DecodeRemoteVideoFrameLayout(
     return true;
 }
 
+// Codec translation units use libwebrtc's libc++ ABI. Keep diagnostic pixel
+// identity extraction behind a C boundary rather than passing STL types.
+extern "C" int np_trace_i420_frame_identity(
+    uint32_t width, uint32_t height, const uint8_t* y, int y_stride,
+    const uint8_t* u, int u_stride, const uint8_t* v, int v_stride,
+    uint64_t* frame_id, uint32_t* generation)
+{
+    if (!frame_id || !generation)
+        return 0;
+    *frame_id = 0;
+    *generation = 0;
+    RetainedI420Frame source;
+    source.width = width; source.height = height;
+    source.y_plane = y; source.y_stride = y_stride;
+    source.u_plane = u; source.u_stride = u_stride;
+    source.v_plane = v; source.v_stride = v_stride;
+    RemoteVideoFrameLayout identity;
+    if (!DecodeRemoteVideoFrameLayout(source, identity, nullptr))
+        return 0;
+    *frame_id = identity.metadata.frame_id;
+    *generation = identity.metadata.source_generation;
+    return 1;
+}
+
 bool ValidateRemoteTransportSelfTest(std::string* error)
 {
     // Exercise the production cadence at fixed and fluctuating render rates.

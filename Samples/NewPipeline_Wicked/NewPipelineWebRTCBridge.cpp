@@ -1,3 +1,4 @@
+#include "NewPipelinePacingTrace.h"
 #include "NewPipelineWebRTCBridge.h"
 
 #if defined(_WIN32)
@@ -723,6 +724,12 @@ public:
         {
             if (!stats->kind || *stats->kind != "video")
                 continue;
+            static auto& trace = *new wicked_newpipeline::PacingTrace(
+                "time_us,bytes_sent,packets_sent,packet_send_delay_us,frames_encoded,encode_time_us,nack_count", ".rtp-out.csv");
+            trace.Record({wicked_newpipeline::PacingTrace::NowUsec(), stats->bytes_sent.value_or(0),
+                stats->packets_sent.value_or(0), uint64_t(stats->total_packet_send_delay.value_or(0) * 1e6),
+                stats->frames_encoded.value_or(0), uint64_t(stats->total_encode_time.value_or(0) * 1e6),
+                stats->nack_count.value_or(0)});
             telemetry_->compressed_bytes_sent.store(stats->bytes_sent.value_or(0), std::memory_order_relaxed);
             telemetry_->total_encode_time_usec.store(
                 static_cast<uint64_t>(stats->total_encode_time.value_or(0.0) * 1'000'000.0),
@@ -739,6 +746,13 @@ public:
         {
             if (!stats->kind || *stats->kind != "video")
                 continue;
+            static auto& trace = *new wicked_newpipeline::PacingTrace(
+                "time_us,bytes_received,packets_received,packets_lost,jitter_delay_us,jitter_emitted,frames_decoded,decode_time_us,frames_dropped", ".rtp-in.csv");
+            trace.Record({wicked_newpipeline::PacingTrace::NowUsec(), stats->bytes_received.value_or(0),
+                stats->packets_received.value_or(0), uint64_t(std::max(0, stats->packets_lost.value_or(0))),
+                uint64_t(stats->jitter_buffer_delay.value_or(0) * 1e6), stats->jitter_buffer_emitted_count.value_or(0),
+                stats->frames_decoded.value_or(0), uint64_t(stats->total_decode_time.value_or(0) * 1e6),
+                stats->frames_dropped.value_or(0)});
             telemetry_->compressed_bytes_received.store(stats->bytes_received.value_or(0), std::memory_order_relaxed);
             telemetry_->total_decode_time_usec.store(
                 static_cast<uint64_t>(stats->total_decode_time.value_or(0.0) * 1'000'000.0),
@@ -1574,6 +1588,19 @@ private:
         peer_connection_ = peer_or_error.MoveValue();
         if (server_)
         {
+            // Match the connection-wide bandwidth controller to the existing
+            // High semantic-video budget. Per-encoding limits alone leave the
+            // pacer on a different startup/floor budget, allowing a motion
+            // burst after an idle scene to accumulate hundreds of milliseconds.
+            webrtc::BitrateSettings bitrate;
+            bitrate.min_bitrate_bps = kBufferVideoMinBitrateBps;
+            bitrate.start_bitrate_bps = kBufferVideoMinBitrateBps;
+            bitrate.max_bitrate_bps = kBufferVideoMaxBitrateBps;
+            const webrtc::RTCError bitrate_result = peer_connection_->SetBitrate(bitrate);
+            if (!bitrate_result.ok())
+                return Fail(std::string{"Could not configure remote video connection bitrate: "} + bitrate_result.message());
+            std::fprintf(stderr, "Server WebRTC connection bitrate min/start=%d max=%d bps\n",
+                kBufferVideoMinBitrateBps, kBufferVideoMaxBitrateBps);
             CreateControlChannel();
             CreateFrameMetadataChannel();
             CreateLocalVideoTrack();
